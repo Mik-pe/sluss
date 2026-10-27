@@ -5,4 +5,5 @@
 
 pub mod batch;
 pub mod store;
+pub mod verification;
 pub mod webhook;
