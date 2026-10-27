@@ -109,7 +109,7 @@ fn optimistic_batch_update_rejects_stale_worker_after_restart() {
         first.insert_batch(&batch()),
         Err(StoreError::Conflict)
     ));
-    let second = Store::open(&path).unwrap();
+    let mut second = Store::open(&path).unwrap();
     let (mut fresh, version) = first.batch("batch-1").unwrap().unwrap();
     let (mut stale, stale_version) = second.batch("batch-1").unwrap().unwrap();
     fresh.begin_build().unwrap();
@@ -162,13 +162,60 @@ fn removing_a_candidate_invalidates_its_verified_batch() {
     store.observe_candidate(&pr(1, "head-1")).unwrap();
     store.observe_candidate(&pr(2, "head-2")).unwrap();
     let mut b = batch();
-    b.begin_build().unwrap();
-    b.begin_testing("integrated".into()).unwrap();
-    b.record_success().unwrap();
     store.insert_batch(&b).unwrap();
+    b.begin_build().unwrap();
+    store.update_batch(&b, 0).unwrap();
+    b.begin_testing("integrated".into()).unwrap();
+    store.update_batch(&b, 1).unwrap();
+    b.record_success().unwrap();
+    store.update_batch(&b, 2).unwrap();
     store.remove_candidate(2).unwrap();
     assert!(matches!(
         store.batch("batch-1").unwrap().unwrap().0.state,
         State::Invalidated { .. }
+    ));
+}
+
+#[test]
+fn storage_rejects_mutated_inputs_and_skipped_or_forged_transitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("queue.sqlite")).unwrap();
+    store.observe_candidate(&pr(1, "head-1")).unwrap();
+    store.observe_candidate(&pr(2, "head-2")).unwrap();
+    let mut b = batch();
+    b.state = State::Verified {
+        integration_sha: "fake".into(),
+    };
+    assert!(matches!(
+        store.insert_batch(&b),
+        Err(StoreError::InvalidBatch)
+    ));
+    b.state = State::Planned;
+    store.insert_batch(&b).unwrap();
+    b.state = State::Verified {
+        integration_sha: "fake".into(),
+    };
+    assert!(matches!(
+        store.update_batch(&b, 0),
+        Err(StoreError::InvalidBatch)
+    ));
+    b.state = State::Building;
+    b.base_sha = "other".into();
+    assert!(matches!(
+        store.update_batch(&b, 0),
+        Err(StoreError::InvalidBatch)
+    ));
+    b.base_sha = "base".into();
+    store.update_batch(&b, 0).unwrap();
+    b.state = State::Testing {
+        integration_sha: "tested".into(),
+    };
+    store.update_batch(&b, 1).unwrap();
+    b.state = State::Verified {
+        integration_sha: "different".into(),
+    };
+    assert!(matches!(
+        store.update_batch(&b, 2),
+        Err(StoreError::InvalidBatch)
     ));
 }

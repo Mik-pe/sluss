@@ -4,7 +4,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
-use crate::batch::{Batch, Candidate};
+use crate::batch::{Batch, Candidate, State};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -18,6 +18,8 @@ pub enum StoreError {
     InvalidCandidate,
     #[error("batch candidate is no longer in the queue at the frozen head")]
     StaleCandidate,
+    #[error("batch inputs or state transition are invalid")]
+    InvalidBatch,
 }
 
 pub struct Store {
@@ -113,6 +115,16 @@ impl Store {
     }
 
     pub fn insert_batch(&mut self, batch: &Batch) -> Result<(), StoreError> {
+        if batch.state != State::Planned
+            || Batch::new(
+                batch.id.clone(),
+                batch.base_sha.clone(),
+                batch.candidates.clone(),
+            )
+            .is_err()
+        {
+            return Err(StoreError::InvalidBatch);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -153,15 +165,61 @@ impl Store {
     }
 
     /// Optimistic concurrency prevents a stale worker from overwriting a newer state.
-    pub fn update_batch(&self, batch: &Batch, version: i64) -> Result<(), StoreError> {
-        let updated = self.conn.execute(
+    pub fn update_batch(&mut self, batch: &Batch, version: i64) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT body, version FROM batches WHERE id=?1",
+                [&batch.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (body, current_version) = current.ok_or(StoreError::Conflict)?;
+        if version != current_version {
+            return Err(StoreError::Conflict);
+        }
+        let previous: Batch = serde_json::from_str(&body)?;
+        if previous.id != batch.id
+            || previous.base_sha != batch.base_sha
+            || previous.candidates != batch.candidates
+            || !valid_transition(&previous.state, &batch.state)
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let updated = tx.execute(
             "UPDATE batches SET version=version+1, body=?1 WHERE id=?2 AND version=?3",
             params![serde_json::to_string(batch)?, batch.id, version],
         )?;
         if updated != 1 {
             return Err(StoreError::Conflict);
         }
+        tx.commit()?;
         Ok(())
+    }
+}
+
+fn valid_transition(previous: &State, next: &State) -> bool {
+    match (previous, next) {
+        (State::Planned, State::Building | State::Failed { .. } | State::Invalidated { .. }) => {
+            true
+        }
+        (State::Building, State::Testing { integration_sha }) => !integration_sha.is_empty(),
+        (
+            State::Building | State::Testing { .. },
+            State::Failed { .. } | State::Invalidated { .. },
+        ) => true,
+        (State::Verified { .. }, State::Invalidated { .. }) => true,
+        (
+            State::Testing {
+                integration_sha: tested,
+            },
+            State::Verified {
+                integration_sha: verified,
+            },
+        ) => tested == verified && !tested.is_empty(),
+        _ => false,
     }
 }
 
