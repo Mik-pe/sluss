@@ -4,4 +4,5 @@
 //! an observation, not authorization to merge.
 
 pub mod batch;
+pub mod integration;
 pub mod store;
