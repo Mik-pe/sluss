@@ -1,0 +1,7 @@
+# Resource reservations
+
+The experimental scheduler stores reservations in SQLite and accounts for global logical pool budgets, per-host pool budgets, and total job slots on each physical host. A request consumes one host slot and the specified units in each pool. Hosts and pools are operator-supplied; host names must identify actual physical machines rather than unrelated runner labels. A request that cannot ever fit the configured capacity is rejected, while a request blocked by active reservations can be retried.
+
+Reservations use a write transaction so multiple local processes cannot allocate the same capacity concurrently. A repeated active reservation ID and identical request returns the existing reservation; different requests cannot reuse that ID. Once released, the ID is permanently retired. Reservations survive restarts and do not expire automatically: callers must reconcile the provider and release capacity only after the actual job has stopped. Configuration changes are refused while reservations exist, and old scheduler instances cannot allocate against a changed configuration.
+
+This is capacity accounting only. There is no workflow dispatch, queue fairness, debounce, provider reconciliation, or automatic recovery yet. A reservation does not prove that GitHub Actions will run on the selected host. Before using these budgets to schedule real jobs, the integration must ensure runner selection pins each job to the reserved physical host and accounts for workloads outside Sluss. Never release on an uncertain dispatch or job outcome.
