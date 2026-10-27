@@ -1,0 +1,13 @@
+# Verification and landing protocol
+
+This is a design contract, not a claim that the protocol is implemented.
+
+1. Reconcile each PR's current head, independent review and blockers. Freeze the target base, ordered PR numbers and heads, and policy identity in a batch.
+2. Build the integration in an isolated workspace. Record every input, Git behavior and the exact resulting commit. Conflicts fail the batch without changing the target.
+3. Start and reconcile trusted CI for that exact commit. Bind evidence to the repository, workflow identity, run and attempt, commit, required jobs and policy; never trust a result supplied by PR code as Sluss's own attestation.
+4. Recheck current PR heads, approvals, blockers, target base, permissions and policy. Any relevant change invalidates the batch. A successful test alone never authorizes landing.
+5. Publish only with a provider-supported atomic update conditioned on the expected target and a compatible fast-forward, preserving the exact verified commit. Abort on uncertainty or any failed condition. After ambiguous network failure, read back the target and reconcile before retrying. A full proof must cover review/policy changes concurrent with landing, not just a head SHA comparison.
+
+GitHub's ref-update and branch-protection semantics, including concurrent writers and changes to review or policy, must be verified end to end before strict mode is enabled. If the guarantees cannot be established with the available APIs and configured writer restrictions, strict mode must refuse to operate. A generic non-force ref update alone is not proof of an exact expected-old-value comparison; GitHub's [update-ref API](https://docs.github.com/en/rest/git/refs#update-a-reference) does not document an expected-old-SHA parameter.
+
+A failed group may be split deterministically; each resulting group requires its own integration and fresh verification. A singleton failure is reported for investigation. Recovery uses durable operation identifiers and current provider state; duplicated webhooks and uncertain responses must not create duplicate work or unsafe updates.
