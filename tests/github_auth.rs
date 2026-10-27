@@ -109,7 +109,10 @@ async fn token(
     .unwrap()
     .claims;
     let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-    assert_eq!(claims.iss, "app-client-id");
+    assert!(matches!(
+        claims.iss.as_str(),
+        "app-client-id" | "different-app"
+    ));
     assert!(claims.iat <= now && now - claims.iat <= 65);
     assert!(claims.exp > now && claims.exp - now <= 540);
     let mode = state.mode.load(Ordering::SeqCst);
@@ -263,6 +266,22 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .unwrap();
     assert_eq!(store.candidates().unwrap()[0].head_sha, "a".repeat(40));
     assert!(inbox.pending().unwrap().is_empty());
+    inbox
+        .record("reconcile-other", "pull_request", &[3; 32], 42, 7)
+        .unwrap();
+    let other_job = inbox.pending().unwrap().remove(0);
+    let other_app = App::new("different-app".into(), &private, &format!("http://{addr}/")).unwrap();
+    let other_token = other_app.read_token(42, 7).await.unwrap();
+    assert!(matches!(
+        sluss::reconcile::reconcile_once(&other_app, &other_token, &mut store, &other_job, &config)
+            .await,
+        Err(sluss::reconcile::ReconcileError::Store(
+            sluss::store::StoreError::PolicyMismatch
+        ))
+    ));
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &other_job, &config)
+        .await
+        .unwrap();
     inbox
         .record("reconcile-2", "pull_request", &[2; 32], 42, 7)
         .unwrap();

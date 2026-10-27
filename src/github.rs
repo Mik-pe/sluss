@@ -76,6 +76,9 @@ struct TokenResponse {
 }
 
 impl App {
+    pub(crate) fn scope(&self) -> (&str, &str) {
+        (&self.client_id, self.api.as_str())
+    }
     /// The API endpoint is an operator-controlled HTTPS origin. HTTP is allowed
     /// only for loopback tests. Redirects are disabled to avoid leaking JWTs.
     pub fn new(client_id: String, private_pem: &[u8], api: &str) -> Result<Self, GitHubError> {

@@ -89,7 +89,7 @@ pub async fn reconcile_once(
         return Err(ReconcileError::Unstable);
     }
     use sha2::Digest;
-    let encoded = serde_json::to_vec(config).map_err(|_| ReconcileError::Scope)?;
+    let encoded = serde_json::to_vec(&(app.scope(), config)).map_err(|_| ReconcileError::Scope)?;
     let policy_digest = hex::encode(sha2::Sha256::digest(encoded));
     store.apply_reconciliation(job, &policy_digest, &candidates)?;
     Ok(())
