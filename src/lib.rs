@@ -7,6 +7,7 @@ pub mod admission;
 pub mod batch;
 pub mod config;
 pub mod github;
+pub mod integration;
 pub mod reconcile;
 pub mod scheduler;
 pub mod store;
