@@ -1,0 +1,21 @@
+# Experimental observation-only configuration. Store this outside PR-controlled paths.
+version = 1
+
+[github]
+app_client_id = "YOUR_APP_CLIENT_ID"
+installation_id = 12345
+repository_id = 67890
+owner = "your-owner"
+repository = "your-repository"
+
+[queue]
+target = "main"
+poll_seconds = 5
+rescan_seconds = 300
+
+[checks]
+required_reviews = 1
+block_labels = ["do-not-merge", "owner-hold"]
+
+[merge]
+mode = "disabled"

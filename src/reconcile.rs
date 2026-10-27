@@ -10,7 +10,7 @@ use crate::{
 use std::collections::BTreeSet;
 use thiserror::Error;
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct RepositoryPolicy {
     pub installation: i64,
     pub repository: i64,

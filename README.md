@@ -6,7 +6,7 @@ Sluss is intended to be a small, open-source CI orchestrator and merge queue for
 
 ## Status: early development
 
-The current code contains a durable SQLite queue of PR **observations**, a batch state machine, authenticated GitHub webhook intake, GitHub App token generation and a small local CLI. There is no GitHub reconciliation worker yet; it does **not** admit PRs, start or verify CI, create integration commits, or update branches. It is not ready for production or a pilot. A `Verified` state in the model is not a merge authorization. `doctor` exits unsuccessfully until the real checks exist.
+The current code contains a durable SQLite queue of PR **observations**, a batch state machine, authenticated GitHub webhook intake, scoped GitHub App authentication and an experimental observation worker. It does **not** start or verify CI, create integration commits, or update branches. It is not ready for production or a pilot. A `Verified` state in the model is not a merge authorization. `doctor` exits unsuccessfully until the real checks exist.
 
 ```sh
 cargo test
@@ -17,7 +17,9 @@ cargo run -- resume
 cargo run -- doctor
 ```
 
-To try webhook intake locally, set `SLUSS_WEBHOOK_SECRET` in the environment and run `cargo run -- serve`. It listens on `127.0.0.1:8080` by default; `--listen` changes the address. External traffic requires a trusted HTTPS reverse proxy. Deliveries wake a durable reconciliation queue, but no worker consumes it yet. Do not deploy this preview as a production GitHub App.
+To try webhook intake locally, set `SLUSS_WEBHOOK_SECRET` in the environment and run `cargo run -- serve`. It listens on `127.0.0.1:8080` by default; `--listen` changes the address. External traffic requires a trusted HTTPS reverse proxy. Without configuration, this only records deliveries.
+
+To enable the experimental observer, copy [examples/sluss.toml](examples/sluss.toml) to an operator-controlled location, set `SLUSS_WEBHOOK_SECRET` and `SLUSS_GITHUB_PRIVATE_KEY_PATH`, then run `cargo run -- serve --config /path/to/sluss.toml`. Startup and periodic scans recover missed notifications, and failed work remains queued for retry. Only the configured repository is processed. This path has only been tested with a local GitHub stub; do not deploy this preview as a production GitHub App.
 
 For development, `sluss reconcile --help` describes a manual, one-shot reconciliation command. It requires `SLUSS_GITHUB_PRIVATE_KEY_PATH` and explicit, operator-controlled App, installation and repository IDs. It reads all open PRs and their reviews, checks reviewer permissions, and atomically updates local queue observations if no newer event arrived. This path has only been tested with a local GitHub stub. A database is bound to one repository and policy; a policy change fails closed and currently requires an explicit migration that is not yet implemented.
 

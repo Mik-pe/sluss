@@ -359,7 +359,7 @@ impl App {
         serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)
     }
 }
-fn valid_name(value: &str) -> bool {
+pub(crate) fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 100
         && value != "."

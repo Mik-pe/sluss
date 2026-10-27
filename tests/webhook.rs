@@ -91,6 +91,39 @@ async fn rejects_forgery_and_deduplicates_signed_retries() {
 }
 
 #[tokio::test]
+async fn configured_router_ignores_other_installations_and_repositories() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.sqlite");
+    let app =
+        sluss::webhook::router_with_scope(b"secret".to_vec(), db.clone(), Some((17, 25))).unwrap();
+    let foreign = r#"{"installation":{"id":17},"repository":{"id":26}}"#;
+    let response = app
+        .clone()
+        .oneshot(request(
+            "foreign",
+            "push",
+            foreign,
+            &signature(foreign.as_bytes()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(Inbox::open(&db).unwrap().pending().unwrap().is_empty());
+    let local = r#"{"installation":{"id":17},"repository":{"id":25}}"#;
+    let response = app
+        .oneshot(request(
+            "local",
+            "push",
+            local,
+            &signature(local.as_bytes()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(Inbox::open(&db).unwrap().pending().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn concurrent_redeliveries_create_one_wakeup_and_large_bodies_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.sqlite");
@@ -222,4 +255,22 @@ fn reconciliation_does_not_adopt_an_unbound_nonempty_database() {
     ));
     assert_eq!(store.candidates().unwrap().len(), 1);
     assert_eq!(inbox.pending().unwrap().len(), 1);
+}
+
+#[test]
+fn periodic_scan_is_coalesced_and_revisions_are_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inbox.sqlite");
+    let mut inbox = Inbox::open(&path).unwrap();
+    assert!(inbox.schedule_if_idle(1, 2).unwrap());
+    let first = inbox.pending_for(1, 2).unwrap().unwrap();
+    assert!(!inbox.schedule_if_idle(1, 2).unwrap());
+    assert_eq!(inbox.pending_for(1, 2).unwrap().unwrap(), first);
+    assert!(inbox.acknowledge(&first).unwrap());
+    assert!(inbox.schedule_if_idle(1, 2).unwrap());
+    let second = inbox.pending_for(1, 2).unwrap().unwrap();
+    assert!(second.revision > first.revision);
+    assert!(!inbox.acknowledge(&first).unwrap());
+    inbox.record("webhook", "push", &[1; 32], 1, 2).unwrap();
+    assert!(!inbox.acknowledge(&second).unwrap());
 }

@@ -14,7 +14,8 @@ axum = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+toml = "1"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -29,6 +29,7 @@ struct ServerState {
     mode: Arc<AtomicU8>,
     pulls: Arc<AtomicUsize>,
     permissions: Arc<AtomicUsize>,
+    token_calls: Arc<AtomicUsize>,
 }
 async fn permission(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -89,6 +90,7 @@ async fn token(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    state.token_calls.fetch_add(1, Ordering::SeqCst);
     assert_eq!(id, 42);
     assert_eq!(body["repository_ids"], json!([7]));
     assert_eq!(
@@ -194,6 +196,7 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
             mode: mode.clone(),
             pulls: pulls.clone(),
             permissions: permissions.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -406,4 +409,139 @@ fn rejects_insecure_and_malformed_configuration() {
         App::new("id".into(), b"bad key", "https://api.github.com/"),
         Err(GitHubError::InvalidConfiguration)
     ));
+}
+
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn spawn_service(
+    db: &std::path::Path,
+    config: &std::path::Path,
+    key_dir: &std::path::Path,
+    port: u16,
+) -> ChildGuard {
+    let child = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(db)
+        .args([
+            "serve",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--config",
+        ])
+        .arg(config)
+        .env("SLUSS_WEBHOOK_SECRET", "test-secret")
+        .env(
+            "SLUSS_GITHUB_PRIVATE_KEY_PATH",
+            key_dir.join("test-key.pem"),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    ChildGuard(child)
+}
+#[tokio::test]
+async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let (key_dir, _private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(1));
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let api = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo/pulls/19", get(pull))
+        .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route("/repos/owner/repo/pulls", get(open_pulls))
+        .route(
+            "/repos/owner/repo/collaborators/reviewer/permission",
+            get(permission),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: token_calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    let api_task = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config,format!("version = 1\n[github]\napp_client_id = \"app-client-id\"\ninstallation_id = 42\nrepository_id = 7\nowner = \"owner\"\nrepository = \"repo\"\napi = \"http://{api_addr}/\"\n[queue]\ntarget = \"main\"\npoll_seconds = 1\nrescan_seconds = 30\n[checks]\nrequired_reviews = 1\nblock_labels = [\"do-not-merge\"]\n")).unwrap();
+    let mut child = spawn_service(&db, &config, key_dir.path(), port);
+    let client = reqwest::Client::new();
+    let mut failed_pending = false;
+    for _ in 0..150 {
+        if token_calls.load(Ordering::SeqCst) > 0
+            && sluss::webhook::Inbox::open(&db)
+                .ok()
+                .and_then(|i| i.pending_for(42, 7).ok().flatten())
+                .is_some()
+        {
+            failed_pending = true;
+            break;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("service exited before failed reconciliation");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(failed_pending, "failed work was not retained");
+    drop(child);
+    mode.store(0, Ordering::SeqCst);
+    let mut child = spawn_service(&db, &config, key_dir.path(), port);
+    let mut ready = false;
+    for _ in 0..150 {
+        if let Ok(store) = sluss::store::Store::open(&db)
+            && store.candidates().is_ok_and(|v| v.len() == 1)
+        {
+            ready = true;
+            break;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("service exited before startup reconciliation");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "startup rescan did not populate the queue");
+    mode.store(10, Ordering::SeqCst);
+    let body = br#"{"installation":{"id":42},"repository":{"id":7}}"#;
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"test-secret").unwrap();
+    mac.update(body);
+    let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/webhook"))
+        .header("X-Hub-Signature-256", signature)
+        .header("X-GitHub-Delivery", "service-test")
+        .header("X-GitHub-Event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let mut cleared = false;
+    for _ in 0..150 {
+        if let Ok(store) = sluss::store::Store::open(&db)
+            && store.candidates().is_ok_and(|v| v.is_empty())
+        {
+            cleared = true;
+            break;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("service exited before webhook reconciliation");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(cleared, "webhook reconciliation did not remove blocked PR");
+    api_task.abort();
 }

@@ -23,6 +23,9 @@ enum Command {
         /// Listen address; expose externally only behind a trusted HTTPS proxy.
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: std::net::SocketAddr,
+        /// Enable automatic observation using operator-owned configuration.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
     Reconcile(ReconcileArgs),
@@ -63,12 +66,42 @@ struct ReconcileArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Command::Serve { listen } = cli.command {
+    if let Command::Serve { listen, config } = cli.command {
         let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
         let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
-        let app = sluss::webhook::router(secret.into_bytes(), cli.db)?;
+        let worker = if let Some(path) = config {
+            let config = sluss::config::Config::load(&path)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app = std::sync::Arc::new(sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &key,
+                &config.github.api,
+            )?);
+            let _store = Store::open(&cli.db)?;
+            Some((
+                app,
+                config.policy(),
+                std::time::Duration::from_secs(config.queue.poll_seconds),
+                std::time::Duration::from_secs(config.queue.rescan_seconds),
+            ))
+        } else {
+            None
+        };
+        let scope = worker
+            .as_ref()
+            .map(|(_, policy, _, _)| (policy.installation, policy.repository));
+        let app = sluss::webhook::router_with_scope(secret.into_bytes(), cli.db.clone(), scope)?;
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        eprintln!("webhook listener on {listen}; reconciliation worker is not implemented");
+        if let Some((app, policy, poll, rescan)) = worker {
+            tokio::spawn(sluss::worker::supervise(app, cli.db, policy, poll, rescan));
+            eprintln!(
+                "webhook listener on {listen}; automatic observations enabled, CI dispatch and landing disabled"
+            );
+        } else {
+            eprintln!("webhook listener on {listen}; reconciliation worker is not enabled");
+        }
         axum::serve(listener, app).await?;
         return Ok(());
     }
@@ -106,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if matches!(cli.command, Command::Doctor) {
         eprintln!(
-            "NOT READY: GitHub App, admission, CI attestation, branch rules and strict landing are not implemented."
+            "NOT READY: live GitHub permissions, branch rules, CI attestation and strict landing are not verified."
         );
         std::process::exit(1);
     }

@@ -1,5 +1,5 @@
 //! Authenticated webhook intake. Events schedule reconciliation; they do not
-//! authorize changes, and no GitHub reconciliation worker exists yet.
+//! authorize changes. A configured worker reconciles the current provider state.
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
@@ -18,10 +18,18 @@ use sha2::{Digest, Sha256};
 struct AppState {
     secret: Arc<[u8]>,
     db: PathBuf,
+    scope: Option<(i64, i64)>,
 }
 
 /// Construct a webhook-only router. TLS and public ingress belong at a trusted proxy.
 pub fn router(secret: Vec<u8>, db: PathBuf) -> Result<Router, &'static str> {
+    router_with_scope(secret, db, None)
+}
+pub fn router_with_scope(
+    secret: Vec<u8>,
+    db: PathBuf,
+    scope: Option<(i64, i64)>,
+) -> Result<Router, &'static str> {
     if secret.is_empty() {
         return Err("webhook secret must not be empty");
     }
@@ -31,6 +39,7 @@ pub fn router(secret: Vec<u8>, db: PathBuf) -> Result<Router, &'static str> {
         .with_state(AppState {
             secret: secret.into(),
             db,
+            scope,
         }))
 }
 
@@ -82,7 +91,7 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     {
         return StatusCode::BAD_REQUEST;
     }
-    // Unknown events are ignored; a future worker always reads current GitHub state.
+    // Unknown events are ignored; the worker reads current GitHub state.
     if !matches!(
         event,
         "pull_request"
@@ -101,6 +110,12 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     };
     if envelope.installation.id <= 0 || envelope.repository.id <= 0 {
         return StatusCode::BAD_REQUEST;
+    }
+    if state
+        .scope
+        .is_some_and(|scope| scope != (envelope.installation.id, envelope.repository.id))
+    {
+        return StatusCode::ACCEPTED;
     }
     let digest: [u8; 32] = Sha256::digest(&body).into();
     let delivery = delivery.to_owned();
@@ -210,6 +225,49 @@ impl Inbox {
             })
         })?;
         rows.collect()
+    }
+    pub fn pending_for(
+        &self,
+        installation: i64,
+        repository: i64,
+    ) -> rusqlite::Result<Option<Reconciliation>> {
+        self.conn.query_row("SELECT installation,repository,revision FROM reconciliations WHERE installation=?1 AND repository=?2",params![installation,repository],|r| Ok(Reconciliation { installation:r.get(0)?, repository:r.get(1)?, revision:r.get(2)? })).optional()
+    }
+    /// Queue an internal full scan only if no scan is already pending. The
+    /// AUTOINCREMENT clock is shared with webhook deliveries and never reused.
+    pub fn schedule_if_idle(
+        &mut self,
+        installation: i64,
+        repository: i64,
+    ) -> rusqlite::Result<bool> {
+        if installation <= 0 || repository <= 0 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "invalid repository scope".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reconciliations WHERE installation=?1 AND repository=?2)",
+            params![installation, repository],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(false);
+        }
+        tx.execute("INSERT INTO webhook_deliveries(delivery_id,event,digest) VALUES('internal-' || lower(hex(randomblob(16))), '__scan__', zeroblob(32))", [])?;
+        let revision = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO reconciliations(installation,repository,revision) VALUES(?1,?2,?3)",
+            params![installation, repository, revision],
+        )?;
+        tx.execute(
+            "DELETE FROM webhook_deliveries WHERE sequence=?1",
+            [revision],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
     /// A newer delivery prevents an older worker from deleting its wakeup.
     pub fn acknowledge(&self, job: &Reconciliation) -> rusqlite::Result<bool> {
