@@ -8,4 +8,6 @@ Required design work includes authenticating webhook payloads before persistence
 
 Webhook intake verifies HMAC over the raw payload and deduplicates normal GitHub redelivery IDs. GitHub's signature covers the body, not delivery or event headers, so an intercepted valid body and signature can be replayed with a different ID; deduplication alone is not cryptographic replay protection. Treat all events as hints and reconcile current state, use HTTPS at a trusted proxy, and do not expose the webhook secret or captured signed payloads. A reconciliation worker and periodic recovery of missed events remain to be implemented.
 
+The App authentication helper requests read-only access to one repository, rejects unexpectedly broad returned permissions or repository scope, and does not follow HTTP redirects. Its token issuance has only been tested against a local stub, not a GitHub App installation. The caller must verify that an installation and repository are authorized before requesting a token; an untrusted webhook is not sufficient authorization.
+
 No operation may silently fall back from exact-commit strict landing to squash or a different commit. If provider guarantees, evidence, policy identity, or update outcome are uncertain, stop and reconcile rather than land.

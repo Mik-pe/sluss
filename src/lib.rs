@@ -4,6 +4,7 @@
 //! an observation, not authorization to merge.
 
 pub mod batch;
+pub mod github;
 pub mod store;
 pub mod verification;
 pub mod webhook;

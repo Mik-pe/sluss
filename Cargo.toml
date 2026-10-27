@@ -7,6 +7,9 @@ description = "A capacity-aware CI orchestrator and merge queue"
 repository = "https://github.com/Mik-pe/sluss"
 
 [dependencies]
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+time = { version = "0.3", features = ["parsing", "formatting"] }
 axum = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
