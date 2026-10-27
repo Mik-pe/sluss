@@ -8,6 +8,7 @@ pub mod batch;
 pub mod config;
 pub mod github;
 pub mod reconcile;
+pub mod scheduler;
 pub mod store;
 pub mod verification;
 pub mod webhook;
