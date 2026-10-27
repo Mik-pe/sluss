@@ -3,6 +3,7 @@
 //! This crate does not yet start CI or publish Git refs. Data in the queue is
 //! an observation, not authorization to merge.
 
+pub mod admission;
 pub mod batch;
 pub mod github;
 pub mod store;

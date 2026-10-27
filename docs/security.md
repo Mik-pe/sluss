@@ -12,4 +12,6 @@ The App authentication helper requests read-only access to one repository, rejec
 
 PR observations fetch all review pages and compare repeated reads, but GitHub does not expose an atomic snapshot across PRs, reviews and policy. Agreement between reads is not proof that the result stays current. Reviewer authority, branch policy, related PRs and code-owner requirements still need to be checked; observations alone cannot admit or land a change.
 
+The CI-planning admission evaluator accepts an explicit list of currently authorized reviewer IDs. It does not fetch or verify those permissions, implement CODEOWNERS or assert GitHub branch-rule equivalence. An approval must be independent and reference the current head; comments do not replace decisions, and authorized outstanding change requests block planning. The result is not a merge authorization.
+
 No operation may silently fall back from exact-commit strict landing to squash or a different commit. If provider guarantees, evidence, policy identity, or update outcome are uncertain, stop and reconcile rather than land.
