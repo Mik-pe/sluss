@@ -156,6 +156,7 @@ fn rejects_insecure_and_malformed_configuration() {
     let (_dir, private, _public) = keys();
     for url in [
         "http://example.com/",
+        "http://localhost/",
         "https://user:pass@example.com/",
         "https://example.com/path",
         "https://example.com/?q=1",

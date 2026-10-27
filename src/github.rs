@@ -81,7 +81,7 @@ impl App {
         let api = reqwest::Url::parse(api).map_err(|_| GitHubError::InvalidConfiguration)?;
         let loopback = api
             .host_str()
-            .is_some_and(|h| h == "127.0.0.1" || h == "[::1]" || h == "localhost");
+            .is_some_and(|h| h == "127.0.0.1" || h == "[::1]");
         if !(api.scheme() == "https" || api.scheme() == "http" && loopback)
             || api.host_str().is_none()
             || !api.username().is_empty()
