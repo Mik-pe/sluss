@@ -1,0 +1,221 @@
+//! Authenticated webhook intake. Events schedule reconciliation; they do not
+//! authorize changes, and no GitHub reconciliation worker exists yet.
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
+use hmac::{Hmac, Mac};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+struct AppState {
+    secret: Arc<[u8]>,
+    db: PathBuf,
+}
+
+/// Construct a webhook-only router. TLS and public ingress belong at a trusted proxy.
+pub fn router(secret: Vec<u8>, db: PathBuf) -> Result<Router, &'static str> {
+    if secret.is_empty() {
+        return Err("webhook secret must not be empty");
+    }
+    Ok(Router::new()
+        .route("/webhook", post(receive))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .with_state(AppState {
+            secret: secret.into(),
+            db,
+        }))
+}
+
+/// GitHub signs the raw payload, not the delivery or event headers. Delivery
+/// IDs deduplicate retries, but do not provide cryptographic replay protection.
+pub fn verify_signature(secret: &[u8], signature: &str, payload: &[u8]) -> bool {
+    let Some(hex_signature) = signature.strip_prefix("sha256=") else {
+        return false;
+    };
+    if hex_signature.len() != 64 {
+        return false;
+    }
+    let Ok(bytes) = hex::decode(hex_signature) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else {
+        return false;
+    };
+    mac.update(payload);
+    mac.verify_slice(&bytes).is_ok()
+}
+
+#[derive(Deserialize)]
+struct Entity {
+    id: i64,
+}
+#[derive(Deserialize)]
+struct Envelope {
+    installation: Entity,
+    repository: Entity,
+}
+
+async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let Some(signature) = get("x-hub-signature-256") else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    if !verify_signature(&state.secret, signature, &body) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let (Some(delivery), Some(event)) = (get("x-github-delivery"), get("x-github-event")) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if delivery.is_empty()
+        || delivery.len() > 128
+        || !delivery
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Unknown events are ignored; a future worker always reads current GitHub state.
+    if !matches!(
+        event,
+        "pull_request"
+            | "pull_request_review"
+            | "check_run"
+            | "check_suite"
+            | "workflow_run"
+            | "push"
+            | "repository"
+            | "repository_ruleset"
+    ) {
+        return StatusCode::ACCEPTED;
+    }
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if envelope.installation.id <= 0 || envelope.repository.id <= 0 {
+        return StatusCode::BAD_REQUEST;
+    }
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    let delivery = delivery.to_owned();
+    let event = event.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let mut inbox = Inbox::open(state.db)?;
+        inbox.record(
+            &delivery,
+            &event,
+            &digest,
+            envelope.installation.id,
+            envelope.repository.id,
+        )
+    })
+    .await
+    {
+        Ok(Ok(Record::New | Record::Duplicate)) => StatusCode::ACCEPTED,
+        Ok(Ok(Record::Collision)) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Record {
+    New,
+    Duplicate,
+    Collision,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reconciliation {
+    pub installation: i64,
+    pub repository: i64,
+    pub revision: i64,
+}
+
+pub struct Inbox {
+    conn: Connection,
+}
+impl Inbox {
+    pub fn open(path: impl AsRef<std::path::Path>) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_id TEXT NOT NULL UNIQUE, event TEXT NOT NULL, digest BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reconciliations (
+            installation INTEGER NOT NULL, repository INTEGER NOT NULL, revision INTEGER NOT NULL,
+            PRIMARY KEY(installation, repository)
+        );",
+        )?;
+        Ok(Self { conn })
+    }
+
+    /// Insert delivery and wakeup in one transaction. IDs must never be reset:
+    /// revisions must not be reused after a reconciliation has been acknowledged.
+    pub fn record(
+        &mut self,
+        delivery: &str,
+        event: &str,
+        digest: &[u8; 32],
+        installation: i64,
+        repository: i64,
+    ) -> rusqlite::Result<Record> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<(String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT event, digest FROM webhook_deliveries WHERE delivery_id=?1",
+                [delivery],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((old_event, old_digest)) = previous {
+            return Ok(if old_event == event && old_digest == digest {
+                Record::Duplicate
+            } else {
+                Record::Collision
+            });
+        }
+        tx.execute(
+            "INSERT INTO webhook_deliveries(delivery_id, event, digest) VALUES(?1, ?2, ?3)",
+            params![delivery, event, digest.as_slice()],
+        )?;
+        let revision = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO reconciliations(installation, repository, revision) VALUES(?1, ?2, ?3)
+            ON CONFLICT(installation, repository) DO UPDATE SET revision=excluded.revision",
+            params![installation, repository, revision],
+        )?;
+        tx.commit()?;
+        Ok(Record::New)
+    }
+    pub fn pending(&self) -> rusqlite::Result<Vec<Reconciliation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT installation, repository, revision FROM reconciliations ORDER BY revision",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Reconciliation {
+                installation: r.get(0)?,
+                repository: r.get(1)?,
+                revision: r.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+    /// A newer delivery prevents an older worker from deleting its wakeup.
+    pub fn acknowledge(&self, job: &Reconciliation) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM reconciliations WHERE installation=?1 AND repository=?2 AND revision=?3",
+            params![job.installation, job.repository, job.revision],
+        )? == 1)
+    }
+}

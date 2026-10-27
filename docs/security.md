@@ -6,4 +6,6 @@ The GitHub App's credentials, webhook secret, signing keys and any release secre
 
 Required design work includes authenticating webhook payloads before persistence, installation-scoped access, replay protection and durable deduplication, explicit trusted workflow and check identity, least privilege, auditable evidence, policy-change invalidation, and concurrency-safe landing. Operator-controlled policies and GitHub rules must prevent PR code from impersonating the attestor or disabling required verification. Doctor must validate relevant permissions and rules, while landing must still revalidate them.
 
+Webhook intake verifies HMAC over the raw payload and deduplicates normal GitHub redelivery IDs. GitHub's signature covers the body, not delivery or event headers, so an intercepted valid body and signature can be replayed with a different ID; deduplication alone is not cryptographic replay protection. Treat all events as hints and reconcile current state, use HTTPS at a trusted proxy, and do not expose the webhook secret or captured signed payloads. A reconciliation worker and periodic recovery of missed events remain to be implemented.
+
 No operation may silently fall back from exact-commit strict landing to squash or a different commit. If provider guarantees, evidence, policy identity, or update outcome are uncertain, stop and reconcile rather than land.

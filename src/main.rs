@@ -18,6 +18,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Receive authenticated GitHub webhook notifications (no worker yet).
+    Serve {
+        /// Listen address; expose externally only behind a trusted HTTPS proxy.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: std::net::SocketAddr,
+    },
     /// Show local queue state and implementation status.
     Status,
     /// Show reconciled PR observations.
@@ -30,8 +36,18 @@ enum Command {
     Doctor,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::Serve { listen } = cli.command {
+        let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
+        let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
+        let app = sluss::webhook::router(secret.into_bytes(), cli.db)?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        eprintln!("webhook listener on {listen}; reconciliation worker is not implemented");
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
     if matches!(cli.command, Command::Doctor) {
         eprintln!(
             "NOT READY: GitHub App, admission, CI attestation, branch rules and strict landing are not implemented."
@@ -40,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let store = Store::open(cli.db)?;
     match cli.command {
+        Command::Serve { .. } => unreachable!(),
         Command::Status => println!(
             "paused: {}\nqueued observations: {}\nCI dispatch: unavailable\nlanding: disabled",
             store.paused()?,
