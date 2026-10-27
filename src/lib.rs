@@ -6,6 +6,7 @@
 pub mod admission;
 pub mod batch;
 pub mod github;
+pub mod reconcile;
 pub mod store;
 pub mod verification;
 pub mod webhook;

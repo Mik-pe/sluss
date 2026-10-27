@@ -150,3 +150,76 @@ fn revision_survives_restart_and_prevents_lost_or_aba_wakeups() {
     assert!(!inbox.acknowledge(&current).unwrap());
     assert_eq!(inbox.pending().unwrap().len(), 1);
 }
+
+#[test]
+fn reconciliation_commits_queue_and_ack_together_without_losing_newer_events() {
+    use sluss::{
+        batch::Candidate,
+        store::{Store, StoreError},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox.record("d1", "push", &[1; 32], 1, 2).unwrap();
+    let first = inbox.pending().unwrap().remove(0);
+    let candidate = Candidate {
+        number: 5,
+        head_sha: "old".into(),
+    };
+    store
+        .apply_reconciliation(&first, &"f".repeat(64), std::slice::from_ref(&candidate))
+        .unwrap();
+    assert_eq!(store.candidates().unwrap(), vec![candidate.clone()]);
+    assert!(inbox.pending().unwrap().is_empty());
+    inbox.record("d2", "push", &[2; 32], 1, 2).unwrap();
+    let stale = inbox.pending().unwrap().remove(0);
+    inbox.record("d3", "push", &[3; 32], 1, 2).unwrap();
+    assert!(matches!(
+        store.apply_reconciliation(&stale, &"f".repeat(64), &[]),
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(store.candidates().unwrap(), vec![candidate]);
+    let newer = inbox.pending().unwrap().remove(0);
+    assert!(matches!(
+        store.apply_reconciliation(&newer, &"e".repeat(64), &[]),
+        Err(StoreError::PolicyMismatch)
+    ));
+    store
+        .apply_reconciliation(&newer, &"f".repeat(64), &[])
+        .unwrap();
+    assert!(store.candidates().unwrap().is_empty());
+    inbox.record("other", "push", &[4; 32], 2, 3).unwrap();
+    let other = inbox.pending().unwrap().remove(0);
+    assert!(matches!(
+        store.apply_reconciliation(&other, &"f".repeat(64), &[]),
+        Err(StoreError::RepositoryMismatch)
+    ));
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+}
+
+#[test]
+fn reconciliation_does_not_adopt_an_unbound_nonempty_database() {
+    use sluss::{
+        batch::Candidate,
+        store::{Store, StoreError},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let mut inbox = Inbox::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    store
+        .observe_candidate(&Candidate {
+            number: 1,
+            head_sha: "existing".into(),
+        })
+        .unwrap();
+    inbox.record("new", "push", &[1; 32], 1, 2).unwrap();
+    let job = inbox.pending().unwrap().remove(0);
+    assert!(matches!(
+        store.apply_reconciliation(&job, &"f".repeat(64), &[]),
+        Err(StoreError::RepositoryMismatch)
+    ));
+    assert_eq!(store.candidates().unwrap().len(), 1);
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+}

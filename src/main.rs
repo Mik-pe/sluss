@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use sluss::store::Store;
 
 #[derive(Parser)]
@@ -24,6 +24,8 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: std::net::SocketAddr,
     },
+    /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
+    Reconcile(ReconcileArgs),
     /// Show local queue state and implementation status.
     Status,
     /// Show reconciled PR observations.
@@ -34,6 +36,28 @@ enum Command {
     Resume,
     /// Explain which prerequisites are not yet implemented.
     Doctor,
+}
+
+#[derive(Args)]
+struct ReconcileArgs {
+    #[arg(long)]
+    owner: String,
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    app_client_id: String,
+    #[arg(long)]
+    installation_id: i64,
+    #[arg(long)]
+    repository_id: i64,
+    #[arg(long, default_value = "main")]
+    target: String,
+    #[arg(long, default_value_t = 1)]
+    required_reviews: usize,
+    #[arg(long)]
+    block_label: Vec<String>,
+    #[arg(long, default_value = "https://api.github.com/")]
+    api: String,
 }
 
 #[tokio::main]
@@ -48,6 +72,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         axum::serve(listener, app).await?;
         return Ok(());
     }
+    if let Command::Reconcile(args) = cli.command {
+        if args.installation_id <= 0 || args.repository_id <= 0 || args.required_reviews == 0 {
+            return Err("invalid reconciliation configuration".into());
+        }
+        let inbox = sluss::webhook::Inbox::open(&cli.db)?;
+        let Some(job) = inbox.pending()?.into_iter().find(|job| {
+            job.installation == args.installation_id && job.repository == args.repository_id
+        }) else {
+            println!("no pending reconciliation for configured repository");
+            return Ok(());
+        };
+        let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let key = std::fs::read(key_path)?;
+        let app = sluss::github::App::new(args.app_client_id, &key, &args.api)?;
+        let token = app
+            .read_token(args.installation_id as u64, args.repository_id as u64)
+            .await?;
+        let config = sluss::reconcile::RepositoryPolicy {
+            installation: args.installation_id,
+            repository: args.repository_id,
+            owner: args.owner,
+            name: args.repository,
+            target_branch: args.target,
+            required_reviews: args.required_reviews,
+            block_labels: args.block_label.into_iter().collect(),
+        };
+        let mut store = Store::open(&cli.db)?;
+        sluss::reconcile::reconcile_once(&app, &token, &mut store, &job, &config).await?;
+        println!("repository observations updated; CI dispatch and landing remain disabled");
+        return Ok(());
+    }
     if matches!(cli.command, Command::Doctor) {
         eprintln!(
             "NOT READY: GitHub App, admission, CI attestation, branch rules and strict landing are not implemented."
@@ -57,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(cli.db)?;
     match cli.command {
         Command::Serve { .. } => unreachable!(),
+        Command::Reconcile(_) => unreachable!(),
         Command::Status => println!(
             "paused: {}\nqueued observations: {}\nCI dispatch: unavailable\nlanding: disabled",
             store.paused()?,

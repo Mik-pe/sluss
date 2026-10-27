@@ -37,6 +37,7 @@ pub struct InstallationToken {
     secret: String,
     pub expires_at: String,
     repository_id: u64,
+    installation_id: u64,
 }
 impl InstallationToken {
     pub fn secret(&self) -> &str {
@@ -195,6 +196,7 @@ impl App {
             secret: response.token,
             expires_at: response.expires_at,
             repository_id,
+            installation_id,
         })
     }
 }
@@ -464,5 +466,63 @@ impl App {
             return Err(GitHubError::UnstableObservation);
         }
         Ok(permission)
+    }
+}
+
+#[derive(Deserialize)]
+struct PullNumber {
+    number: u64,
+}
+impl App {
+    /// Enumerate open pull requests twice. A changed or truncated listing is not usable.
+    pub async fn open_pull_numbers(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+    ) -> Result<Vec<u64>, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let first = self.fetch_open_pulls(token, owner, repository).await?;
+        let second = self.fetch_open_pulls(token, owner, repository).await?;
+        if first != second {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(first)
+    }
+    async fn fetch_open_pulls(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+    ) -> Result<Vec<u64>, GitHubError> {
+        let path = format!("repos/{owner}/{repository}/pulls");
+        let mut result = Vec::new();
+        let mut unique = std::collections::BTreeSet::new();
+        for page in 1..=100u32 {
+            // GitHub defaults to state=open for this endpoint.
+            let pulls: Vec<PullNumber> = self.get_json(token, &path, Some(page)).await?;
+            if pulls.len() > 100 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let done = pulls.len() < 100;
+            for pull in pulls {
+                if pull.number == 0 || !unique.insert(pull.number) {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                result.push(pull.number);
+            }
+            if done {
+                return Ok(result);
+            }
+        }
+        Err(GitHubError::UnstableObservation)
+    }
+    pub fn repository_id(token: &InstallationToken) -> u64 {
+        token.repository_id
+    }
+    pub fn installation_id(token: &InstallationToken) -> u64 {
+        token.installation_id
     }
 }

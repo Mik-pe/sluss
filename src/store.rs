@@ -18,6 +18,10 @@ pub enum StoreError {
     InvalidCandidate,
     #[error("batch candidate is no longer in the queue at the frozen head")]
     StaleCandidate,
+    #[error("database is bound to a different GitHub installation or repository")]
+    RepositoryMismatch,
+    #[error("repository policy has changed; explicit migration is required")]
+    PolicyMismatch,
 }
 
 pub struct Store {
@@ -40,6 +44,9 @@ impl Store {
             );
             CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS repository_binding (
+                id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
             );",
         )?;
         Ok(Self { conn })
@@ -95,6 +102,98 @@ impl Store {
         invalidate_batches(&tx, number, None)?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    /// Replace queue observations and acknowledge a reconciliation atomically.
+    /// A newer webhook revision makes this entire write fail. One database is
+    /// restricted to one repository until the queue is explicitly redesigned.
+    pub fn apply_reconciliation(
+        &mut self,
+        job: &crate::webhook::Reconciliation,
+        policy_digest: &str,
+        candidates: &[Candidate],
+    ) -> Result<(), StoreError> {
+        if job.installation <= 0
+            || job.repository <= 0
+            || job.revision <= 0
+            || policy_digest.len() != 64
+            || !policy_digest
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err(StoreError::InvalidCandidate);
+        }
+        let mut numbers = std::collections::BTreeSet::new();
+        if candidates.iter().any(|c| {
+            c.number == 0
+                || c.number > i64::MAX as u64
+                || c.head_sha.is_empty()
+                || !numbers.insert(c.number)
+        }) {
+            return Err(StoreError::InvalidCandidate);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let binding: Option<(i64, i64, String)> = tx
+            .query_row(
+                "SELECT installation,repository,policy_digest FROM repository_binding WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((installation, repository, digest)) = binding {
+            if (installation, repository) != (job.installation, job.repository) {
+                return Err(StoreError::RepositoryMismatch);
+            }
+            if digest != policy_digest {
+                return Err(StoreError::PolicyMismatch);
+            }
+        } else {
+            let existing: i64 = tx.query_row(
+                "SELECT (SELECT COUNT(*) FROM candidates) + (SELECT COUNT(*) FROM batches)",
+                [],
+                |r| r.get(0),
+            )?;
+            if existing != 0 {
+                return Err(StoreError::RepositoryMismatch);
+            }
+        }
+        let revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM reconciliations WHERE installation=?1 AND repository=?2",
+                params![job.installation, job.repository],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if revision != Some(job.revision) {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO repository_binding(id,installation,repository,policy_digest) VALUES(1,?1,?2,?3)",
+            params![job.installation, job.repository, policy_digest],
+        )?;
+        let old: Vec<u64> = {
+            let mut stmt = tx.prepare("SELECT number FROM candidates")?;
+            let rows = stmt.query_map([], |r| Ok(r.get::<_, i64>(0)? as u64))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for number in old {
+            if !numbers.contains(&number) {
+                tx.execute("DELETE FROM candidates WHERE number=?1", [number as i64])?;
+                invalidate_batches(&tx, number, None)?;
+            }
+        }
+        for candidate in candidates {
+            tx.execute("INSERT INTO candidates(number,head_sha,sequence) VALUES(?1,?2,(SELECT COALESCE(MAX(sequence),0)+1 FROM candidates)) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,sequence=excluded.sequence WHERE candidates.head_sha!=excluded.head_sha",params![candidate.number as i64,candidate.head_sha])?;
+            invalidate_batches(&tx, candidate.number, Some(&candidate.head_sha))?;
+        }
+        tx.execute(
+            "DELETE FROM reconciliations WHERE installation=?1 AND repository=?2 AND revision=?3",
+            params![job.installation, job.repository, job.revision],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn candidates(&self) -> Result<Vec<Candidate>, StoreError> {

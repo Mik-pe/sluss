@@ -50,8 +50,13 @@ async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Valu
     } else {
         "a".repeat(40)
     };
+    let label = if state.mode.load(Ordering::SeqCst) == 10 {
+        "do-not-merge"
+    } else {
+        "needs-work"
+    };
     Json(
-        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":"needs-work"}]}),
+        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":label}]}),
     )
 }
 async fn reviews(
@@ -69,6 +74,14 @@ async fn reviews(
     };
     let items: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"user":{"id":9,"login":"reviewer","type":"User"},"state":"APPROVED","commit_id":"a".repeat(40),"submitted_at":"2026-01-01T00:00:00Z"})).collect();
     Json(json!(items))
+}
+async fn open_pulls(
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query.get("page").map(String::as_str), Some("1"));
+    Json(json!([{"number":19}]))
 }
 async fn token(
     State(state): State<ServerState>,
@@ -160,7 +173,7 @@ fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
 }
 #[tokio::test]
 async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
-    let (_dir, private, public) = keys();
+    let (key_dir, private, public) = keys();
     let mode = Arc::new(AtomicU8::new(0));
     let pulls = Arc::new(AtomicUsize::new(0));
     let permissions = Arc::new(AtomicUsize::new(0));
@@ -168,6 +181,7 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route("/repos/owner/repo/pulls", get(open_pulls))
         .route(
             "/repos/owner/repo/collaborators/reviewer/permission",
             get(permission),
@@ -227,6 +241,45 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         authorized_reviewers: authorized.authorized_reviewers,
     };
     assert!(sluss::admission::evaluate(&authorized.snapshot, &policy).is_ok());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let mut inbox = sluss::webhook::Inbox::open(&path).unwrap();
+    let mut store = sluss::store::Store::open(&path).unwrap();
+    inbox
+        .record("reconcile-1", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let job = inbox.pending().unwrap().remove(0);
+    let config = sluss::reconcile::RepositoryPolicy {
+        installation: 42,
+        repository: 7,
+        owner: "owner".into(),
+        name: "repo".into(),
+        target_branch: "main".into(),
+        required_reviews: 1,
+        block_labels: std::collections::BTreeSet::from(["do-not-merge".into()]),
+    };
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &job, &config)
+        .await
+        .unwrap();
+    assert_eq!(store.candidates().unwrap()[0].head_sha, "a".repeat(40));
+    assert!(inbox.pending().unwrap().is_empty());
+    inbox
+        .record("reconcile-2", "pull_request", &[2; 32], 42, 7)
+        .unwrap();
+    let job = inbox.pending().unwrap().remove(0);
+    mode.store(8, Ordering::SeqCst);
+    assert!(
+        sluss::reconcile::reconcile_once(&client, &token, &mut store, &job, &config)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.candidates().unwrap().len(), 1);
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+    mode.store(10, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &job, &config)
+        .await
+        .unwrap();
+    assert!(store.candidates().unwrap().is_empty());
     mode.store(7, Ordering::SeqCst);
     assert!(
         client
@@ -267,6 +320,52 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         client.read_token(0, 7).await,
         Err(GitHubError::InvalidConfiguration)
     ));
+    mode.store(0, Ordering::SeqCst);
+    let cli_dir = tempfile::tempdir().unwrap();
+    let cli_db = cli_dir.path().join("cli.sqlite");
+    let mut inbox = sluss::webhook::Inbox::open(&cli_db).unwrap();
+    inbox.record("cli", "push", &[9; 32], 42, 7).unwrap();
+    let path = cli_db.clone();
+    let key_path = key_dir.path().join("test-key.pem");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(path)
+            .args([
+                "reconcile",
+                "--owner",
+                "owner",
+                "--repository",
+                "repo",
+                "--app-client-id",
+                "app-client-id",
+                "--installation-id",
+                "42",
+                "--repository-id",
+                "7",
+                "--api",
+                &format!("http://{addr}/"),
+            ])
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_path)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        sluss::store::Store::open(&cli_db)
+            .unwrap()
+            .candidates()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(inbox.pending().unwrap().is_empty());
     server.abort();
 }
 #[test]
