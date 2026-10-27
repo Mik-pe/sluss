@@ -10,4 +10,6 @@ Webhook intake verifies HMAC over the raw payload and deduplicates normal GitHub
 
 The App authentication helper requests read-only access to one repository, rejects unexpectedly broad returned permissions or repository scope, and does not follow HTTP redirects. Its token issuance has only been tested against a local stub, not a GitHub App installation. The caller must verify that an installation and repository are authorized before requesting a token; an untrusted webhook is not sufficient authorization.
 
+PR observations fetch all review pages and compare repeated reads, but GitHub does not expose an atomic snapshot across PRs, reviews and policy. Agreement between reads is not proof that the result stays current. Reviewer authority, branch policy, related PRs and code-owner requirements still need to be checked; observations alone cannot admit or land a change.
+
 No operation may silently fall back from exact-commit strict landing to squash or a different commit. If provider guarantees, evidence, policy identity, or update outcome are uncertain, stop and reconcile rather than land.

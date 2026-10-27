@@ -22,6 +22,8 @@ pub enum GitHubError {
     Status(u16),
     #[error("GitHub returned an invalid or unexpectedly scoped installation token")]
     InvalidResponse,
+    #[error("GitHub PR or review data is invalid, incomplete, or changed during observation")]
+    UnstableObservation,
 }
 
 pub struct App {
@@ -34,6 +36,7 @@ pub struct App {
 pub struct InstallationToken {
     secret: String,
     pub expires_at: String,
+    repository_id: u64,
 }
 impl InstallationToken {
     pub fn secret(&self) -> &str {
@@ -191,6 +194,178 @@ impl App {
         Ok(InstallationToken {
             secret: response.token,
             expires_at: response.expires_at,
+            repository_id,
         })
     }
+}
+
+/// An observation is not an admission decision: reviewer permissions, branch
+/// protection and concurrent provider changes must still be validated.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullObservation {
+    pub number: u64,
+    pub state: String,
+    pub draft: bool,
+    pub user: PullUser,
+    pub head: PullHead,
+    pub base: PullBase,
+    pub labels: Vec<PullLabel>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullUser {
+    pub id: u64,
+    pub login: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullHead {
+    pub sha: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullBase {
+    pub sha: String,
+    #[serde(rename = "ref")]
+    pub branch: String,
+    pub repo: PullRepository,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRepository {
+    pub id: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullLabel {
+    pub name: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReviewObservation {
+    pub id: u64,
+    pub user: Option<PullUser>,
+    pub state: String,
+    pub commit_id: Option<String>,
+    pub submitted_at: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSnapshot {
+    pub pull: PullObservation,
+    pub reviews: Vec<ReviewObservation>,
+}
+
+impl App {
+    /// Read a bounded, double-checked snapshot using a repository-scoped token.
+    /// GitHub does not provide an atomic PR/review snapshot; matching reads do
+    /// not prove that values remain current after this method returns.
+    pub async fn observe_pull(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        number: u64,
+    ) -> Result<PullSnapshot, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) || number == 0 {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let path = format!("repos/{owner}/{repository}/pulls/{number}");
+        let first: PullObservation = self.get_json(token, &path, None).await?;
+        let reviews1 = self.get_reviews(token, &path).await?;
+        let middle: PullObservation = self.get_json(token, &path, None).await?;
+        let reviews2 = self.get_reviews(token, &path).await?;
+        let last: PullObservation = self.get_json(token, &path, None).await?;
+        if first != middle
+            || middle != last
+            || reviews1 != reviews2
+            || last.number != number
+            || last.base.repo.id != token.repository_id
+            || last.user.id == 0
+            || !commit_sha(&last.head.sha)
+            || !commit_sha(&last.base.sha)
+            || last.base.branch.is_empty()
+            || last.labels.iter().any(|l| l.name.is_empty())
+            || reviews2.iter().any(|r| {
+                r.id == 0 || r.state.is_empty() || r.user.as_ref().is_some_and(|u| u.id == 0)
+            })
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(PullSnapshot {
+            pull: last,
+            reviews: reviews2,
+        })
+    }
+    async fn get_reviews(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+    ) -> Result<Vec<ReviewObservation>, GitHubError> {
+        let mut result = Vec::new();
+        for page in 1..=100u32 {
+            let rows: Vec<ReviewObservation> = self
+                .get_json(token, &format!("{path}/reviews"), Some(page))
+                .await?;
+            if rows.len() > 100 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let done = rows.len() < 100;
+            result.extend(rows);
+            if done {
+                let mut ids = std::collections::BTreeSet::new();
+                if result.iter().any(|review| !ids.insert(review.id)) {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                return Ok(result);
+            }
+        }
+        Err(GitHubError::UnstableObservation)
+    }
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+        page: Option<u32>,
+    ) -> Result<T, GitHubError> {
+        let mut url = self
+            .api
+            .join(path)
+            .map_err(|_| GitHubError::InvalidConfiguration)?;
+        if let Some(page) = page {
+            url.query_pairs_mut()
+                .append_pair("per_page", "100")
+                .append_pair("page", &page.to_string());
+        }
+        let mut response = self
+            .client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(token.secret())
+            .send()
+            .await
+            .map_err(|_| GitHubError::Request)?;
+        if !response.status().is_success() {
+            return Err(GitHubError::Status(response.status().as_u16()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
+            if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)
+    }
+}
+fn valid_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+fn commit_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }

@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
 };
 
@@ -27,6 +27,35 @@ struct Claims {
 struct ServerState {
     public_key: Arc<Vec<u8>>,
     mode: Arc<AtomicU8>,
+    pulls: Arc<AtomicUsize>,
+}
+async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let sha = if state.mode.load(Ordering::SeqCst) == 5 && count > 0 {
+        "c".repeat(40)
+    } else {
+        "a".repeat(40)
+    };
+    Json(
+        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":"needs-work"}]}),
+    )
+}
+async fn reviews(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query.get("per_page").map(String::as_str), Some("100"));
+    let page = query["page"].parse::<u64>().unwrap();
+    let count = if state.mode.load(Ordering::SeqCst) == 6 {
+        if page == 1 { 100 } else { 1 }
+    } else {
+        1
+    };
+    let items: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"user":{"id":9,"login":"reviewer","type":"User"},"state":"APPROVED","commit_id":"a".repeat(40),"submitted_at":"2026-01-01T00:00:00Z"})).collect();
+    Json(json!(items))
 }
 async fn token(
     State(state): State<ServerState>,
@@ -120,11 +149,15 @@ fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
 async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let (_dir, private, public) = keys();
     let mode = Arc::new(AtomicU8::new(0));
+    let pulls = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo/pulls/19", get(pull))
+        .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
         .with_state(ServerState {
             public_key: Arc::new(public),
             mode: mode.clone(),
+            pulls: pulls.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -133,6 +166,32 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let token = client.read_token(42, 7).await.unwrap();
     assert_eq!(token.secret(), "fake-installation-token");
     assert!(!format!("{token:?}").contains(token.secret()));
+    let snapshot = client
+        .observe_pull(&token, "owner", "repo", 19)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.pull.head.sha, "a".repeat(40));
+    assert_eq!(snapshot.reviews.len(), 1);
+    mode.store(6, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .observe_pull(&token, "owner", "repo", 19)
+            .await
+            .unwrap()
+            .reviews
+            .len(),
+        101
+    );
+    mode.store(5, Ordering::SeqCst);
+    pulls.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        client.observe_pull(&token, "owner", "repo", 19).await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    assert!(matches!(
+        client.observe_pull(&token, "../owner", "repo", 19).await,
+        Err(GitHubError::InvalidConfiguration)
+    ));
     mode.store(1, Ordering::SeqCst);
     assert!(matches!(
         client.read_token(42, 7).await,
