@@ -28,6 +28,19 @@ struct ServerState {
     public_key: Arc<Vec<u8>>,
     mode: Arc<AtomicU8>,
     pulls: Arc<AtomicUsize>,
+    permissions: Arc<AtomicUsize>,
+}
+async fn permission(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let count = state.permissions.fetch_add(1, Ordering::SeqCst);
+    let access = if mode == 7 || (mode == 9 && count > 0) {
+        "read"
+    } else {
+        "write"
+    };
+    let id = if mode == 8 { 10 } else { 9 };
+    Json(json!({"permission":access,"user":{"id":id,"login":"reviewer","type":"User"}}))
 }
 async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -150,14 +163,20 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let (_dir, private, public) = keys();
     let mode = Arc::new(AtomicU8::new(0));
     let pulls = Arc::new(AtomicUsize::new(0));
+    let permissions = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route(
+            "/repos/owner/repo/collaborators/reviewer/permission",
+            get(permission),
+        )
         .with_state(ServerState {
             public_key: Arc::new(public),
             mode: mode.clone(),
             pulls: pulls.clone(),
+            permissions: permissions.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -191,6 +210,46 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     assert!(matches!(
         client.observe_pull(&token, "../owner", "repo", 19).await,
         Err(GitHubError::InvalidConfiguration)
+    ));
+    mode.store(0, Ordering::SeqCst);
+    let authorized = client
+        .observe_authorized_pull(&token, "owner", "repo", 19)
+        .await
+        .unwrap();
+    assert_eq!(
+        authorized.authorized_reviewers,
+        std::collections::BTreeSet::from([9])
+    );
+    let policy = sluss::admission::Policy {
+        target_branch: "main".into(),
+        required_reviews: 1,
+        block_labels: Default::default(),
+        authorized_reviewers: authorized.authorized_reviewers,
+    };
+    assert!(sluss::admission::evaluate(&authorized.snapshot, &policy).is_ok());
+    mode.store(7, Ordering::SeqCst);
+    assert!(
+        client
+            .observe_authorized_pull(&token, "owner", "repo", 19)
+            .await
+            .unwrap()
+            .authorized_reviewers
+            .is_empty()
+    );
+    mode.store(8, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_authorized_pull(&token, "owner", "repo", 19)
+            .await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    permissions.store(0, Ordering::SeqCst);
+    mode.store(9, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_authorized_pull(&token, "owner", "repo", 19)
+            .await,
+        Err(GitHubError::UnstableObservation)
     ));
     mode.store(1, Ordering::SeqCst);
     assert!(matches!(

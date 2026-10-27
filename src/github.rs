@@ -369,3 +369,100 @@ fn commit_sha(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedPullObservation {
+    pub snapshot: PullSnapshot,
+    /// IDs with verified write or admin base permission at observation time.
+    pub authorized_reviewers: std::collections::BTreeSet<u64>,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+struct PermissionObservation {
+    permission: String,
+    user: PullUser,
+}
+
+impl App {
+    /// Recheck each human reviewer's effective GitHub repository permission,
+    /// then reread the PR. This is still not an atomic authorization snapshot.
+    pub async fn observe_authorized_pull(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        number: u64,
+    ) -> Result<AuthorizedPullObservation, GitHubError> {
+        let first = self.observe_pull(token, owner, repository, number).await?;
+        let mut reviewers = BTreeMap::new();
+        for review in &first.reviews {
+            let user = review
+                .user
+                .as_ref()
+                .ok_or(GitHubError::UnstableObservation)?;
+            if user.id == 0 || !valid_name(&user.login) {
+                return Err(GitHubError::UnstableObservation);
+            }
+            if user.kind != "User" {
+                continue;
+            }
+            if let Some(old) = reviewers.insert(user.id, user.login.clone())
+                && !old.eq_ignore_ascii_case(&user.login)
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        if reviewers.len() > 100 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut first_permissions = BTreeMap::new();
+        for (id, login) in &reviewers {
+            first_permissions.insert(
+                *id,
+                self.permission(token, owner, repository, *id, login)
+                    .await?,
+            );
+        }
+        let mut authorized = std::collections::BTreeSet::new();
+        for (id, login) in &reviewers {
+            let current = self
+                .permission(token, owner, repository, *id, login)
+                .await?;
+            if first_permissions.get(id) != Some(&current) {
+                return Err(GitHubError::UnstableObservation);
+            }
+            match current.permission.as_str() {
+                "admin" | "write" => {
+                    authorized.insert(*id);
+                }
+                "read" | "none" => {}
+                _ => return Err(GitHubError::UnstableObservation),
+            }
+        }
+        let last = self.observe_pull(token, owner, repository, number).await?;
+        if first != last {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(AuthorizedPullObservation {
+            snapshot: last,
+            authorized_reviewers: authorized,
+        })
+    }
+    async fn permission(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: u64,
+        login: &str,
+    ) -> Result<PermissionObservation, GitHubError> {
+        let path = format!("repos/{owner}/{repository}/collaborators/{login}/permission");
+        let permission: PermissionObservation = self.get_json(token, &path, None).await?;
+        if permission.user.id != id
+            || !permission.user.login.eq_ignore_ascii_case(login)
+            || permission.user.kind != "User"
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(permission)
+    }
+}
