@@ -38,6 +38,11 @@ pub struct Summary {
     pub runner_milliseconds: u64,
     pub rerun_jobs: u64,
     pub rerun_milliseconds: u64,
+    pub observed_deliveries: u64,
+    pub delivery_conflicts: u64,
+    pub observed_admission_samples: u64,
+    pub observed_admission_median_ms: Option<u64>,
+    pub observed_admission_p90_ms: Option<u64>,
     /// Completed observed scheduling-delay intervals, grouped by requested pool.
     pub capacity_waits: BTreeMap<String, CapacityWaitSummary>,
 }
@@ -49,6 +54,9 @@ pub struct CapacityWaitSummary {
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS ci_job_metrics (repository_id TEXT NOT NULL, job_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(repository_id,job_id));
         CREATE INDEX IF NOT EXISTS ci_job_metrics_batch_attempt ON ci_job_metrics(repository_id, json_extract(body, '$.batch_id'), json_extract(body, '$.attempt')) WHERE json_valid(body);
+        CREATE TABLE IF NOT EXISTS ci_delivery_cursor (id INTEGER PRIMARY KEY CHECK(id=1), after_number INTEGER NOT NULL CHECK(after_number>=0));
+        CREATE TABLE IF NOT EXISTS ci_delivery_claims (number INTEGER PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>0));
+        CREATE TABLE IF NOT EXISTS ci_delivery_records (number INTEGER PRIMARY KEY, repository_id INTEGER NOT NULL, target TEXT NOT NULL, merged_ms INTEGER NOT NULL, head_sha TEXT, observed_ready_ms INTEGER, conflicted INTEGER NOT NULL CHECK(conflicted IN (0,1)));
         CREATE TABLE IF NOT EXISTS ci_capacity_waits (id INTEGER PRIMARY KEY, batch_id TEXT NOT NULL, request TEXT NOT NULL, started_ms INTEGER NOT NULL, ended_ms INTEGER);
         CREATE UNIQUE INDEX IF NOT EXISTS ci_capacity_waits_open ON ci_capacity_waits(batch_id) WHERE ended_ms IS NULL;")
 }
@@ -195,11 +203,58 @@ pub(crate) fn summarize(conn: &Connection) -> Result<Summary, MetricsError> {
                 .ok_or(MetricsError::Overflow)?;
         }
     }
+    let mut deliveries = 0u64;
+    let mut delivery_conflicts = 0u64;
+    let mut latencies = Vec::new();
+    let mut stmt =
+        conn.prepare("SELECT merged_ms,observed_ready_ms,conflicted FROM ci_delivery_records")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (merged, ready, conflict) = row?;
+        if merged <= 0 || !matches!(conflict, 0 | 1) {
+            return Err(MetricsError::InvalidJob);
+        }
+        if conflict == 1 {
+            delivery_conflicts = delivery_conflicts
+                .checked_add(1)
+                .ok_or(MetricsError::Overflow)?;
+            continue;
+        }
+        deliveries = deliveries.checked_add(1).ok_or(MetricsError::Overflow)?;
+        if let Some(ready) = ready {
+            let elapsed = merged
+                .checked_sub(ready)
+                .filter(|n| ready >= 0 && *n > 0)
+                .ok_or(MetricsError::InvalidJob)?;
+            latencies.push(elapsed as u64);
+        }
+    }
+    latencies.sort_unstable();
+    let percentile = |percent: usize| -> Option<u64> {
+        if latencies.is_empty() {
+            None
+        } else {
+            let count = latencies.len();
+            let rank = (count / 100) * percent + ((count % 100) * percent).div_ceil(100);
+            Some(latencies[rank - 1])
+        }
+    };
     Ok(Summary {
         completed_jobs: count,
         runner_milliseconds: milliseconds,
         rerun_jobs,
         rerun_milliseconds,
+        observed_deliveries: deliveries,
+        delivery_conflicts,
+        observed_admission_samples: latencies.len() as u64,
+        observed_admission_median_ms: percentile(50),
+        observed_admission_p90_ms: percentile(90),
         capacity_waits,
     })
 }

@@ -1701,6 +1701,57 @@ struct BenchmarkPullBase {
 }
 
 impl App {
+    /// Read a previously admitted PR twice for accounting. This is a sampled
+    /// provider observation, not a claim about CI or merge authorization.
+    pub(crate) async fn observe_delivery(
+        &self,
+        token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        number: u64,
+    ) -> Result<crate::delivery::DeliveryObservation, GitHubError> {
+        use crate::delivery::DeliveryObservation;
+        if !token.checks_read
+            || number == 0
+            || policy.installation <= 0
+            || policy.repository <= 0
+            || token.installation_id != policy.installation as u64
+            || token.repository_id != policy.repository as u64
+            || !valid_name(&policy.owner)
+            || !valid_name(&policy.name)
+        {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let path = format!("repos/{}/{}/pulls/{number}", policy.owner, policy.name);
+        let first: BenchmarkPull = self.get_json(token, &path, None).await?;
+        let last: BenchmarkPull = self.get_json(token, &path, None).await?;
+        if first != last || first.number != number || first.base.repo.id != token.repository_id {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let head_sha = first.head.map(|head| head.sha);
+        if head_sha.as_ref().is_some_and(|sha| !commit_sha(sha)) {
+            return Err(GitHubError::UnstableObservation);
+        }
+        match (first.state.as_str(), first.merged, first.merged_at) {
+            ("closed", true, Some(time)) => {
+                let merged_ms = crate::metrics::timestamp_ms(&time)
+                    .map_err(|_| GitHubError::UnstableObservation)?;
+                if merged_ms <= 0 {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                if first.base.branch == policy.target_branch {
+                    Ok(DeliveryObservation::Merged {
+                        merged_ms,
+                        head_sha,
+                    })
+                } else {
+                    Ok(DeliveryObservation::NotMerged)
+                }
+            }
+            ("open" | "closed", false, None) => Ok(DeliveryObservation::NotMerged),
+            _ => Err(GitHubError::UnstableObservation),
+        }
+    }
+
     /// Collect explicitly selected run attempts and merged PRs through the App.
     /// Selection and population completeness are deliberately not asserted.
     pub async fn collect_benchmark(

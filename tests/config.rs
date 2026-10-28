@@ -237,3 +237,19 @@ fn status_reports_the_saved_rate_gate_and_legacy_state() {
         String::from_utf8_lossy(&backward.stdout).contains("system clock precedes recorded time")
     );
 }
+
+#[test]
+fn delivery_observer_requires_configuration_before_database_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["serve", "--observe-deliveries"])
+        .env("SLUSS_WEBHOOK_SECRET", "test")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--config"));
+    assert!(!db.exists());
+}

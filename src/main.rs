@@ -59,6 +59,9 @@ enum Command {
         /// Observe known workflow runs periodically.
         #[arg(long, requires_all = ["config", "capacity"])]
         observe_dispatches: bool,
+        /// Periodically sample merged PRs previously admitted by Sluss.
+        #[arg(long, requires = "config")]
+        observe_deliveries: bool,
         /// Periodically collect rerun metrics for known direct dispatches.
         #[arg(long, requires_all = ["config", "capacity"])]
         observe_reruns: bool,
@@ -1023,6 +1026,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_stale_checks,
         observe_dispatches,
         observe_reruns,
+        observe_deliveries,
         complete_ci_only,
         bisect_ci_failures,
         release_ci_only,
@@ -1209,6 +1213,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     policy.clone(),
                     poll,
                     release_wakeup.clone(),
+                ));
+            }
+            if observe_deliveries {
+                eprintln!("automatic delivery accounting enabled; this does not authorize landing");
+                tokio::spawn(sluss::worker::supervise_delivery_observation(
+                    app.clone(),
+                    cli.db.clone(),
+                    policy.clone(),
+                    poll,
                 ));
             }
             if observe_reruns {
@@ -3064,11 +3077,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Metrics => {
             let metrics = store.metrics()?;
             println!(
-                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nobserved rerun jobs: {}\nobserved rerun runner-minutes: {:.2}\nOnly jobs recorded by Sluss are included; rerun accounting is opt-in and PR delivery is not measured.",
+                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nobserved rerun jobs: {}\nobserved rerun runner-minutes: {:.2}\nOnly jobs recorded by Sluss are included; rerun accounting is opt-in.",
                 metrics.completed_jobs,
                 metrics.runner_milliseconds as f64 / 60_000.0,
                 metrics.rerun_jobs,
                 metrics.rerun_milliseconds as f64 / 60_000.0
+            );
+            println!(
+                "observed merged PRs previously admitted by Sluss: {}; conflicting delivery observations: {}",
+                metrics.observed_deliveries, metrics.delivery_conflicts
+            );
+            if let (Some(median), Some(p90)) = (
+                metrics.observed_admission_median_ms,
+                metrics.observed_admission_p90_ms,
+            ) {
+                println!(
+                    "observed admission-to-merge: {} samples; median {:.2} minutes; p90 {:.2} minutes",
+                    metrics.observed_admission_samples,
+                    median as f64 / 60_000.0,
+                    p90 as f64 / 60_000.0
+                );
+            } else {
+                println!("observed admission-to-merge: no eligible samples");
+            }
+            println!(
+                "These are sampled provider merges and local admission observations, not exact ready-to-main latency, CI attribution or complete repository delivery counts."
             );
             let rerun_issues = sluss::scheduler::Scheduler::rerun_scan_issues(&cli.db)?;
             println!(

@@ -10077,3 +10077,97 @@ async fn default_workflow_blob(
 
 #[path = "github_auth/real_git_scenario.rs"]
 mod real_git_scenario;
+
+#[tokio::test]
+async fn delivery_worker_counts_only_stable_observed_merges() {
+    use sluss::{
+        batch::Candidate,
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (_keys, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(207));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo/pulls/{number}", get(benchmark_pull))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: reads.clone(),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let policy = sluss::reconcile::RepositoryPolicy {
+        installation: 42,
+        repository: 7,
+        owner: "owner".into(),
+        name: "repo".into(),
+        target_branch: "main".into(),
+        required_reviews: 1,
+        block_labels: Default::default(),
+    };
+    let digest = sluss::reconcile::policy_digest(&app, &policy).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("first", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidate = AdmissionCandidate {
+        candidate: Candidate {
+            number: 19,
+            head_sha: "a".repeat(40),
+        },
+        evidence_digest: "e".repeat(64),
+    };
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &digest,
+            &[candidate],
+            &"b".repeat(40),
+            "main",
+        )
+        .unwrap();
+    inbox
+        .record("second", "pull_request", &[2; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation_with_base(&event, &digest, &[], &"b".repeat(40), "main")
+        .unwrap();
+    rusqlite::Connection::open(&db).unwrap().execute("UPDATE admission_observations_v1 SET first_observed_ms=1767236280000,last_observed_ms=1767236340000,ended_ms=1767236460000 WHERE number=19", []).unwrap();
+    assert_eq!(
+        sluss::worker::observe_deliveries_once(&app, &db, &policy)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.metrics().unwrap().observed_deliveries, 0);
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::observe_deliveries_once(&app, &db, &policy)
+            .await
+            .unwrap(),
+        1
+    );
+    let metrics = store.metrics().unwrap();
+    assert_eq!(metrics.observed_deliveries, 1);
+    assert_eq!(metrics.observed_admission_samples, 1);
+    assert_eq!(metrics.observed_admission_median_ms, Some(120000));
+    assert_eq!(
+        sluss::worker::observe_deliveries_once(&app, &db, &policy)
+            .await
+            .unwrap(),
+        0
+    );
+    server.abort();
+}

@@ -485,6 +485,95 @@ async fn observe_dispatches_inner(
     }
 }
 
+/// Observe a bounded page of formerly admitted PRs for delivery accounting.
+pub async fn observe_deliveries_once(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+) -> Result<usize, String> {
+    observe_deliveries_inner(app, db, policy)
+        .await
+        .map_err(|error| error.to_string())
+}
+async fn observe_deliveries_inner(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+) -> Result<usize, ObservationPassError> {
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    observation_scope(&store, policy)?;
+    let digest = crate::reconcile::policy_digest(app, policy).map_err(|e| e.to_string())?;
+    let mut journal = crate::delivery::DeliveryJournal::open(db).map_err(|e| e.to_string())?;
+    let mut token = None;
+    let mut observed = 0usize;
+    for _ in 0..4 {
+        let Some(claim) = journal.next(policy, &digest).map_err(|e| e.to_string())? else {
+            break;
+        };
+        if token.is_none() {
+            token = Some(
+                app.read_token(policy.installation as u64, policy.repository as u64)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let result = app
+            .observe_delivery(token.as_ref().expect("initialized"), policy, claim.number)
+            .await;
+        match result {
+            Ok(value) => match journal.record(&claim, policy, &digest, &value) {
+                Ok(inserted) => {
+                    if inserted {
+                        observed += 1;
+                    }
+                }
+                Err(crate::delivery::DeliveryError::Stale) => {}
+                Err(error) => return Err(error.to_string().into()),
+            },
+            Err(
+                crate::github::GitHubError::Status(404)
+                | crate::github::GitHubError::UnstableObservation,
+            ) => {
+                eprintln!(
+                    "delivery observation skipped PR #{}; provider data is missing or unstable",
+                    claim.number
+                );
+            }
+            Err(error) => return Err(error.to_string().into()),
+        }
+    }
+    Ok(observed)
+}
+/// Sampling only; no merge, CI authorization or complete-population claim.
+pub async fn supervise_delivery_observation(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(60));
+    let mut delay = minimum;
+    loop {
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
+        match observe_deliveries_inner(&app, &db, &policy).await {
+            Ok(_) => delay = minimum,
+            Err(ObservationPassError::Unbound) => {
+                delay = minimum;
+                sleep(poll.max(Duration::from_secs(1))).await;
+                continue;
+            }
+            Err(ObservationPassError::Other(error)) => {
+                eprintln!("delivery observation failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
 /// Observe a bounded page of historical reruns. The durable cursor cycles
 /// through known direct runs; accounting never changes CI or reservations.
 pub async fn observe_reruns_once(
