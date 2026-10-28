@@ -132,3 +132,111 @@ fn config_changes_wait_for_live_reservations_and_invalidate_old_handles() {
         Err(SchedulerError::Invalid)
     ));
 }
+
+fn dispatch_plan() -> sluss::scheduler::DispatchPlan {
+    sluss::scheduler::DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "a".repeat(40),
+        staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
+        policy_digest: "b".repeat(64),
+    }
+}
+
+#[test]
+fn dispatch_intent_survives_crashes_and_cannot_release_capacity_early() {
+    use sluss::scheduler::DispatchState;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dispatch.sqlite");
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    let req = request(&[("macos", 1)]);
+    let plan = dispatch_plan();
+    assert!(
+        scheduler
+            .reserve_dispatch("job", &req, &plan)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Prepared
+    );
+    assert!(matches!(
+        scheduler.release("job"),
+        Err(SchedulerError::DispatchManaged)
+    ));
+    let mut changed = plan.clone();
+    changed.integration_sha = "c".repeat(40);
+    assert!(matches!(
+        scheduler.reserve_dispatch("job", &req, &changed),
+        Err(SchedulerError::IdConflict)
+    ));
+    assert!(scheduler.claim_dispatch("job").unwrap());
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    assert!(!scheduler.claim_dispatch("job").unwrap());
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Sending
+    );
+    assert!(scheduler.reserve("other", &req).unwrap().is_none());
+    assert!(matches!(
+        scheduler.finish_dispatch("job", 50),
+        Err(SchedulerError::DispatchTransition)
+    ));
+    scheduler.observe_dispatch("job", 50).unwrap();
+    scheduler.observe_dispatch("job", 50).unwrap();
+    assert!(matches!(
+        scheduler.observe_dispatch("job", 51),
+        Err(SchedulerError::DispatchTransition)
+    ));
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Observed { run_id: 50 }
+    );
+    assert!(matches!(
+        scheduler.finish_dispatch("job", 51),
+        Err(SchedulerError::DispatchTransition)
+    ));
+    scheduler.finish_dispatch("job", 50).unwrap();
+    scheduler.finish_dispatch("job", 50).unwrap();
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+    assert!(matches!(
+        scheduler.reserve_dispatch("job", &req, &plan),
+        Err(SchedulerError::IdFinished)
+    ));
+    assert!(scheduler.reserve("other", &req).unwrap().is_some());
+}
+
+#[test]
+fn only_one_worker_claims_a_dispatch_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dispatch.sqlite");
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    scheduler
+        .reserve_dispatch("job", &request(&[("macos", 1)]), &dispatch_plan())
+        .unwrap();
+    drop(scheduler);
+    let barrier = Arc::new(Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut scheduler = Scheduler::open(db, capacity()).unwrap();
+                barrier.wait();
+                scheduler.claim_dispatch("job").unwrap()
+            })
+        })
+        .collect();
+    assert_eq!(
+        threads
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum::<usize>(),
+        1
+    );
+}
