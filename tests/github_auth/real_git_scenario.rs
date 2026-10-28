@@ -363,14 +363,26 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     let wake = Arc::new(tokio::sync::Notify::new());
-    let observer = tokio::spawn(sluss::worker::supervise_dispatch_observation_with_wakeup(
+    let release_wake = Arc::new(tokio::sync::Notify::new());
+    let releaser = tokio::spawn(sluss::worker::supervise_ci_release_with_wakeup(
+        app.clone(),
+        db.clone(),
+        capacity.clone(),
+        policy.clone(),
+        std::time::Duration::from_millis(10),
+        release_wake.clone(),
+    ));
+    let observer = tokio::spawn(sluss::worker::supervise_dispatch_observation_with_signals(
         app.clone(),
         db.clone(),
         capacity.clone(),
         policy.clone(),
         std::time::Duration::from_millis(10),
         true,
-        wake.clone(),
+        sluss::worker::ObservationWakeups {
+            ci: wake.clone(),
+            release: Some(release_wake),
+        },
     ));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -443,7 +455,23 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     })
     .await
     .expect("webhook should wake observation well before the 60-second fallback poll");
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            if Scheduler::open(&db, capacity.clone())
+                .unwrap()
+                .pending_dispatches()
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("completion should wake capacity release before its 60-second fallback poll");
     observer.abort();
+    releaser.abort();
     let reopened = Store::open(&db).unwrap();
     assert_eq!(
         reopened.batch(id).unwrap().unwrap().0.state,

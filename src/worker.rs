@@ -443,6 +443,36 @@ pub async fn supervise_dispatch_observation_with_wakeup(
     complete_ci_only: bool,
     wakeup: Arc<tokio::sync::Notify>,
 ) {
+    supervise_dispatch_observation_with_signals(
+        app,
+        db,
+        capacity,
+        policy,
+        poll,
+        complete_ci_only,
+        ObservationWakeups {
+            ci: wakeup,
+            release: None,
+        },
+    )
+    .await;
+}
+
+/// Process-local hints; durable state and periodic scans remain authoritative.
+pub struct ObservationWakeups {
+    pub ci: Arc<tokio::sync::Notify>,
+    pub release: Option<Arc<tokio::sync::Notify>>,
+}
+
+pub async fn supervise_dispatch_observation_with_signals(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+    complete_ci_only: bool,
+    wakeups: ObservationWakeups,
+) {
     let minimum = poll.max(Duration::from_secs(60));
     let wake_delay = poll.max(Duration::from_secs(5)).min(minimum);
     let mut delay = minimum;
@@ -455,10 +485,13 @@ pub async fn supervise_dispatch_observation_with_wakeup(
             delay = delay.saturating_mul(2).min(Duration::from_secs(300));
             sleep(delay).await;
         } else {
+            if let Some(release) = &wakeups.release {
+                release.notify_one();
+            }
             delay = minimum;
             tokio::select! {
                 _ = sleep(minimum) => {}
-                _ = wakeup.notified() => sleep(wake_delay).await,
+                _ = wakeups.ci.notified() => sleep(wake_delay).await,
             }
         }
     }
@@ -872,7 +905,29 @@ pub async fn supervise_ci_release(
     policy: RepositoryPolicy,
     poll: Duration,
 ) {
+    supervise_ci_release_with_wakeup(
+        app,
+        db,
+        capacity,
+        policy,
+        poll,
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .await;
+}
+
+/// Completion hints are advisory; release always repeats all provider and
+/// topology checks. A missed hint is recovered by the normal periodic scan.
+pub async fn supervise_ci_release_with_wakeup(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+    wakeup: Arc<tokio::sync::Notify>,
+) {
     let minimum = poll.max(Duration::from_secs(60));
+    let wake_delay = poll.max(Duration::from_secs(5)).min(minimum);
     let mut delay = minimum;
     loop {
         match release_ci_only_once(&app, &db, &capacity, &policy).await {
@@ -881,12 +936,16 @@ pub async fn supervise_ci_release(
                     eprintln!("released {count} completed CI-only reservations");
                 }
                 delay = minimum;
+                tokio::select! {
+                    _ = sleep(minimum) => {}
+                    _ = wakeup.notified() => sleep(wake_delay).await,
+                }
             }
             Err(error) => {
                 eprintln!("CI-only capacity revalidation failed: {error}");
                 delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+                sleep(delay).await;
             }
         }
-        sleep(delay).await;
     }
 }

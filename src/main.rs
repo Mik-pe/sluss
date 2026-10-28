@@ -1046,6 +1046,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|(_, policy, _, _, _)| (policy.installation, policy.repository));
         let ci_wakeup = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_wakeup = std::sync::Arc::new(tokio::sync::Notify::new());
         let app = sluss::webhook::router_with_ci_wakeup(
             secret.into_bytes(),
             cli.db.clone(),
@@ -1125,12 +1126,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "CI-only capacity release enabled under the single-runner isolation contract"
                 );
-                tokio::spawn(sluss::worker::supervise_ci_release(
+                tokio::spawn(sluss::worker::supervise_ci_release_with_wakeup(
                     app.clone(),
                     cli.db.clone(),
                     capacity,
                     policy.clone(),
                     poll,
+                    release_wakeup.clone(),
                 ));
             }
             if observe_dispatches {
@@ -1141,14 +1143,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "automatic dispatch observation enabled; observations do not authorize landing"
                 );
-                tokio::spawn(sluss::worker::supervise_dispatch_observation_with_wakeup(
+                tokio::spawn(sluss::worker::supervise_dispatch_observation_with_signals(
                     app.clone(),
                     cli.db.clone(),
                     capacity,
                     policy.clone(),
                     poll,
                     complete_ci_only,
-                    ci_wakeup.clone(),
+                    sluss::worker::ObservationWakeups {
+                        ci: ci_wakeup.clone(),
+                        release: release_ci_only.then_some(release_wakeup),
+                    },
                 ));
             }
             tokio::spawn(sluss::worker::supervise(app, cli.db, policy, poll, rescan));
