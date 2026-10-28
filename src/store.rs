@@ -158,6 +158,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS adaptive_batch_state_v1 (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL, planning_digest TEXT NOT NULL, batch_limit INTEGER NOT NULL, streak INTEGER NOT NULL, threshold INTEGER NOT NULL, last_policy_key TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS adaptive_batch_events_v1 (sequence INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT UNIQUE NOT NULL, epoch INTEGER NOT NULL, planning_digest TEXT NOT NULL, policy_key TEXT NOT NULL, batch_size INTEGER NOT NULL, limit_before INTEGER NOT NULL, conclusion TEXT NOT NULL, runner_ms INTEGER NOT NULL, limit_after INTEGER NOT NULL, invalid INTEGER NOT NULL DEFAULT 0 CHECK(invalid IN (0,1)));
             CREATE INDEX IF NOT EXISTS adaptive_batch_samples_v1 ON adaptive_batch_events_v1(epoch,policy_key,batch_size,conclusion,sequence DESC);
+            CREATE TABLE IF NOT EXISTS adaptive_split_costs_v1 (child_id TEXT PRIMARY KEY NOT NULL, root_id TEXT NOT NULL, epoch INTEGER NOT NULL, runner_ms INTEGER, CHECK(runner_ms IS NULL OR runner_ms > 0));
+            CREATE INDEX IF NOT EXISTS adaptive_split_root_v1 ON adaptive_split_costs_v1(root_id);
             CREATE TABLE IF NOT EXISTS planning_migrations (id INTEGER PRIMARY KEY, previous_digest TEXT NOT NULL, next_digest TEXT NOT NULL, previous_body TEXT, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_selection_config (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL);

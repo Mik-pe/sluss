@@ -755,7 +755,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Command::AdaptiveHistory = &cli.command {
         let events = Store::adaptive_history(&cli.db)?;
-        println!("{} adaptive CI-only samples (latest 50)", events.len());
+        println!("{} adaptive CI-only events (latest 50)", events.len());
         for event in events {
             let timing = event
                 .runner_ms
@@ -773,9 +773,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event.limit_after,
                 if event.invalid { " (invalidated)" } else { "" }
             );
+            if event.conclusion == "failure" {
+                println!(
+                    "  observed investigation: {} jobs, {:.2} runner-minutes; {}",
+                    event.recovery_jobs,
+                    event.recovery_runner_ms as f64 / 60_000.0,
+                    if event.recovery_settled {
+                        "settled"
+                    } else {
+                        "incomplete or unknown"
+                    }
+                );
+            }
         }
         println!(
-            "Samples measure individual CI jobs, not delivered PRs, total investigation cost, or merge authorization."
+            "Samples measure observed first-attempt CI jobs, not delivered PRs, later reruns, or merge authorization."
         );
         return Ok(());
     }
@@ -2099,7 +2111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 if let Some(adaptive) = store.adaptive_status()? {
                     println!(
-                        "adaptive batch limit: {}; full successes: {}/{}; recorded CI samples: {} (invalidated: {})",
+                        "adaptive batch limit: {}; full successes: {}/{}; recorded CI events: {} (invalidated: {})",
                         adaptive.limit,
                         adaptive.success_streak,
                         adaptive.increase_threshold,

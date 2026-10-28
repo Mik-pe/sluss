@@ -207,10 +207,10 @@ fn adapts_measured_cost_and_failures_across_restart() {
         assert_eq!(batch.candidates.len(), 2);
         finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
     }
-    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
     queue(&mut store, &mut inbox, 13, 4);
     let batch = plan(&mut store);
-    assert_eq!(batch.candidates.len(), 3);
+    assert_eq!(batch.candidates.len(), 2);
     finish(&mut store, &mut scheduler, &batch, 13, "failure", 30);
     let status = store.adaptive_status().unwrap().unwrap();
     assert_eq!(
@@ -230,7 +230,7 @@ fn adapts_measured_cost_and_failures_across_restart() {
             events[0].limit_after,
             events[0].runner_ms
         ),
-        ("failure", 3, 1, Some(30_000))
+        ("failure", 2, 1, Some(30_000))
     );
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
         .arg("--db")
@@ -239,7 +239,7 @@ fn adapts_measured_cost_and_failures_across_restart() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("limit 3 -> 1"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("limit 2 -> 1"));
     queue(&mut store, &mut inbox, 14, 4);
     assert_eq!(plan(&mut store).candidates.len(), 1);
 }
@@ -280,6 +280,36 @@ fn adaptive_history_is_read_only_on_missing_or_legacy_databases() {
 }
 
 #[test]
+fn old_adaptive_history_does_not_invent_investigation_costs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("old.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    store.bind_ci_bisection(true).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    queue(&mut store, &mut inbox, 1, 4);
+    let batch = plan(&mut store);
+    finish(&mut store, &mut scheduler, &batch, 1, "failure", 12);
+    drop(scheduler);
+    drop(store);
+    drop(inbox);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TABLE adaptive_split_costs_v1", [])
+        .unwrap();
+    let history = Store::adaptive_history(&db).unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(!history[0].recovery_settled);
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='adaptive_split_costs_v1')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!table_exists);
+}
+
+#[test]
 fn missing_runtime_and_bisection_children_do_not_change_the_controller() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("adaptive.sqlite");
@@ -295,6 +325,11 @@ fn missing_runtime_and_bisection_children_do_not_change_the_controller() {
     let batch = plan(&mut store);
     finish(&mut store, &mut scheduler, &batch, 2, "success", 0);
     assert_eq!(store.adaptive_status().unwrap().unwrap().success_streak, 0);
+    let history = Store::adaptive_history(&db).unwrap();
+    assert_eq!(
+        (history[0].conclusion.as_str(), history[0].runner_ms),
+        ("success", None)
+    );
     queue(&mut store, &mut inbox, 3, 4);
     let batch = plan(&mut store);
     finish(&mut store, &mut scheduler, &batch, 3, "failure", 0);
@@ -308,8 +343,44 @@ fn missing_runtime_and_bisection_children_do_not_change_the_controller() {
     let status = store.adaptive_status().unwrap().unwrap();
     assert_eq!(
         (status.limit, status.recorded_samples, status.success_streak),
-        (1, 2, 0)
+        (1, 3, 0)
     );
+    for serial in 10..=15 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 1);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 6);
+    }
+    // The failed size-two root lacked timing; its cost cannot be assumed zero.
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 1);
+}
+
+#[test]
+fn untimed_success_blocks_comparison_until_it_leaves_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("adaptive.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=4 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish(
+            &mut store,
+            &mut scheduler,
+            &batch,
+            serial,
+            "success",
+            if serial == 1 { 0 } else { 12 },
+        );
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
+    for serial in 5..=10 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
 }
 
 #[test]
@@ -489,4 +560,189 @@ fn concurrent_adaptive_planners_create_one_bounded_batch() {
         .unwrap()
         .unwrap();
     assert_eq!((state.limit, state.recorded_samples), (2, 0));
+}
+
+#[test]
+fn investigation_cost_prevents_return_to_an_expensive_batch_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("adaptive.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    store.bind_ci_bisection(true).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 2);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    for serial in 4..=6 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 3);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 18);
+    }
+    for serial in 7..=9 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 4);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 24);
+    }
+    queue(&mut store, &mut inbox, 10, 4);
+    let root = plan(&mut store);
+    assert_eq!(root.candidates.len(), 4);
+    finish(&mut store, &mut scheduler, &root, 10, "failure", 24);
+    let root_event = Store::adaptive_history(&db)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.batch_id == root.id)
+        .unwrap();
+    assert!(!root_event.recovery_settled);
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
+    for run in 11..=12 {
+        let child = plan(&mut store);
+        assert_eq!(child.candidates.len(), 2);
+        finish(&mut store, &mut scheduler, &child, run, "success", 12);
+    }
+    let root_event = Store::adaptive_history(&db)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.batch_id == root.id)
+        .unwrap();
+    assert!(root_event.recovery_settled);
+    assert_eq!(
+        (root_event.recovery_jobs, root_event.recovery_runner_ms),
+        (2, 24_000)
+    );
+    // Six successful size-two batches end the cooldown and allow size three.
+    for serial in 13..=18 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 2);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
+    for serial in 19..=21 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 3);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 18);
+    }
+    // At size four, 24 s of failed parent work and 24 s of investigation
+    // are charged to the three earlier successful root batches.
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
+}
+
+#[test]
+fn stale_investigation_cost_blocks_reentry_to_the_failed_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("adaptive.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    store.bind_ci_bisection(true).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    queue(&mut store, &mut inbox, 4, 4);
+    let root = plan(&mut store);
+    assert_eq!(root.candidates.len(), 3);
+    finish(&mut store, &mut scheduler, &root, 4, "failure", 18);
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 1);
+    // Changed inputs invalidate the split before it can establish full cost.
+    for serial in 5..=10 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 1);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 6);
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
+    for serial in 11..=13 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 2);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
+    let root_event = Store::adaptive_history(&db)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.batch_id == root.id)
+        .unwrap();
+    assert!(!root_event.recovery_settled);
+}
+
+#[test]
+fn nested_bisection_costs_survive_restart_without_counting_passes_as_root_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("adaptive.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    store.bind_ci_bisection(true).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    for serial in 4..=6 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 18);
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 4);
+    queue(&mut store, &mut inbox, 7, 4);
+    let root = plan(&mut store);
+    finish(&mut store, &mut scheduler, &root, 7, "failure", 24);
+    let first = plan(&mut store);
+    assert_eq!(first.candidates.len(), 2);
+    finish(&mut store, &mut scheduler, &first, 8, "failure", 12);
+    let partial = Store::adaptive_history(&db)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.batch_id == root.id)
+        .unwrap();
+    assert_eq!(
+        (
+            partial.recovery_jobs,
+            partial.recovery_runner_ms,
+            partial.recovery_settled
+        ),
+        (1, 12_000, false)
+    );
+    drop(store);
+    drop(scheduler);
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    let sibling = plan(&mut store);
+    assert_eq!(sibling.candidates.len(), 2);
+    finish(&mut store, &mut scheduler, &sibling, 9, "success", 12);
+    let grandchild = plan(&mut store);
+    assert_eq!(grandchild.candidates.len(), 1);
+    finish(&mut store, &mut scheduler, &grandchild, 10, "success", 6);
+    let other = plan(&mut store);
+    assert_eq!(other.candidates.len(), 1);
+    finish(&mut store, &mut scheduler, &other, 11, "failure", 6);
+    let final_event = Store::adaptive_history(&db)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.batch_id == root.id)
+        .unwrap();
+    assert_eq!(
+        (
+            final_event.recovery_jobs,
+            final_event.recovery_runner_ms,
+            final_event.recovery_settled
+        ),
+        (4, 36_000, true)
+    );
+    assert_eq!(
+        (
+            store.adaptive_status().unwrap().unwrap().limit,
+            store.adaptive_status().unwrap().unwrap().success_streak
+        ),
+        (2, 0)
+    );
 }
