@@ -826,3 +826,90 @@ fn selective_staging_freezes_suites_atomically_and_recovers_after_publication() 
     ));
     assert_eq!(store.batch_selection(id).unwrap().unwrap(), frozen);
 }
+
+#[test]
+fn selective_bisection_stages_the_same_full_suite_for_comparable_halves() {
+    use sluss::{
+        batch::Candidate,
+        coordinator::{StagingOptions, prepare_local_from_remote_with_options},
+        selective::{Policy, Selection},
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (source, base, one, two) = fixture();
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        source.path(),
+        &[
+            "push",
+            remote.path().to_str().unwrap(),
+            "main:refs/heads/main",
+            "one:refs/pull/1/head",
+            "two:refs/pull/2/head",
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let policy_path = dir.path().join("verification.toml");
+    std::fs::write(&policy_path, "version=1\nfull_suites=['fast','other']\n[[components]]\nname='one'\npaths=['one']\nsuites=['fast']\n[[components]]\nname='two'\npaths=['two']\nsuites=['other']\n").unwrap();
+    let policy = Policy::load(&policy_path).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[6; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[
+                AdmissionCandidate {
+                    candidate: Candidate {
+                        number: 1,
+                        head_sha: one,
+                    },
+                    evidence_digest: "e".repeat(64),
+                },
+                AdmissionCandidate {
+                    candidate: Candidate {
+                        number: 2,
+                        head_sha: two,
+                    },
+                    evidence_digest: "d".repeat(64),
+                },
+            ],
+        )
+        .unwrap();
+    let root = "batch-0123456789abcdef";
+    store.plan_batch(root, &base, 2, 1).unwrap().unwrap();
+    store.start_integration(root).unwrap();
+    store
+        .fail_integration(root, "reproducible conflict")
+        .unwrap();
+    let child = store
+        .plan_batch("batch-1123456789abcdef", &base, 2, 1)
+        .unwrap()
+        .unwrap();
+    assert!(store.is_split_batch(&child.id).unwrap());
+    prepare_local_from_remote_with_options(
+        &mut store,
+        &child.id,
+        remote.path(),
+        "main",
+        StagingOptions {
+            policy_paths: &["shared".into()],
+            verification_policy: Some(&policy),
+        },
+    )
+    .unwrap();
+    let frozen = store.batch_selection(&child.id).unwrap().unwrap();
+    assert!(matches!(frozen.selection, Selection::Full { .. }));
+    assert_eq!(
+        frozen.selection.suites(),
+        &["fast".to_string(), "other".to_string()]
+            .into_iter()
+            .collect()
+    );
+}

@@ -59,6 +59,9 @@ enum Command {
         /// Complete observed CI-only batches without releasing their reservations.
         #[arg(long, requires = "observe_dispatches")]
         complete_ci_only: bool,
+        /// Investigate CI failures by testing controlled subgroups.
+        #[arg(long, requires = "complete_ci_only")]
+        bisect_ci_failures: bool,
         /// Release finished or invalidated CI reservations under the single-runner contract.
         #[arg(long, requires_all = ["complete_ci_only", "capacity"])]
         release_ci_only: bool,
@@ -259,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_stale,
         observe_dispatches,
         complete_ci_only,
+        bisect_ci_failures,
         release_ci_only,
         capacity,
     } = cli.command
@@ -278,7 +282,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &key,
                 &config.github.api,
             )?);
-            let _store = Store::open(&cli.db)?;
+            let mut initial_store = Store::open(&cli.db)?;
+            if complete_ci_only {
+                initial_store.bind_ci_bisection(bisect_ci_failures)?;
+            }
             Some((
                 app,
                 config.policy(),
@@ -861,6 +868,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store.paused()?,
                 store.candidates()?.len()
             );
+            for (batch, state) in store.ci_investigations()? {
+                println!("CI investigation {batch}: {state} (not a merge approval)");
+            }
             for batch in store.active_batches()? {
                 println!(
                     "batch {}: {:?} ({} PRs, base {})",

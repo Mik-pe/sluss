@@ -39,6 +39,7 @@ fn selection_for(
     integration: &integration::Integration,
     base: &str,
     policy: Option<&crate::selective::Policy>,
+    force_full: bool,
 ) -> Result<Option<crate::selective::FrozenSelection>, PrepareError> {
     policy
         .map(|policy| {
@@ -46,7 +47,14 @@ fn selection_for(
                 base_sha: base.into(),
                 integration_sha: integration.sha().into(),
                 policy_digest: policy.digest()?,
-                selection: policy.select_git(&integration.repository(), base, integration.sha())?,
+                selection: if force_full {
+                    crate::selective::Selection::Full {
+                        suites: policy.full_suites.iter().cloned().collect(),
+                        reason: "bisection requires comparable full suites".into(),
+                    }
+                } else {
+                    policy.select_git(&integration.repository(), base, integration.sha())?
+                },
             })
         })
         .transpose()
@@ -104,7 +112,12 @@ pub fn prepare_local_with_options(
         Err(error) => return Err(error.into()),
     };
     let policy = integration.check_policy(&batch.base_sha, policy_paths)?;
-    let selection = selection_for(&integration, &batch.base_sha, options.verification_policy)?;
+    let selection = selection_for(
+        &integration,
+        &batch.base_sha,
+        options.verification_policy,
+        store.is_split_batch(batch_id)?,
+    )?;
     // Recheck after the potentially long Git operation. If an earlier attempt
     // already completed, validate both frozen values before touching the ref.
     let current = store.start_integration(batch_id)?;
@@ -242,10 +255,16 @@ pub async fn prepare_github_with_options(
     let source = source.to_owned();
     let paths = policy_paths.to_vec();
     let verification_policy = options.verification_policy.cloned();
+    let force_full = store.is_split_batch(batch_id)?;
     let built = tokio::task::spawn_blocking(move || -> Result<_, PrepareError> {
         let integration = integration::build(&source, &base, &heads)?;
         let policy = integration.check_policy(&base, &paths)?;
-        let selection = selection_for(&integration, &base, verification_policy.as_ref())?;
+        let selection = selection_for(
+            &integration,
+            &base,
+            verification_policy.as_ref(),
+            force_full,
+        )?;
         Ok((integration, policy, selection))
     })
     .await

@@ -43,6 +43,8 @@ pub enum SchedulerError {
     #[error(transparent)]
     Metrics(#[from] crate::metrics::MetricsError),
     #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
+    #[error(transparent)]
     CiObservation(#[from] crate::verification::CiObservationError),
     #[error("provider CI observations disagree for the same run")]
     CiConflict,
@@ -1244,9 +1246,136 @@ impl Scheduler {
         {
             return Err(SchedulerError::StaleBatch);
         }
+        investigate_ci_batch(&tx, &batch)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Split failures as experiments. Only continue into a failing subgroup when
+/// its sibling independently succeeded. Every result remains CI-only state.
+fn investigate_ci_batch(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &crate::batch::Batch,
+) -> Result<(), SchedulerError> {
+    use crate::batch::State;
+    let enabled: bool = tx
+        .query_row(
+            "SELECT enabled FROM ci_bisection_config WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    let parent: Option<String> = tx
+        .query_row(
+            "SELECT parent_id FROM split_tasks WHERE child_id=?1 AND state='planned'",
+            [&batch.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(parent) = parent {
+        // Integration-conflict splits use the same task table. Only compare
+        // siblings when a CI investigation actually owns their parent.
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_investigations WHERE batch_id=?1 AND state='pending')",
+            [&parent],
+            |r| r.get(0),
+        )?;
+        if !pending {
+            return Ok(());
+        }
+        let children: Vec<(String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT state,child_id FROM split_tasks WHERE parent_id=?1 ORDER BY side",
+            )?;
+            let rows = stmt.query_map([&parent], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if children.len() != 2
+            || children
+                .iter()
+                .any(|(state, id)| state != "planned" || id.is_none())
+        {
+            return Ok(());
+        }
+        let mut observed = Vec::new();
+        for (_, child) in children {
+            let id = child.ok_or(SchedulerError::Corrupt)?;
+            let (candidate, _) = match crate::store::checked_batch(tx, &id) {
+                Ok(value) => value,
+                Err(
+                    crate::store::StoreError::StaleBatch | crate::store::StoreError::InvalidBatch,
+                ) => {
+                    tx.execute(
+                        "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
+                        [&parent],
+                    )?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match &candidate.state {
+                State::CiComplete { conclusion, .. } => {
+                    observed.push((candidate.clone(), conclusion.clone()))
+                }
+                _ => return Ok(()),
+            }
+        }
+        if observed[0].0.base_sha != observed[1].0.base_sha {
+            return Ok(());
+        }
+        let mut plans = Vec::new();
+        for (child, _) in &observed {
+            let body: String = tx.query_row(
+                "SELECT plan FROM dispatch_intents WHERE id=?1",
+                [&child.id],
+                |r| r.get(0),
+            )?;
+            plans.push(serde_json::from_str::<DispatchPlan>(&body)?);
+        }
+        let comparable = plans[0].installation_id == plans[1].installation_id
+            && plans[0].repository_id == plans[1].repository_id
+            && plans[0].workflow_id == plans[1].workflow_id
+            && plans[0].policy_digest == plans[1].policy_digest
+            && plans[0].required_jobs == plans[1].required_jobs
+            && plans[0].suites == plans[1].suites
+            && plans[0].selection_policy_digest == plans[1].selection_policy_digest;
+        if !comparable {
+            tx.execute("INSERT INTO ci_investigations(batch_id,state) VALUES(?1,'inconclusive') ON CONFLICT(batch_id) DO UPDATE SET state=excluded.state", [&parent])?;
+            return Ok(());
+        }
+        let failure = match (observed[0].1.as_str(), observed[1].1.as_str()) {
+            ("failure", "success") => Some(&observed[0].0),
+            ("success", "failure") => Some(&observed[1].0),
+            _ => None,
+        };
+        let state = match failure {
+            Some(failed) if failed.candidates.len() == 1 => "needs-review",
+            Some(_) => "investigating",
+            None => "inconclusive",
+        };
+        tx.execute("INSERT INTO ci_investigations(batch_id,state) VALUES(?1,?2) ON CONFLICT(batch_id) DO UPDATE SET state=excluded.state", params![parent,state])?;
+        if let Some(failed) = failure.filter(|failed| failed.candidates.len() > 1) {
+            crate::store::enqueue_bisection(tx, failed)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO ci_investigations(batch_id,state) VALUES(?1,'pending')",
+                [&failed.id],
+            )?;
+        }
+    } else if matches!(&batch.state, State::CiComplete { conclusion, .. } if conclusion == "failure")
+        && batch.candidates.len() > 1
+    {
+        crate::store::enqueue_bisection(tx, batch)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO ci_investigations(batch_id,state) VALUES(?1,'pending')",
+            [&batch.id],
+        )?;
+    }
+    Ok(())
 }
 
 impl Scheduler {

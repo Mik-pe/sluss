@@ -75,6 +75,8 @@ impl Store {
                 id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS candidate_evidence (number INTEGER PRIMARY KEY, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ci_bisection_config (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)));
+            CREATE TABLE IF NOT EXISTS ci_investigations (batch_id TEXT PRIMARY KEY, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_candidate_completions (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, base_sha TEXT NOT NULL, batch_id TEXT NOT NULL, conclusion TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
@@ -372,6 +374,7 @@ impl Store {
                 )?;
                 tx.execute("DELETE FROM failed_singletons", [])?;
                 tx.execute("DELETE FROM ci_candidate_completions", [])?;
+                tx.execute("UPDATE ci_investigations SET state='stale' WHERE state IN ('pending','investigating')", [])?;
             }
             let old_target: Option<String> = tx
                 .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
@@ -476,6 +479,36 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
+    }
+
+    /// Bind the optional CI investigation mode across all workers.
+    pub fn bind_ci_bisection(&mut self, enabled: bool) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO ci_bisection_config(id,enabled) VALUES(1,?1)",
+            [enabled],
+        )?;
+        let existing: bool = tx.query_row(
+            "SELECT enabled FROM ci_bisection_config WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if existing != enabled {
+            return Err(StoreError::PolicyMismatch);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Summarize bounded CI investigation progress for operators.
+    pub fn ci_investigations(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT batch_id,state FROM ci_investigations ORDER BY batch_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Current CI-only completions are scheduling holds, not merge approvals.
@@ -751,13 +784,14 @@ impl Store {
         let mut selected = Vec::new();
         let mut selected_task = None;
         let mut held_for_splits = std::collections::BTreeSet::new();
-        let tasks: Vec<(i64, String)> = {
-            let mut stmt =
-                tx.prepare("SELECT id,members FROM split_tasks WHERE state='pending' ORDER BY id")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let tasks: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id,members,parent_id FROM split_tasks WHERE state='pending' ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             rows.collect::<Result<_, _>>()?
         };
-        for (task_id, body) in tasks {
+        for (task_id, body, parent_id) in tasks {
             let members: Vec<AdmissionCandidate> = serde_json::from_str(&body)?;
             if members.is_empty() {
                 return Err(StoreError::InvalidBatch);
@@ -805,6 +839,10 @@ impl Store {
                 tx.execute(
                     "UPDATE split_tasks SET state='stale' WHERE id=?1 AND state='pending'",
                     [task_id],
+                )?;
+                tx.execute(
+                    "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
+                    [&parent_id],
                 )?;
                 continue;
             }
@@ -986,6 +1024,15 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether this batch was created as a durable bisection half.
+    pub fn is_split_batch(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM split_tasks WHERE child_id=?1 AND state='planned')",
+            [id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn batch(&self, id: &str) -> Result<Option<(Batch, i64)>, StoreError> {
@@ -1398,7 +1445,7 @@ fn now_ms() -> Result<i64, StoreError> {
     i64::try_from(elapsed.as_millis()).map_err(|_| StoreError::Clock)
 }
 
-fn checked_batch(tx: &Transaction<'_>, id: &str) -> Result<(Batch, i64), StoreError> {
+pub(crate) fn checked_batch(tx: &Transaction<'_>, id: &str) -> Result<(Batch, i64), StoreError> {
     let binding: Option<(i64, i64)> = tx
         .query_row(
             "SELECT installation,repository FROM repository_binding WHERE id=1",
@@ -1471,7 +1518,7 @@ fn checked_batch(tx: &Transaction<'_>, id: &str) -> Result<(Batch, i64), StoreEr
 
 /// Split only failures explicitly classified by the caller as reproducible
 /// integration or CI failures. Infrastructure errors must not use this path.
-fn enqueue_bisection(tx: &Transaction<'_>, batch: &Batch) -> Result<(), StoreError> {
+pub(crate) fn enqueue_bisection(tx: &Transaction<'_>, batch: &Batch) -> Result<(), StoreError> {
     let mut members = Vec::new();
     for candidate in &batch.candidates {
         let number = i64::try_from(candidate.number).map_err(|_| StoreError::InvalidCandidate)?;
