@@ -997,6 +997,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let listener = tokio::net::TcpListener::bind(listen).await?;
         let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
+        // Validate the actual persisted topology as well as the file. Without
+        // this, planning and staging can run while all capacity workers retry
+        // a permanent mismatch with outstanding reservations.
+        if let Some(capacity) = &capacity_config {
+            sluss::scheduler::Scheduler::open(&cli.db, capacity.clone())
+                .map_err(|error| error.to_string())?;
+        }
         if complete_ci_only {
             Store::open(&cli.db)?.bind_ci_bisection(bisect_ci_failures)?;
         }

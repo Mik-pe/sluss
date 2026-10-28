@@ -1309,6 +1309,131 @@ fn spawn_service(
         .unwrap();
     ChildGuard(child)
 }
+
+#[tokio::test]
+async fn service_rejects_capacity_conflicting_with_existing_reservation_before_workers_start() {
+    use sluss::scheduler::{Capacity, Request, Scheduler};
+    let (key_dir, _private, public) = keys();
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let api = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: Arc::new(AtomicU8::new(0)),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: token_calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    let api_task = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let config = dir.path().join("sluss.toml");
+    let capacity_file = dir.path().join("capacity.toml");
+    let original = "[pools]\nrust = 1\n[hosts.sluss-host-one]\nslots = 1\nrunner_ids = [101]\npools = {rust = 1}\n";
+    let changed = original.replace("rust = 1", "rust = 2");
+    let capacity: Capacity = toml::from_str(original).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+    scheduler
+        .reserve(
+            "in-flight",
+            &Request {
+                pools: BTreeMap::from([("rust".into(), 1)]),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    drop(scheduler);
+    std::fs::write(&capacity_file, changed).unwrap();
+    std::fs::write(&config, format!("version = 1\n[github]\napp_client_id = \"app-client-id\"\ninstallation_id = 42\nrepository_id = 7\nowner = \"owner\"\nrepository = \"repo\"\napi = \"http://{api_addr}/\"\n[queue]\ntarget = \"main\"\npoll_seconds = 1\n[checks]\nrequired_reviews = 1\n")).unwrap();
+    let stderr_path = dir.path().join("stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db)
+            .args(["serve", "--listen", "127.0.0.1:0", "--config"])
+            .arg(&config)
+            .args(["--auto-plan", "--observe-dispatches", "--capacity"])
+            .arg(&capacity_file)
+            .env("SLUSS_WEBHOOK_SECRET", "test-secret")
+            .env(
+                "SLUSS_GITHUB_PRIVATE_KEY_PATH",
+                key_dir.path().join("test-key.pem"),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("service must reject the conflict instead of launching workers");
+    assert!(!status.success());
+    assert!(
+        std::fs::read_to_string(stderr_path)
+            .unwrap()
+            .contains("capacity configuration cannot change")
+    );
+    assert_eq!(token_calls.load(Ordering::SeqCst), 0);
+    let mut scheduler = Scheduler::open(&db, capacity).unwrap();
+    assert_eq!(
+        scheduler
+            .reserve(
+                "in-flight",
+                &Request {
+                    pools: BTreeMap::from([("rust".into(), 1)])
+                }
+            )
+            .unwrap()
+            .unwrap()
+            .host,
+        "sluss-host-one"
+    );
+    drop(scheduler);
+    std::fs::write(&capacity_file, original).unwrap();
+    let mut restarted = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db)
+            .args(["serve", "--listen", "127.0.0.1:0", "--config"])
+            .arg(&config)
+            .args(["--auto-plan", "--observe-dispatches", "--capacity"])
+            .arg(&capacity_file)
+            .env("SLUSS_WEBHOOK_SECRET", "test-secret")
+            .env(
+                "SLUSS_GITHUB_PRIVATE_KEY_PATH",
+                key_dir.path().join("test-key.pem"),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while token_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                restarted.0.try_wait().unwrap().is_none(),
+                "service exited after the topology was restored"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restored service must resume reconciliation");
+    assert!(restarted.0.try_wait().unwrap().is_none());
+    drop(restarted);
+    api_task.abort();
+}
+
 #[tokio::test]
 async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
     use hmac::{Hmac, Mac};
