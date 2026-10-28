@@ -56,6 +56,9 @@ enum Command {
         /// Observe known workflow runs periodically.
         #[arg(long, requires_all = ["config", "capacity"])]
         observe_dispatches: bool,
+        /// Complete observed CI-only batches without releasing their reservations.
+        #[arg(long, requires = "observe_dispatches")]
+        complete_ci_only: bool,
         /// Capacity configuration used by cancellation and observation.
         #[arg(long, requires = "config")]
         capacity: Option<PathBuf>,
@@ -188,6 +191,11 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Clear CI-only scheduling holds for a completed batch.
+    RetryCi {
+        #[arg(long)]
+        batch_id: String,
+    },
     /// Show local queue state and implementation status.
     Status,
     /// Show runner time for completed jobs observed by Sluss.
@@ -247,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verification_policy,
         cancel_stale,
         observe_dispatches,
+        complete_ci_only,
         capacity,
     } = cli.command
     {
@@ -343,6 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     capacity,
                     policy.clone(),
                     poll,
+                    complete_ci_only,
                 ));
             }
             tokio::spawn(sluss::worker::supervise(app, cli.db, policy, poll, rescan));
@@ -816,6 +826,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        Command::RetryCi { batch_id } => {
+            let mut store = store;
+            let count = store.retry_ci_only(&batch_id)?;
+            println!(
+                "cleared {count} CI-only scheduling holds; any runner reservation remains held"
+            );
+        }
         Command::Status => {
             println!(
                 "paused: {}\nqueued observations: {}\nCI dispatch: experimental (manual or optional worker)\nlanding: disabled",
@@ -846,8 +863,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(|f| (f.number, f.batch_id))
                 .collect();
+            let completed: std::collections::BTreeMap<_, _> = store
+                .ci_only_completions()?
+                .into_iter()
+                .map(|(number, batch, conclusion)| (number, (batch, conclusion)))
+                .collect();
             for pr in store.candidates()? {
-                if let Some(batch) = failed.get(&pr.number) {
+                if let Some((batch, conclusion)) = completed.get(&pr.number) {
+                    println!(
+                        "#{} {} (CI-only {} in {}; not merge approval)",
+                        pr.number, pr.head_sha, conclusion, batch
+                    );
+                } else if let Some(batch) = failed.get(&pr.number) {
                     println!(
                         "#{} {} (failed in {}; awaiting change)",
                         pr.number, pr.head_sha, batch

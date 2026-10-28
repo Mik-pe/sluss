@@ -183,6 +183,17 @@ pub async fn observe_dispatches_once(
     capacity: &crate::scheduler::Capacity,
     policy: &RepositoryPolicy,
 ) -> Result<(), String> {
+    observe_dispatches_with_completion(app, db, capacity, policy, false).await
+}
+
+/// CI-only completion retires the scheduling batch while retaining its reservation.
+pub async fn observe_dispatches_with_completion(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+    complete_ci_only: bool,
+) -> Result<(), String> {
     use crate::{batch::State, scheduler::DispatchState};
     let store = Store::open(db).map_err(|e| e.to_string())?;
     if store.repository_scope().map_err(|e| e.to_string())?
@@ -207,7 +218,10 @@ pub async fn observe_dispatches_once(
             failed = true;
             continue;
         };
-        if matches!(batch.state, State::Invalidated { .. }) {
+        if matches!(
+            batch.state,
+            State::Invalidated { .. } | State::CiComplete { .. }
+        ) {
             continue;
         }
         let Some(host) = capacity.hosts.get(&dispatch.reservation.host) else {
@@ -241,9 +255,19 @@ pub async fn observe_dispatches_once(
             scheduler
                 .record_job_metrics(id, &snapshot)
                 .map_err(|e| e.to_string())?;
-            scheduler
+            let observation = scheduler
                 .record_ci_observation(id, &snapshot)
                 .map_err(|e| e.to_string())?;
+            if complete_ci_only
+                && !matches!(observation, crate::verification::CiObservation::Pending)
+                && scheduler
+                    .receipt_source(id)
+                    .map_err(|e| e.to_string())?
+                    .as_deref()
+                    == Some("direct")
+            {
+                scheduler.complete_ci_only(id).map_err(|e| e.to_string())?;
+            }
             Ok::<_, String>(())
         }
         .await;
@@ -266,11 +290,15 @@ pub async fn supervise_dispatch_observation(
     capacity: crate::scheduler::Capacity,
     policy: RepositoryPolicy,
     poll: Duration,
+    complete_ci_only: bool,
 ) {
     let minimum = poll.max(Duration::from_secs(60));
     let mut delay = minimum;
     loop {
-        if let Err(error) = observe_dispatches_once(&app, &db, &capacity, &policy).await {
+        if let Err(error) =
+            observe_dispatches_with_completion(&app, &db, &capacity, &policy, complete_ci_only)
+                .await
+        {
             eprintln!("dispatch observation pass failed: {error}");
             delay = delay.saturating_mul(2).min(Duration::from_secs(300));
         } else {

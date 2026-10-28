@@ -75,6 +75,7 @@ impl Store {
                 id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS candidate_evidence (number INTEGER PRIMARY KEY, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ci_candidate_completions (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, base_sha TEXT NOT NULL, batch_id TEXT NOT NULL, conclusion TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
@@ -369,6 +370,7 @@ impl Store {
                     [],
                 )?;
                 tx.execute("DELETE FROM failed_singletons", [])?;
+                tx.execute("DELETE FROM ci_candidate_completions", [])?;
             }
             let old_target: Option<String> = tx
                 .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
@@ -473,6 +475,37 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
+    }
+
+    /// Current CI-only completions are scheduling holds, not merge approvals.
+    pub fn ci_only_completions(&self) -> Result<Vec<(u64, String, String)>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT c.number,c.batch_id,c.conclusion FROM ci_candidate_completions c JOIN candidates p ON p.number=c.number AND p.head_sha=c.head_sha JOIN candidate_evidence e ON e.number=c.number AND e.digest=c.digest JOIN observed_base b ON b.id=1 AND b.sha=c.base_sha ORDER BY p.sequence,p.number")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Remove holds for a completed CI-only batch; this does not free a runner.
+    pub fn retry_ci_only(&mut self, batch_id: &str) -> Result<usize, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let body: Option<String> = tx
+            .query_row("SELECT body FROM batches WHERE id=?1", [batch_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let batch: Batch = serde_json::from_str(&body.ok_or(StoreError::InvalidBatch)?)?;
+        if !matches!(batch.state, State::CiComplete { .. }) {
+            return Err(StoreError::InvalidBatch);
+        }
+        let removed = tx.execute(
+            "DELETE FROM ci_candidate_completions WHERE batch_id=?1",
+            [batch_id],
+        )?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Current singleton failures, excluding records invalidated by new observations.
@@ -794,6 +827,10 @@ impl Store {
                     return Err(StoreError::InvalidCandidate);
                 }
                 if !occupied.contains(&number) && !held_for_splits.contains(&number) {
+                    let completed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_candidate_completions c JOIN candidate_evidence e ON e.number=c.number WHERE c.number=?1 AND c.head_sha=?2 AND c.digest=e.digest AND c.base_sha=?3)", params![number as i64, sha, base_sha], |r| r.get(0))?;
+                    if completed {
+                        continue;
+                    }
                     let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM failed_singletons f JOIN candidate_evidence e ON e.number=f.number WHERE f.number=?1 AND f.head_sha=?2 AND f.digest=e.digest)", params![number as i64,sha], |r| r.get(0))?;
                     if blocked {
                         continue;

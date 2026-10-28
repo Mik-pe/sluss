@@ -26,6 +26,12 @@ pub enum State {
     Testing {
         integration_sha: String,
     },
+    /// A CI-only observation for scheduling; it is not a merge approval.
+    CiComplete {
+        integration_sha: String,
+        run_id: u64,
+        conclusion: String,
+    },
     /// This is a state-machine result, not an authorization to update a ref.
     Verified {
         integration_sha: String,

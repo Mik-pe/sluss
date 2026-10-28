@@ -1145,3 +1145,90 @@ fn stale_run_from_row(
     }
     Ok(StaleRun { plan, run_id })
 }
+
+impl Scheduler {
+    /// Finalize the scheduling lifecycle of a directly received CI run without
+    /// releasing its runner reservation or granting any merge authorization.
+    pub fn complete_ci_only(&mut self, id: &str) -> Result<(), SchedulerError> {
+        use crate::{
+            batch::{Batch, State},
+            verification::CiObservation,
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        type CompletionRow = (String, String, Option<String>, String, String, i64, String);
+        let row: Option<CompletionRow> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,b.batch_id,q.body,q.version,c.body FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN batches q ON q.id=b.batch_id JOIN ci_observations c ON c.id=d.id WHERE d.id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+        ).optional()?;
+        let (plan_body, state, run, batch_id, batch_body, version, observation_body) =
+            row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
+        let observation: StoredCiObservation = serde_json::from_str(&observation_body)?;
+        let run_id = run
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or(SchedulerError::DispatchTransition)?;
+        let source: Option<String> = tx
+            .query_row(
+                "SELECT source FROM dispatch_receipt_sources WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if state != "observed"
+            || source.as_deref() != Some("direct")
+            || observation.run_id != run_id
+            || observation.plan != plan
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let conclusion = match observation.observation {
+            CiObservation::Successful => "success".to_owned(),
+            CiObservation::Failed { conclusion } if !conclusion.is_empty() => conclusion,
+            _ => return Err(SchedulerError::DispatchTransition),
+        };
+        let mut batch: Batch = serde_json::from_str(&batch_body)?;
+        if batch.state
+            == (State::CiComplete {
+                integration_sha: plan.integration_sha.clone(),
+                run_id,
+                conclusion: conclusion.clone(),
+            })
+        {
+            return Ok(());
+        }
+        validate_batch_dispatch(&tx, &batch_id, &plan)?;
+        for candidate in &batch.candidates {
+            let number = i64::try_from(candidate.number).map_err(|_| SchedulerError::StaleBatch)?;
+            let digest: String = tx.query_row(
+                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                params![batch_id, number],
+                |r| r.get(0),
+            )?;
+            tx.execute("INSERT INTO ci_candidate_completions(number,head_sha,digest,base_sha,batch_id,conclusion) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,digest=excluded.digest,base_sha=excluded.base_sha,batch_id=excluded.batch_id,conclusion=excluded.conclusion", params![number,candidate.head_sha,digest,batch.base_sha,batch_id,conclusion])?;
+        }
+        batch.state = State::CiComplete {
+            integration_sha: plan.integration_sha,
+            run_id,
+            conclusion,
+        };
+        if tx.execute(
+            "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
+            params![serde_json::to_string(&batch)?, batch_id, version],
+        )? != 1
+        {
+            return Err(SchedulerError::StaleBatch);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}

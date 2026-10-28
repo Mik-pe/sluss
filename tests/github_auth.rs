@@ -129,7 +129,7 @@ async fn actions_jobs(
     } else {
         1
     };
-    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
+    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if mode == 40 { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
 async fn dispatch_repo(headers: HeaderMap) -> Json<Value> {
@@ -174,7 +174,13 @@ async fn dispatched_run(
     } else {
         "completed"
     };
-    let conclusion = if mode == 31 { None } else { Some("success") };
+    let conclusion = if mode == 31 {
+        None
+    } else if mode == 40 {
+        Some("failure")
+    } else {
+        Some("success")
+    };
     Json(
         json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
@@ -1860,7 +1866,12 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         },
         verification_policy: None,
     };
-    for (name, fail_after_post) in [("uncertain", true), ("successful", false)] {
+    for (name, fail_after_post) in [
+        ("uncertain", true),
+        ("successful", false),
+        ("base-changed", false),
+        ("failed", false),
+    ] {
         mode.store(0, Ordering::SeqCst);
         let auto_db = data.path().join(format!("{name}.sqlite"));
         let mut inbox = Inbox::open(&auto_db).unwrap();
@@ -1997,6 +2008,149 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 Some("recovered")
             );
             assert_eq!(posts.load(Ordering::SeqCst), before + 1);
+            sluss::worker::observe_dispatches_with_completion(
+                &fixture_app,
+                &auto_db,
+                &observer_capacity,
+                &fixture_policy,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                auto_store.batch(id).unwrap().unwrap().0.state,
+                sluss::batch::State::Testing { .. }
+            ));
+        } else {
+            if name == "failed" {
+                mode.store(40, Ordering::SeqCst);
+            }
+            inbox
+                .record("fresh-review", "pull_request_review", &[44; 32], 42, 7)
+                .unwrap();
+            assert!(
+                sluss::worker::observe_dispatches_with_completion(
+                    &fixture_app,
+                    &auto_db,
+                    &observer_capacity,
+                    &fixture_policy,
+                    true,
+                )
+                .await
+                .is_err(),
+                "pending reconciliation must prevent completion"
+            );
+            let event = inbox.pending().unwrap().remove(0);
+            sluss::reconcile::reconcile_once(
+                &fixture_app,
+                &fixture_token,
+                &mut auto_store,
+                &event,
+                &fixture_policy,
+            )
+            .await
+            .unwrap();
+            sluss::worker::observe_dispatches_with_completion(
+                &fixture_app,
+                &auto_db,
+                &observer_capacity,
+                &fixture_policy,
+                true,
+            )
+            .await
+            .unwrap();
+            let expected = if name == "failed" {
+                "failure"
+            } else {
+                "success"
+            };
+            assert!(matches!(auto_store.batch(id).unwrap().unwrap().0.state,
+                sluss::batch::State::CiComplete { run_id: 123, ref conclusion, .. } if conclusion == expected));
+            assert_eq!(
+                auto_store.ci_only_completions().unwrap(),
+                vec![(19, id.into(), expected.into())]
+            );
+            assert!(
+                auto_store
+                    .plan_batch("batch-1123456789abcdef", &"b".repeat(40), 1, 1)
+                    .unwrap()
+                    .is_none()
+            );
+            let scheduler =
+                sluss::scheduler::Scheduler::open(&auto_db, observer_capacity.clone()).unwrap();
+            assert_eq!(
+                scheduler.pending_dispatches().unwrap().len(),
+                1,
+                "the reservation is retained"
+            );
+            let queue = Command::new(env!("CARGO_BIN_EXE_sluss"))
+                .arg("--db")
+                .arg(&auto_db)
+                .arg("queue")
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&queue.stdout).contains("not merge approval"));
+            if name == "base-changed" {
+                let raw = rusqlite::Connection::open(&auto_db).unwrap();
+                let digest: String = raw
+                    .query_row(
+                        "SELECT policy_digest FROM repository_binding WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let evidence: String = raw
+                    .query_row(
+                        "SELECT digest FROM candidate_evidence WHERE number=19",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let candidate = auto_store.candidates().unwrap().remove(0);
+                inbox
+                    .record("base-moved", "push", &[45; 32], 42, 7)
+                    .unwrap();
+                let event = inbox.pending().unwrap().remove(0);
+                auto_store
+                    .apply_admission_reconciliation_with_base(
+                        &event,
+                        &digest,
+                        &[sluss::store::AdmissionCandidate {
+                            candidate,
+                            evidence_digest: evidence,
+                        }],
+                        &"c".repeat(40),
+                        "main",
+                    )
+                    .unwrap();
+                assert!(auto_store.ci_only_completions().unwrap().is_empty());
+                assert!(
+                    auto_store
+                        .plan_batch("batch-1123456789abcdef", &"c".repeat(40), 1, 1)
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                let retry = Command::new(env!("CARGO_BIN_EXE_sluss"))
+                    .arg("--db")
+                    .arg(&auto_db)
+                    .args(["retry-ci", "--batch-id", id])
+                    .output()
+                    .unwrap();
+                assert!(retry.status.success());
+                assert!(
+                    String::from_utf8_lossy(&retry.stdout)
+                        .contains("cleared 1 CI-only scheduling holds")
+                );
+                assert_eq!(auto_store.retry_ci_only(id).unwrap(), 0);
+                assert!(
+                    auto_store
+                        .plan_batch("batch-1123456789abcdef", &"b".repeat(40), 1, 1)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
         }
     }
     server.abort();
