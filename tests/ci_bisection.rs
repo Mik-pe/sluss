@@ -1157,6 +1157,44 @@ fn legacy_parent_without_original_job_snapshot_cannot_drive_bisection() {
 }
 
 #[test]
+fn older_contradictory_success_snapshot_cannot_drive_bisection() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    finish(&mut store, &mut scheduler, &left, 2, "success");
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM ci_observations WHERE id=?1",
+            [&left.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut old: sluss::scheduler::CiObservationRecord = serde_json::from_str(&body).unwrap();
+    let mut optional = old.snapshot.as_ref().unwrap().jobs[0].clone();
+    optional.id = 999;
+    optional.name = "optional".into();
+    optional.status = "in_progress".into();
+    optional.conclusion = None;
+    old.snapshot.as_mut().unwrap().jobs.push(optional);
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        [&left.id, &serde_json::to_string(&old).unwrap()],
+    )
+    .unwrap();
+    let right = plan(&mut store, 3).unwrap();
+    finish(&mut store, &mut scheduler, &right, 3, "failure");
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "inconclusive".into()))
+    );
+    assert!(plan(&mut store, 4).is_none());
+}
+
+#[test]
 fn contradictory_completed_run_invalidates_its_pending_investigation() {
     let (dir, mut store, _inbox, mut scheduler) = setup();
     let root = plan(&mut store, 1).unwrap();
@@ -1271,9 +1309,77 @@ fn missing_previously_observed_job_creates_a_durable_conflict() {
             runner_id: Some(7),
         }],
     };
+    // A terminal successful run cannot establish evidence while even an
+    // optional job remains unfinished or has no final conclusion.
+    let mut extra = snapshot.jobs[0].clone();
+    extra.id = 102;
+    extra.name = "optional".into();
+    extra.status = "in_progress".into();
+    extra.conclusion = None;
+    snapshot.jobs.push(extra);
+    assert!(matches!(
+        scheduler.record_ci_observation(&root.id, &snapshot),
+        Err(SchedulerError::CiObservation(CiObservationError::Ambiguous))
+    ));
+    assert!(store.ci_evidence(&root.id).unwrap().is_none());
+    assert!(scheduler.complete_ci_only(&root.id).is_err());
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(
+        dir.path().join("queue.sqlite"),
+        Capacity {
+            pools: [("rust".into(), 1)].into(),
+            hosts: [(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [7].into(),
+                    pools: [("rust".into(), 1)].into(),
+                },
+            )]
+            .into(),
+        },
+    )
+    .unwrap();
+    assert!(store.ci_evidence(&root.id).unwrap().is_none());
+    snapshot.jobs.pop();
     scheduler
         .record_ci_observation(&root.id, &snapshot)
         .unwrap();
+    // Simulate a summary saved by an older version: completion must
+    // re-evaluate the saved snapshot rather than trust its old success flag.
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    let saved: String = conn
+        .query_row(
+            "SELECT body FROM ci_observations WHERE id=?1",
+            [&root.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut legacy: sluss::scheduler::CiObservationRecord = serde_json::from_str(&saved).unwrap();
+    let mut optional = legacy.snapshot.as_ref().unwrap().jobs[0].clone();
+    optional.id = 102;
+    optional.name = "optional".into();
+    optional.status = "queued".into();
+    optional.conclusion = None;
+    legacy.snapshot.as_mut().unwrap().jobs.push(optional);
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        [&root.id, &serde_json::to_string(&legacy).unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        scheduler.complete_ci_only(&root.id),
+        Err(SchedulerError::CiObservation(CiObservationError::Ambiguous))
+    ));
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::Testing { .. }
+    ));
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        [&root.id, &saved],
+    )
+    .unwrap();
     snapshot.run.id = 99;
     assert!(matches!(
         scheduler.record_ci_observation(&root.id, &snapshot),

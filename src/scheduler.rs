@@ -2127,6 +2127,19 @@ impl Scheduler {
         {
             return Err(SchedulerError::DispatchTransition);
         }
+        // Re-evaluate snapshots saved by an older version before allowing
+        // their summary to advance the CI-only lifecycle. Legacy summaries
+        // without snapshots retain their existing, non-attesting behavior.
+        if let Some(snapshot) = observation.snapshot.as_ref()
+            && crate::verification::observe_ci(&plan, run_id, snapshot)
+                .ok()
+                .as_ref()
+                != Some(&observation.observation)
+        {
+            return Err(SchedulerError::CiObservation(
+                crate::verification::CiObservationError::Ambiguous,
+            ));
+        }
         let conclusion = match observation.observation {
             CiObservation::Successful => "success".to_owned(),
             CiObservation::Failed { conclusion } if !conclusion.is_empty() => conclusion,
@@ -2187,7 +2200,17 @@ fn has_job_snapshot(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, Sc
     match body {
         Some(body) => {
             let record: CiObservationRecord = serde_json::from_str(&body)?;
-            Ok(record.snapshot.is_some() && record.runner_id.is_some())
+            Ok(record.snapshot.as_ref().is_some_and(|snapshot| {
+                record.runner_id.is_some_and(|runner| {
+                    snapshot
+                        .jobs
+                        .iter()
+                        .any(|job| job.runner_id == Some(runner))
+                }) && crate::verification::observe_ci(&record.plan, record.run_id, snapshot)
+                    .ok()
+                    .as_ref()
+                    == Some(&record.observation)
+            }))
         }
         None => Ok(false),
     }

@@ -101,6 +101,9 @@ pub fn check_consistency(
             return Err(EvidenceError::RequiredJobNotSuccessful);
         }
     }
+    if observed.jobs.iter().any(|job| !job.completed) {
+        return Err(EvidenceError::IncompleteJobs);
+    }
     Ok(())
 }
 fn is_hex(value: &str, length: usize) -> bool {
@@ -319,6 +322,15 @@ pub fn observe_ci(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or(CiObservationError::Ambiguous)?;
+    // A completed run and a still-running or conclusion-less job are
+    // contradictory provider observations, including for optional jobs.
+    if snapshot
+        .jobs
+        .iter()
+        .any(|job| job.status != "completed" || job.conclusion.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(CiObservationError::Ambiguous);
+    }
     if conclusion != "success" {
         return Ok(CiObservation::Failed {
             conclusion: conclusion.into(),

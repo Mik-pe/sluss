@@ -104,6 +104,17 @@ fn partial_failed_or_ambiguous_results_fail_closed() {
         Err(EvidenceError::RequiredJobNotSuccessful)
     );
     x = observed();
+    x.jobs.push(Job {
+        id: 6,
+        name: "optional".into(),
+        completed: false,
+        successful: false,
+    });
+    assert_eq!(
+        check_consistency(&e, &x),
+        Err(EvidenceError::IncompleteJobs)
+    );
+    x = observed();
     x.jobs[1].name = x.jobs[0].name.clone();
     assert_eq!(check_consistency(&e, &x), Err(EvidenceError::AmbiguousJobs));
     x = observed();
@@ -323,6 +334,39 @@ fn ci_observation_requires_exact_run_and_every_required_job() {
     pending.run.status = "in_progress".into();
     pending.run.conclusion = None;
     assert_eq!(observe_ci(&plan, 4, &pending), Ok(CiObservation::Pending));
+    let mut optional = snapshot.clone();
+    optional.jobs.push(ActionsJob {
+        id: 6,
+        name: "optional".into(),
+        status: "queued".into(),
+        conclusion: None,
+        ..snapshot.jobs[0].clone()
+    });
+    assert_eq!(
+        observe_ci(&plan, 4, &optional),
+        Err(CiObservationError::Ambiguous)
+    );
+    optional.run.status = "in_progress".into();
+    optional.run.conclusion = None;
+    assert_eq!(observe_ci(&plan, 4, &optional), Ok(CiObservation::Pending));
+    optional.run.status = "completed".into();
+    optional.run.conclusion = Some("success".into());
+    optional.jobs[1].status = "completed".into();
+    assert_eq!(
+        observe_ci(&plan, 4, &optional),
+        Err(CiObservationError::Ambiguous)
+    );
+    optional.run.conclusion = Some("failure".into());
+    assert_eq!(
+        observe_ci(&plan, 4, &optional),
+        Err(CiObservationError::Ambiguous)
+    );
+    optional.run.conclusion = Some("success".into());
+    optional.jobs[1].conclusion = Some("skipped".into());
+    assert_eq!(
+        observe_ci(&plan, 4, &optional),
+        Ok(CiObservation::Successful)
+    );
     let mut failed = snapshot.clone();
     failed.run.conclusion = Some("failure".into());
     assert_eq!(
