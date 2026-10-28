@@ -107,6 +107,15 @@ enum Command {
         #[arg(long)]
         discard_unstarted: bool,
     },
+    /// Migrate planner limits while paused and drained.
+    MigratePlanning {
+        /// Current planner digest from `sluss status`, or "unbound".
+        #[arg(long)]
+        expected_digest: String,
+        /// Operator-owned configuration containing the new queue settings.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -1444,6 +1453,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("selection mode already matches {next}; Sluss remains paused");
             }
         }
+        Command::MigratePlanning {
+            expected_digest,
+            config,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let mut store = store;
+            if store.migrate_planning_settings(
+                &expected_digest,
+                &config.planning(),
+                config.github.installation_id,
+                config.github.repository_id,
+                &config.queue.target,
+            )? {
+                println!(
+                    "planning settings migrated; queue, CI holds and split tasks retained; Sluss remains paused"
+                );
+            } else {
+                println!("planning settings already match; Sluss remains paused");
+            }
+        }
         Command::RetryCi { batch_id } => {
             let mut store = store;
             let count = store.retry_ci_only(&batch_id)?;
@@ -1464,6 +1493,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_deref()
                     .unwrap_or("unbound")
             );
+            if let Some((settings, digest)) = store.planning_settings()? {
+                println!(
+                    "planning digest: {digest}\nplanning limits: batch {}, active {}, debounce {:?}, window {:?}",
+                    settings.max_batch_size,
+                    settings.max_active_batches,
+                    settings.debounce,
+                    settings.batch_window
+                );
+            } else {
+                println!("planning digest: unbound");
+            }
             for (batch, state) in store.ci_investigations()? {
                 println!("CI investigation {batch}: {state} (not a merge approval)");
             }

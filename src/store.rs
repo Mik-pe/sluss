@@ -38,6 +38,12 @@ pub enum StoreError {
         "selection migration requires no active batches, reservations or unresolved dispatches"
     )]
     MigrationBusy,
+    #[error("pause Sluss before migrating planner settings")]
+    PlanningMigrationNeedsPause,
+    #[error("planner migration requires no active batches, reservations or unresolved dispatches")]
+    PlanningMigrationBusy,
+    #[error("a pending split is larger than the new maximum batch size")]
+    PlanningMigrationSplitTooLarge,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -51,12 +57,34 @@ pub struct FailedCandidate {
     pub head_sha: String,
     pub batch_id: String,
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanningSettings {
     pub max_batch_size: usize,
     pub max_active_batches: usize,
     pub debounce: Duration,
     pub batch_window: Duration,
+}
+
+impl PlanningSettings {
+    fn validate(&self) -> Result<(), StoreError> {
+        if !(1..=100).contains(&self.max_batch_size)
+            || !(1..=100).contains(&self.max_active_batches)
+            || self.debounce > Duration::from_secs(86400)
+            || self.batch_window > Duration::from_secs(86400)
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String, StoreError> {
+        use sha2::{Digest, Sha256};
+        self.validate()?;
+        let mut hash = Sha256::new();
+        hash.update(b"sluss-planning-settings-v1\0");
+        hash.update(serde_json::to_vec(self)?);
+        Ok(hex::encode(hash.finalize()))
+    }
 }
 
 /// Historical CI comparison and any durable conflict marker. This is not
@@ -100,6 +128,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS planning_config (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS planning_migrations (id INTEGER PRIMARY KEY, previous_digest TEXT NOT NULL, next_digest TEXT NOT NULL, previous_body TEXT, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_selection_config (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS selection_migrations (id INTEGER PRIMARY KEY, previous_mode TEXT NOT NULL, next_mode TEXT NOT NULL, migrated_ms INTEGER NOT NULL, cleared_holds INTEGER NOT NULL, discarded_batches INTEGER NOT NULL);
@@ -614,6 +643,134 @@ impl Store {
     }
 
     /// Freeze an ordered batch from a reconciled queue in one transaction.
+    /// Read the bound planning configuration and its versioned digest.
+    pub fn planning_settings(&self) -> Result<Option<(PlanningSettings, String)>, StoreError> {
+        let body: Option<String> = self
+            .conn
+            .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        body.map(|body| {
+            let settings: PlanningSettings = serde_json::from_str(&body)?;
+            let digest = settings.digest()?;
+            Ok((settings, digest))
+        })
+        .transpose()
+    }
+
+    /// Migrate settings only while paused and drained. Pending split groups are
+    /// preserved and must fit the new limit. Workers must be stopped by the
+    /// operator: SQLite cannot establish that an external Git process exited.
+    pub fn migrate_planning_settings(
+        &mut self,
+        expected: &str,
+        next: &PlanningSettings,
+        installation: i64,
+        repository: i64,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        if expected != "unbound" && !valid_hex(expected, 64) {
+            return Err(StoreError::InvalidBatch);
+        }
+        let next_digest = next.digest()?;
+        let next_body = serde_json::to_string(next)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let paused: bool = tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !paused {
+            return Err(StoreError::PlanningMigrationNeedsPause);
+        }
+        let binding: Option<(i64, i64, String)> = tx.query_row(
+            "SELECT r.installation,r.repository,t.branch FROM repository_binding r JOIN observed_target t ON r.id=t.id WHERE r.id=1", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        match binding {
+            Some((i, r, _)) if (i, r) != (installation, repository) => {
+                return Err(StoreError::RepositoryMismatch);
+            }
+            Some((_, _, branch)) if branch != target => return Err(StoreError::PolicyMismatch),
+            None => return Err(StoreError::Unbound),
+            _ => {}
+        }
+        let old_body: Option<String> = tx
+            .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let old_digest = match &old_body {
+            Some(body) => serde_json::from_str::<PlanningSettings>(body)?.digest()?,
+            None => "unbound".to_owned(),
+        };
+        if old_digest != expected {
+            return Err(StoreError::PolicyMismatch);
+        }
+        // Validate the drain inside the same write transaction that changes the
+        // settings so a competing planner or dispatcher cannot interleave.
+        {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let batch: Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    batch.state,
+                    State::Planned
+                        | State::Building
+                        | State::Testing { .. }
+                        | State::Verified { .. }
+                ) {
+                    return Err(StoreError::PlanningMigrationBusy);
+                }
+            }
+        }
+        for (table, predicate) in [
+            ("capacity_reservations", "1"),
+            ("dispatch_intents", "state NOT IN ('finished','cancelled')"),
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if exists
+                && tx.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"),
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                return Err(StoreError::PlanningMigrationBusy);
+            }
+        }
+        {
+            let mut stmt = tx.prepare("SELECT members FROM split_tasks WHERE state='pending'")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let members: Vec<AdmissionCandidate> =
+                    serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if members.is_empty() {
+                    return Err(StoreError::InvalidBatch);
+                }
+                if members.len() > next.max_batch_size {
+                    return Err(StoreError::PlanningMigrationSplitTooLarge);
+                }
+            }
+        }
+        if old_digest == next_digest {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute("INSERT INTO planning_config(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [&next_body])?;
+        tx.execute("INSERT INTO planning_migrations(previous_digest,next_digest,previous_body,next_body,migrated_ms) VALUES(?1,?2,?3,?4,?5)", params![old_digest,next_digest,old_body,next_body,now_ms()?])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// The supplied base is an observation, not proof that the target is
     /// unchanged; callers must refresh provider state before integration.
     /// Plan using only the last provider-reconciled repository and target.

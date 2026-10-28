@@ -1442,3 +1442,259 @@ fn workflow_policy_paths_must_have_been_frozen_before_staging() {
         Some(".github/workflows/ci.yml")
     );
 }
+
+#[test]
+fn planner_migration_preserves_pending_split_and_rejects_unsafe_changes() {
+    use sluss::store::PlanningSettings;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox.record("target", "push", &[3; 32], 1, 2).unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates = store.candidates().unwrap();
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &with_evidence(&candidates),
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    let old = PlanningSettings {
+        max_batch_size: 4,
+        max_active_batches: 1,
+        debounce: Duration::ZERO,
+        batch_window: Duration::ZERO,
+    };
+    let mut next = old.clone();
+    next.max_batch_size = 2;
+    assert!(matches!(
+        store.migrate_planning_settings("unbound", &next, 1, 2, "main"),
+        Err(StoreError::PlanningMigrationNeedsPause)
+    ));
+    let parent = store
+        .plan_observed_batch(1, 2, &"f".repeat(64), "main", &old)
+        .unwrap()
+        .unwrap();
+    let digest = store.planning_settings().unwrap().unwrap().1;
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_planning_settings(&digest, &next, 1, 2, "main"),
+        Err(StoreError::PlanningMigrationBusy)
+    ));
+    store.set_paused(false).unwrap();
+    store.start_integration(&parent.id).unwrap();
+    store.fail_integration(&parent.id, "conflict").unwrap();
+    store.set_paused(true).unwrap();
+    let mut too_small = next.clone();
+    too_small.max_batch_size = 1;
+    assert!(matches!(
+        store.migrate_planning_settings(&digest, &too_small, 1, 2, "main"),
+        Err(StoreError::PlanningMigrationSplitTooLarge)
+    ));
+    assert!(matches!(
+        store.migrate_planning_settings(&"f".repeat(64), &next, 1, 2, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        store.migrate_planning_settings(&digest, &next, 1, 3, "main"),
+        Err(StoreError::RepositoryMismatch)
+    ));
+    assert!(matches!(
+        store.migrate_planning_settings(&digest, &next, 1, 2, "other"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert_eq!(
+        store.planning_settings().unwrap().unwrap(),
+        (old.clone(), digest.clone())
+    );
+    let budgets = std::collections::BTreeMap::from([("rust".to_owned(), 1)]);
+    let capacity = sluss::scheduler::Capacity {
+        pools: budgets.clone(),
+        hosts: std::collections::BTreeMap::from([(
+            "host".to_owned(),
+            sluss::scheduler::Host {
+                slots: 1,
+                runner_ids: Default::default(),
+                pools: budgets.clone(),
+            },
+        )]),
+    };
+    let mut scheduler = sluss::scheduler::Scheduler::open(&db, capacity).unwrap();
+    scheduler
+        .reserve("other-work", &sluss::scheduler::Request { pools: budgets })
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store.migrate_planning_settings(&digest, &next, 1, 2, "main"),
+        Err(StoreError::PlanningMigrationBusy)
+    ));
+    scheduler.release("other-work").unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO dispatch_intents(id,plan,state) VALUES('uncertain','{}','sending')",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.migrate_planning_settings(&digest, &next, 1, 2, "main"),
+        Err(StoreError::PlanningMigrationBusy)
+    ));
+    conn.execute("DELETE FROM dispatch_intents WHERE id='uncertain'", [])
+        .unwrap();
+    conn.execute("INSERT INTO ci_candidate_completions(number,head_sha,digest,base_sha,batch_id,conclusion) VALUES(99,?1,?2,?3,'history','success')", rusqlite::params!["f".repeat(40),"e".repeat(64),"a".repeat(40)]).unwrap();
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config, "version=1\n[github]\napp_client_id='test'\ninstallation_id=1\nrepository_id=2\nowner='owner'\nrepository='repo'\n[queue]\ntarget='main'\nmax_batch_size=2\nmax_active_batches=1\ndebounce_seconds=0\nbatch_window_seconds=0\n[checks]\nrequired_reviews=1\n").unwrap();
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains(&digest));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["migrate-planning", "--expected-digest", &digest, "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(store.paused().unwrap());
+    let (current, new_digest) = store.planning_settings().unwrap().unwrap();
+    assert_eq!(current, next);
+    assert_ne!(digest, new_digest);
+    assert!(
+        !store
+            .migrate_planning_settings(&new_digest, &next, 1, 2, "main")
+            .unwrap()
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM planning_migrations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    let holds: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_candidate_completions WHERE batch_id='history'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(holds, 1);
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    assert_eq!(store.planning_settings().unwrap().unwrap().1, new_digest);
+    store.set_paused(false).unwrap();
+    assert!(matches!(
+        store.plan_observed_batch(1, 2, &"f".repeat(64), "main", &old),
+        Err(StoreError::PolicyMismatch)
+    ));
+    let first = store
+        .plan_observed_batch(1, 2, &"f".repeat(64), "main", &next)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first
+            .candidates
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[test]
+fn concurrent_planner_migrations_compare_the_same_frozen_version() {
+    use sluss::store::PlanningSettings;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox.record("target", "push", &[3; 32], 1, 2).unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates = store.candidates().unwrap();
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &with_evidence(&candidates),
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    store.set_paused(true).unwrap();
+    let initial = PlanningSettings {
+        max_batch_size: 4,
+        max_active_batches: 1,
+        debounce: Duration::ZERO,
+        batch_window: Duration::ZERO,
+    };
+    assert!(
+        store
+            .migrate_planning_settings("unbound", &initial, 1, 2, "main")
+            .unwrap()
+    );
+    let digest = initial.digest().unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = [2, 3]
+        .into_iter()
+        .map(|size| {
+            let db = db.clone();
+            let digest = digest.clone();
+            let barrier = barrier.clone();
+            let mut next = initial.clone();
+            next.max_batch_size = size;
+            std::thread::spawn(move || {
+                let mut store = Store::open(db).unwrap();
+                barrier.wait();
+                store.migrate_planning_settings(&digest, &next, 1, 2, "main")
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(StoreError::PolicyMismatch)))
+            .count(),
+        1
+    );
+    assert!(store.paused().unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM planning_migrations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    // Unknown future fields must never be silently discarded by an older binary.
+    let body: String = conn
+        .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    value["future_limit"] = serde_json::json!(1);
+    conn.execute(
+        "UPDATE planning_config SET body=?1 WHERE id=1",
+        [serde_json::to_string(&value).unwrap()],
+    )
+    .unwrap();
+    assert!(store.planning_settings().is_err());
+    assert!(
+        store
+            .migrate_planning_settings(&digest, &initial, 1, 2, "main")
+            .is_err()
+    );
+}
