@@ -48,6 +48,7 @@ pub struct InstallationToken {
     actions_write: bool,
     contents_write: bool,
     runner_inventory_read: bool,
+    checks_read: bool,
     app_client_id: String,
     api_origin: String,
 }
@@ -396,6 +397,7 @@ impl App {
             actions_write: matches!(purpose, TokenPurpose::Dispatch),
             contents_write: matches!(purpose, TokenPurpose::Staging),
             runner_inventory_read: matches!(purpose, TokenPurpose::RunnerInventory),
+            checks_read: matches!(purpose, TokenPurpose::Read),
             app_client_id: self.client_id.clone(),
             api_origin: self.api.as_str().to_owned(),
         })
@@ -1394,6 +1396,103 @@ impl App {
         journal
             .claim_with_fresh_snapshot(operation_id, &snapshot)
             .map_err(Into::into)
+    }
+}
+
+/// Immutable identity expected for a previously created App check. The
+/// caller must independently establish its provenance and current policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppCheckExpectation {
+    pub installation_id: u64,
+    pub repository_id: u64,
+    pub repository_node_id: String,
+    pub check_run_id: u64,
+    pub integration_sha: String,
+    pub batch_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppCheckObservation {
+    pub id: u64,
+    pub name: String,
+    pub head_sha: String,
+    pub external_id: Option<String>,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub app: AppCheckIssuer,
+    pub check_suite: AppCheckSuite,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppCheckIssuer {
+    pub id: u64,
+    pub node_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppCheckSuite {
+    pub id: u64,
+}
+impl App {
+    /// Read an already existing successful `sluss/verified` check twice and
+    /// compare GitHub's issuing App and exact SHA with independently scoped
+    /// identity observations. This does not create a check, prove its CI
+    /// policy, establish its provenance, or authorize a merge. GitHub state
+    /// may change immediately after these reads.
+    pub async fn observe_own_verified_check(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        expected: &AppCheckExpectation,
+    ) -> Result<AppCheckObservation, GitHubError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        if !token.checks_read
+            || !valid_name(owner)
+            || !valid_name(repository)
+            || expected.installation_id == 0
+            || expected.repository_id == 0
+            || expected.check_run_id == 0
+            || !valid_name(&expected.batch_id)
+            || !commit_sha(&expected.integration_sha)
+            || expected.integration_sha.bytes().all(|c| c == b'0')
+            || expected.installation_id != token.installation_id
+            || expected.repository_id != token.repository_id
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+        {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let app = self.observe_app_identity().await?;
+        let root = format!("repos/{owner}/{repository}");
+        let first_repo: Identity = self.get_json(token, &root, None).await?;
+        if first_repo.id != expected.repository_id
+            || first_repo.node_id != expected.repository_node_id
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let path = format!("{root}/check-runs/{}", expected.check_run_id);
+        let first: AppCheckObservation = self.get_json(token, &path, None).await?;
+        let last: AppCheckObservation = self.get_json(token, &path, None).await?;
+        let last_repo: Identity = self.get_json(token, &root, None).await?;
+        let last_app = self.observe_app_identity().await?;
+        if first != last
+            || first_repo != last_repo
+            || app != last_app
+            || last.id != expected.check_run_id
+            || last.name != "sluss/verified"
+            || last.head_sha != expected.integration_sha
+            || last.external_id.as_deref() != Some(expected.batch_id.as_str())
+            || last.status != "completed"
+            || last.conclusion.as_deref() != Some("success")
+            || last.app.id != app.id
+            || last.app.node_id != app.node_id
+            || last.check_suite.id == 0
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(last)
     }
 }
 

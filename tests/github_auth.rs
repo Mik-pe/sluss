@@ -373,6 +373,21 @@ async fn authenticated_app(State(state): State<ServerState>, headers: HeaderMap)
         json!({"id":id,"client_id":if mode == 82 {"wrong"} else {"app-client-id"},"slug":"sluss-test","node_id":"A_app"}),
     )
 }
+async fn verified_check(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let changed = mode == 90 && state.token_calls.fetch_add(1, Ordering::SeqCst) % 2 == 1;
+    Json(json!({
+        "id":if mode == 91 {334} else {333},
+        "name":if mode == 86 || changed {"sluss/other"} else {"sluss/verified"},
+        "head_sha":if mode == 85 {"b".repeat(40)} else {"a".repeat(40)},
+        "external_id":if mode == 87 {"batch-other"} else {"batch-0123456789abcdef"},
+        "status":if mode == 89 {"in_progress"} else {"completed"},
+        "conclusion":if mode == 88 {"neutral"} else {"success"},
+        "app":{"id":if mode == 84 {18} else {17},"node_id":if mode == 93 {"A_other"} else {"A_app"}},
+        "check_suite":{"id":if mode == 92 {0} else {44}}
+    }))
+}
 async fn repository_runners(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1503,6 +1518,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/graphql", post(graphql_schema))
         .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/check-runs/333", get(verified_check))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
         .route("/repos/owner/repo/branches/main", get(doctor_branch))
         .route("/repos/owner/repo/pulls", get(open_pulls))
@@ -1577,6 +1593,64 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     mode.store(0, Ordering::SeqCst);
     let fixture_token = fixture_app.read_token(42, 7).await.unwrap();
     let security_token = fixture_app.runner_inventory_token(42, 7).await.unwrap();
+    let expected_check = sluss::github::AppCheckExpectation {
+        installation_id: 42,
+        repository_id: 7,
+        repository_node_id: "R_repo".into(),
+        check_run_id: 333,
+        integration_sha: "a".repeat(40),
+        batch_id: "batch-0123456789abcdef".into(),
+    };
+    assert_eq!(
+        fixture_app
+            .observe_own_verified_check(&fixture_token, "owner", "repo", &expected_check)
+            .await
+            .unwrap()
+            .app
+            .id,
+        17
+    );
+    assert!(matches!(
+        fixture_app
+            .observe_own_verified_check(&security_token, "owner", "repo", &expected_check)
+            .await,
+        Err(GitHubError::InvalidConfiguration)
+    ));
+    let mut invalid_expectations = Vec::new();
+    let mut item = expected_check.clone();
+    item.installation_id = 43;
+    invalid_expectations.push(item);
+    let mut item = expected_check.clone();
+    item.repository_id = 8;
+    invalid_expectations.push(item);
+    let mut item = expected_check.clone();
+    item.check_run_id = 0;
+    invalid_expectations.push(item);
+    let mut item = expected_check.clone();
+    item.integration_sha = "0".repeat(40);
+    invalid_expectations.push(item);
+    let mut item = expected_check.clone();
+    item.batch_id = "../batch".into();
+    invalid_expectations.push(item);
+    for item in invalid_expectations {
+        assert!(matches!(
+            fixture_app
+                .observe_own_verified_check(&fixture_token, "owner", "repo", &item)
+                .await,
+            Err(GitHubError::InvalidConfiguration)
+        ));
+    }
+    for invalid in [63, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93] {
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(
+            fixture_app
+                .observe_own_verified_check(&fixture_token, "owner", "repo", &expected_check)
+                .await
+                .is_err(),
+            "mode {invalid}"
+        );
+    }
+    mode.store(0, Ordering::SeqCst);
     assert!(
         fixture_app
             .observe_branch_security(&fixture_token, "owner", "repo", "main")
