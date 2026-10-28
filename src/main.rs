@@ -53,6 +53,9 @@ enum Command {
         /// Cancel known runs when their batch is invalidated.
         #[arg(long, requires_all = ["config", "capacity"])]
         cancel_stale: bool,
+        /// Cancel stale staging checks and recover uncertain cancellations.
+        #[arg(long, requires = "config")]
+        cancel_stale_checks: bool,
         /// Observe known workflow runs periodically.
         #[arg(long, requires_all = ["config", "capacity"])]
         observe_dispatches: bool,
@@ -611,6 +614,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         verification_policy,
         cancel_stale,
+        cancel_stale_checks,
         observe_dispatches,
         complete_ci_only,
         bisect_ci_failures,
@@ -703,6 +707,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.clone(),
                     cli.db.clone(),
                     capacity,
+                    policy.clone(),
+                    poll,
+                ));
+            }
+            if cancel_stale_checks {
+                eprintln!(
+                    "automatic stale staging-check cancellation enabled; landing remains disabled"
+                );
+                tokio::spawn(sluss::worker::supervise_stale_check_cancellation(
+                    app.clone(),
+                    cli.db.clone(),
                     policy.clone(),
                     poll,
                 ));

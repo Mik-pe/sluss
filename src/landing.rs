@@ -332,6 +332,12 @@ pub enum PendingCiCancellationState {
         recovered: bool,
     },
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StaleCheckTask {
+    Cancel(String),
+    Recover(String),
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StalePendingCiCheck {
     pub intent: PendingCiCheckIntent,
@@ -667,6 +673,40 @@ impl LandingJournal {
             return Ok(None);
         }
         pending_ci_cancellation_from_conn(&self.conn, id)
+    }
+
+    /// Find one-shot cancellations and unresolved sends from a single snapshot.
+    /// Recovered-only or conflicting creation receipts cannot be cancelled.
+    pub(crate) fn stale_check_tasks(&mut self) -> Result<Vec<StaleCheckTask>, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let ids = {
+            let mut statement =
+                tx.prepare("SELECT batch_id FROM pending_ci_checks_v1 ORDER BY batch_id")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut tasks = Vec::new();
+        for id in ids {
+            let (_, state) = pending_ci_check_from_conn(&tx, &id)?.ok_or(LandingError::Corrupt)?;
+            match pending_ci_cancellation_from_conn(&tx, &id)? {
+                Some(PendingCiCancellationState::Sending { .. }) => {
+                    tasks.push(StaleCheckTask::Recover(id));
+                }
+                Some(PendingCiCancellationState::Cancelled { .. }) => {}
+                None if matches!(state, PendingCiCheckState::Created { direct: true, .. }) => {
+                    match stale_pending_ci_check_from_conn(&tx, &id) {
+                        Ok(_) => tasks.push(StaleCheckTask::Cancel(id)),
+                        Err(LandingError::PendingCheckNotStale) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => {}
+            }
+        }
+        tx.commit()?;
+        Ok(tasks)
     }
 
     /// Return a directly received check only when its local evidence is no

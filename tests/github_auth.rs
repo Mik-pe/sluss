@@ -3992,6 +3992,106 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     ));
     assert_eq!(posts.load(Ordering::SeqCst), before_current_cancel);
     let pending_conn = rusqlite::Connection::open(&pending_db).unwrap();
+    // The opt-in worker ignores current evidence and foreign repository scope,
+    // then recovers an ambiguous cancellation without sending another PATCH.
+    let worker_db = data.path().join("pending-cancel-worker.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [worker_db.to_str().unwrap()])
+        .unwrap();
+    let before_worker = posts.load(Ordering::SeqCst);
+    sluss::worker::cancel_stale_checks_once(&observer_app, &worker_db, &observer_policy)
+        .await
+        .unwrap();
+    let mut foreign_policy = observer_policy.clone();
+    foreign_policy.repository = 8;
+    assert!(
+        sluss::worker::cancel_stale_checks_once(&observer_app, &worker_db, &foreign_policy)
+            .await
+            .is_err()
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), before_worker);
+    let mut worker_inbox = Inbox::open(&worker_db).unwrap();
+    worker_inbox
+        .record("worker-review", "pull_request_review", &[80; 32], 42, 7)
+        .unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(135, Ordering::SeqCst);
+    assert!(
+        sluss::worker::cancel_stale_checks_once(&observer_app, &worker_db, &observer_policy)
+            .await
+            .is_err()
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), before_worker + 1);
+    let worker_journal = sluss::landing::LandingJournal::open(&worker_db).unwrap();
+    assert!(matches!(
+        worker_journal.pending_ci_cancellation(id).unwrap(),
+        Some(sluss::landing::PendingCiCancellationState::Sending { .. })
+    ));
+    mode.store(73, Ordering::SeqCst);
+    sluss::worker::cancel_stale_checks_once(&observer_app, &worker_db, &observer_policy)
+        .await
+        .unwrap();
+    sluss::worker::cancel_stale_checks_once(&observer_app, &worker_db, &observer_policy)
+        .await
+        .unwrap();
+    assert!(matches!(
+        worker_journal.pending_ci_cancellation(id).unwrap(),
+        Some(sluss::landing::PendingCiCancellationState::Cancelled {
+            direct: false,
+            recovered: true,
+            ..
+        })
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_worker + 1);
+    // The supervisor starts work immediately and remains idempotent across restart.
+    let supervised_db = data.path().join("pending-cancel-supervised.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [supervised_db.to_str().unwrap()])
+        .unwrap();
+    let mut supervised_inbox = Inbox::open(&supervised_db).unwrap();
+    supervised_inbox
+        .record("supervised-review", "pull_request_review", &[81; 32], 42, 7)
+        .unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    let before_supervised = posts.load(Ordering::SeqCst);
+    let supervised_app =
+        Arc::new(App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap());
+    let worker = tokio::spawn(sluss::worker::supervise_stale_check_cancellation(
+        supervised_app,
+        supervised_db.clone(),
+        observer_policy.clone(),
+        std::time::Duration::from_millis(10),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let journal = sluss::landing::LandingJournal::open(&supervised_db).unwrap();
+            if matches!(
+                journal.pending_ci_cancellation(id).unwrap(),
+                Some(sluss::landing::PendingCiCancellationState::Cancelled { direct: true, .. })
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.abort();
+    sluss::worker::cancel_stale_checks_once(&observer_app, &supervised_db, &observer_policy)
+        .await
+        .unwrap();
+    assert_eq!(posts.load(Ordering::SeqCst), before_supervised + 1);
+    let help = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--cancel-stale-checks"));
+    let missing_config = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .args(["serve", "--cancel-stale-checks"])
+        .output()
+        .unwrap();
+    assert!(!missing_config.status.success());
+    assert!(String::from_utf8_lossy(&missing_config.stderr).contains("--config"));
     let cancel_db = data.path().join("pending-cancel-cli.sqlite");
     pending_conn
         .execute("VACUUM INTO ?1", [cancel_db.to_str().unwrap()])
@@ -4580,6 +4680,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             sluss::landing::LandingError::PendingCheckConflict
         ))
     ));
+    assert_eq!(posts.load(Ordering::SeqCst), after_lost);
+    sluss::worker::cancel_stale_checks_once(&observer_app, &lost_db, &observer_policy)
+        .await
+        .unwrap();
     assert_eq!(posts.load(Ordering::SeqCst), after_lost);
     for race_mode in [127, 132, 133] {
         let late_db = data

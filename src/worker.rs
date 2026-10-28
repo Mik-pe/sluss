@@ -202,6 +202,107 @@ pub async fn supervise_stale_cancellation(
     }
 }
 
+/// Cancel obsolete nonpassing checks or read back uncertain cancellations.
+/// Only the journal's one-shot claim can send an update; recovery only reads.
+pub async fn cancel_stale_checks_once(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+) -> Result<(), String> {
+    use crate::{
+        github::PendingCheckError,
+        landing::{LandingError, LandingJournal, StaleCheckTask},
+    };
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    if store.repository_scope().map_err(|e| e.to_string())?
+        != (policy.installation as u64, policy.repository as u64)
+    {
+        return Err("repository does not match the reconciled queue".into());
+    }
+    let mut journal = LandingJournal::open(db).map_err(|e| e.to_string())?;
+    let tasks = journal.stale_check_tasks().map_err(|e| e.to_string())?;
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let read = app
+        .read_token(policy.installation as u64, policy.repository as u64)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut write = None;
+    let mut failed = false;
+    for task in tasks {
+        let result = match task {
+            StaleCheckTask::Cancel(id) => {
+                if write.is_none() {
+                    match app
+                        .checks_write_token(policy.installation as u64, policy.repository as u64)
+                        .await
+                    {
+                        Ok(token) => write = Some(token),
+                        Err(error) => {
+                            eprintln!("stale staging-check write token failed: {error}");
+                            failed = true;
+                            continue;
+                        }
+                    }
+                }
+                app.cancel_stale_staged_check(
+                    &mut journal,
+                    (&read, write.as_ref().expect("initialized")),
+                    (&policy.owner, &policy.name),
+                    &id,
+                )
+                .await
+            }
+            StaleCheckTask::Recover(id) => {
+                app.recover_cancelled_staged_check(
+                    &mut journal,
+                    &read,
+                    (&policy.owner, &policy.name),
+                    &id,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(_)
+            | Err(PendingCheckError::Journal(
+                LandingError::PendingCheckNotStale | LandingError::StaleBatch,
+            )) => {}
+            Err(error) => {
+                eprintln!("stale staging-check cancellation or recovery failed: {error}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        Err("one or more staging checks need another observation".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Optional worker; ambiguous writes are subsequently observed, never resent.
+pub async fn supervise_stale_check_cancellation(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(60));
+    let mut delay = minimum;
+    loop {
+        match cancel_stale_checks_once(&app, &db, &policy).await {
+            Ok(()) => delay = minimum,
+            Err(error) => {
+                eprintln!("stale staging-check worker: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
 /// Observe known dispatch receipts without starting work or authorizing landing.
 /// A failed provider observation is retried on a later pass.
 pub async fn observe_dispatches_once(
