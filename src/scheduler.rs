@@ -1307,27 +1307,85 @@ impl Scheduler {
         if state != "observed" {
             return Err(SchedulerError::DispatchTransition);
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO capacity_release_topology(id,body) VALUES(1,?1)",
-            [&self.encoded],
-        )?;
-        let locked: String = tx.query_row(
-            "SELECT body FROM capacity_release_topology WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
-        if locked != self.encoded {
-            return Err(SchedulerError::ConfigChanged);
-        }
-        if tx.execute("DELETE FROM capacity_reservations WHERE id=?1", [id])? != 1 {
-            return Err(SchedulerError::Corrupt);
-        }
-        tx.execute("INSERT INTO capacity_finished(id) VALUES(?1)", [id])?;
-        tx.execute(
-            "UPDATE dispatch_intents SET state='finished' WHERE id=?1",
-            [id],
-        )?;
+        finish_bounded_reservation(&tx, id, &self.encoded)?;
         tx.commit()?;
         Ok(())
     }
+
+    /// Free capacity for a directly received run whose batch was invalidated.
+    /// The caller must first verify that the provider run has terminated.
+    pub fn release_invalidated_ci_only(
+        &mut self,
+        id: &str,
+        run_id: u64,
+    ) -> Result<(), SchedulerError> {
+        use crate::batch::{Batch, State};
+        crate::verification::check_release_topology(&self.capacity)
+            .map_err(|_| SchedulerError::Invalid)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        type StaleReleaseRow = (String, String, Option<String>, String, String);
+        let row: Option<StaleReleaseRow> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,q.body,s.source FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN batches q ON q.id=b.batch_id JOIN dispatch_receipt_sources s ON s.id=d.id WHERE d.id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).optional()?;
+        let (plan_body, state, saved_run, batch_body, source) =
+            row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
+        let batch: Batch = serde_json::from_str(&batch_body)?;
+        if run_id == 0
+            || saved_run.as_deref() != Some(&run_id.to_string())
+            || source != "direct"
+            || !plan.valid()
+            || batch.id != id
+            || !matches!(batch.state, State::Invalidated { .. })
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        if state == "finished" {
+            return Ok(());
+        }
+        if state != "observed" {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        finish_bounded_reservation(&tx, id, &self.encoded)?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn finish_bounded_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    encoded: &str,
+) -> Result<(), SchedulerError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO capacity_release_topology(id,body) VALUES(1,?1)",
+        [encoded],
+    )?;
+    let locked: String = tx.query_row(
+        "SELECT body FROM capacity_release_topology WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if locked != encoded {
+        return Err(SchedulerError::ConfigChanged);
+    }
+    if tx.execute("DELETE FROM capacity_reservations WHERE id=?1", [id])? != 1 {
+        return Err(SchedulerError::Corrupt);
+    }
+    tx.execute("INSERT INTO capacity_finished(id) VALUES(?1)", [id])?;
+    tx.execute(
+        "UPDATE dispatch_intents SET state='finished' WHERE id=?1",
+        [id],
+    )?;
+    Ok(())
 }

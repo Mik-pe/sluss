@@ -59,7 +59,7 @@ enum Command {
         /// Complete observed CI-only batches without releasing their reservations.
         #[arg(long, requires = "observe_dispatches")]
         complete_ci_only: bool,
-        /// Release completed CI-only reservations under the single-runner safety contract.
+        /// Release finished or invalidated CI reservations under the single-runner contract.
         #[arg(long, requires_all = ["complete_ci_only", "capacity"])]
         release_ci_only: bool,
         /// Capacity configuration used by scheduling and observation.

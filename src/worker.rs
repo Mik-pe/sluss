@@ -514,8 +514,8 @@ pub async fn supervise_dispatch(
     }
 }
 
-/// Revalidate completed runs and repository runner inventory before releasing
-/// CI-only reservations under the conservative single-runner topology.
+/// Revalidate completed or invalidated runs and runner inventory before
+/// releasing CI-only reservations under the conservative topology.
 pub async fn release_ci_only_once(
     app: &App,
     db: &std::path::Path,
@@ -535,7 +535,7 @@ pub async fn release_ci_only_once(
     let mut released = 0;
     for pending in scheduler.pending_dispatches().map_err(|e| e.to_string())? {
         let run_id = match pending.state {
-            DispatchState::Observed { run_id } => run_id,
+            DispatchState::Accepted { run_id } | DispatchState::Observed { run_id } => run_id,
             _ => continue,
         };
         let Some((batch, _)) = store
@@ -544,16 +544,22 @@ pub async fn release_ci_only_once(
         else {
             continue;
         };
-        let State::CiComplete {
-            run_id: completed_run,
-            ref conclusion,
-            ..
-        } = batch.state
-        else {
-            continue;
+        let expected_conclusion = match &batch.state {
+            State::CiComplete {
+                run_id: completed_run,
+                conclusion,
+                ..
+            } if *completed_run == run_id => Some(conclusion.as_str()),
+            State::Invalidated { .. } => None,
+            _ => continue,
         };
-        if completed_run != run_id {
-            return Err("completed batch and run differ".into());
+        if scheduler
+            .receipt_source(&pending.reservation.id)
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            != Some("direct")
+        {
+            continue;
         }
         let host = capacity
             .hosts
@@ -573,15 +579,30 @@ pub async fn release_ci_only_once(
             )
             .await
             .map_err(|e| e.to_string())?;
+        let conclusion = first
+            .run
+            .conclusion
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let placement = crate::verification::check_host_placement(&first, &host.runner_ids)
+            .map_err(|e| e.to_string())?;
+        let placement_valid = matches!(placement, Placement::Confirmed { .. })
+            || (expected_conclusion.is_none()
+                && matches!(placement, Placement::Waiting)
+                && first.jobs.iter().all(|job| {
+                    job.status == "completed" && job.conclusion.as_deref() == Some("skipped")
+                }));
         if first.run.status != "completed"
-            || first.run.conclusion.as_deref() != Some(conclusion)
-            || !matches!(
-                crate::verification::check_host_placement(&first, &host.runner_ids)
-                    .map_err(|e| e.to_string())?,
-                Placement::Confirmed { .. }
-            )
+            || conclusion.is_none()
+            || expected_conclusion.is_some_and(|expected| conclusion != Some(expected))
+            || !placement_valid
         {
             return Err("completed run or runner placement changed".into());
+        }
+        if matches!(placement, Placement::Confirmed { .. }) {
+            scheduler
+                .record_job_metrics(&pending.reservation.id, &first)
+                .map_err(|e| e.to_string())?;
         }
         let inventory_token = app
             .runner_inventory_token(policy.installation as u64, policy.repository as u64)
@@ -606,9 +627,15 @@ pub async fn release_ci_only_once(
         if first != last {
             return Err("run changed during capacity revalidation".into());
         }
-        scheduler
-            .release_completed_ci_only(&pending.reservation.id, run_id)
-            .map_err(|e| e.to_string())?;
+        if expected_conclusion.is_some() {
+            scheduler
+                .release_completed_ci_only(&pending.reservation.id, run_id)
+                .map_err(|e| e.to_string())?;
+        } else {
+            scheduler
+                .release_invalidated_ci_only(&pending.reservation.id, run_id)
+                .map_err(|e| e.to_string())?;
+        }
         released += 1;
     }
     Ok(released)

@@ -121,8 +121,16 @@ async fn actions_jobs(
     assert_eq!(query.get("per_page").map(String::as_str), Some("100"));
     let page: u64 = query["page"].parse().unwrap();
     let mode = state.mode.load(Ordering::SeqCst);
-    let count = if mode == 15 && page == 1 { 100 } else { 1 };
-    let total = if mode == 15 {
+    let count = if mode == 43 {
+        0
+    } else if mode == 15 && page == 1 {
+        100
+    } else {
+        1
+    };
+    let total = if mode == 43 {
+        0
+    } else if mode == 15 {
         101
     } else if mode == 14 {
         2
@@ -182,6 +190,8 @@ async fn dispatched_run(
         None
     } else if mode == 40 {
         Some("failure")
+    } else if mode == 43 {
+        Some("cancelled")
     } else {
         Some("success")
     };
@@ -1827,6 +1837,34 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         String::from_utf8_lossy(&stale_observation.stdout)
             .contains("batch is stale; no CI result is accepted")
     );
+    mode.store(31, Ordering::SeqCst);
+    assert!(
+        sluss::worker::release_ci_only_once(&fixture_app, &db, &observer_capacity, &fixture_policy)
+            .await
+            .is_err()
+    );
+    mode.store(21, Ordering::SeqCst);
+    assert!(
+        sluss::worker::release_ci_only_once(&fixture_app, &db, &observer_capacity, &fixture_policy)
+            .await
+            .is_err()
+    );
+    mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::release_ci_only_once(&fixture_app, &db, &observer_capacity, &fixture_policy)
+            .await
+            .unwrap(),
+        1
+    );
+    let mut released = sluss::scheduler::Scheduler::open(&db, observer_capacity.clone()).unwrap();
+    assert!(released.pending_dispatches().unwrap().is_empty());
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    released.release_invalidated_ci_only(id, 123).unwrap();
+    assert!(released.release_invalidated_ci_only(id, 124).is_err());
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
     let doctor = launch(vec![
         "doctor".into(),
         "--config".into(),
@@ -1876,6 +1914,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         ("successful", false),
         ("base-changed", false),
         ("failed", false),
+        ("cancelled-empty", false),
+        ("stale-unobserved", false),
     ] {
         mode.store(0, Ordering::SeqCst);
         let auto_db = data.path().join(format!("{name}.sqlite"));
@@ -1972,6 +2012,34 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             before + 1,
             "a restarted worker must not retry an accepted or uncertain POST"
         );
+        if name == "cancelled-empty" || name == "stale-unobserved" {
+            auto_store.remove_candidate(19).unwrap();
+            mode.store(
+                if name == "cancelled-empty" { 43 } else { 0 },
+                Ordering::SeqCst,
+            );
+            assert_eq!(
+                sluss::worker::release_ci_only_once(
+                    &fixture_app,
+                    &auto_db,
+                    &observer_capacity,
+                    &fixture_policy
+                )
+                .await
+                .unwrap(),
+                1
+            );
+            assert!(matches!(
+                auto_store.batch(id).unwrap().unwrap().0.state,
+                sluss::batch::State::Invalidated { .. }
+            ));
+            assert_eq!(posts.load(Ordering::SeqCst), before + 1);
+            assert_eq!(
+                auto_store.metrics().unwrap().completed_jobs,
+                if name == "stale-unobserved" { 1 } else { 0 }
+            );
+            continue;
+        }
         if fail_after_post {
             let key = key_dir.path().join("test-key.pem");
             let path = auto_db.clone();
@@ -2038,6 +2106,23 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 0
             );
             assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+            auto_store.remove_candidate(19).unwrap();
+            assert_eq!(
+                sluss::worker::release_ci_only_once(
+                    &fixture_app,
+                    &auto_db,
+                    &observer_capacity,
+                    &fixture_policy
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                scheduler.pending_dispatches().unwrap().len(),
+                1,
+                "recovered receipt cannot release a stale reservation"
+            );
         } else {
             if name == "failed" {
                 mode.store(40, Ordering::SeqCst);
