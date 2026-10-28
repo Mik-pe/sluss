@@ -39,6 +39,22 @@ pub fn policy_digest(app: &App, config: &RepositoryPolicy) -> Result<String, Rec
     Ok(hex::encode(sha2::Sha256::digest(encoded)))
 }
 
+/// Canonical local digest of an authenticated review observation. This is
+/// scheduling evidence, not an attestation or an atomic provider snapshot.
+pub(crate) fn admission_digest(
+    observed: &crate::github::AuthorizedPullObservation,
+) -> Result<String, ReconcileError> {
+    use sha2::Digest;
+    let input = serde_json::to_vec(&(
+        "sluss-admission-v1",
+        &observed.snapshot,
+        &observed.authorized_reviewers,
+        &observed.reviewer_permissions,
+    ))
+    .map_err(|_| ReconcileError::Scope)?;
+    Ok(hex::encode(sha2::Sha256::digest(input)))
+}
+
 /// Refresh a single pending delivery. A failure never acknowledges the job or
 /// applies a partial queue. The caller must retry and periodically recover
 /// missed events. Branch protection and CODEOWNERS remain unimplemented.
@@ -85,20 +101,12 @@ pub async fn reconcile_once(
         };
         match admission::evaluate(&observed.snapshot, &policy) {
             Ok(eligible) => {
-                use sha2::Digest;
-                let input = serde_json::to_vec(&(
-                    "sluss-admission-v1",
-                    &observed.snapshot,
-                    &observed.authorized_reviewers,
-                    &observed.reviewer_permissions,
-                ))
-                .map_err(|_| ReconcileError::Scope)?;
                 candidates.push(AdmissionCandidate {
                     candidate: Candidate {
                         number: eligible.pull_number,
                         head_sha: eligible.head_sha,
                     },
-                    evidence_digest: hex::encode(sha2::Sha256::digest(input)),
+                    evidence_digest: admission_digest(&observed)?,
                 });
             }
             Err(

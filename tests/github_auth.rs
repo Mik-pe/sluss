@@ -2105,7 +2105,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let frozen_landing = landing
         .prepare_observed_batch("land-refresh", id, "R_repo")
         .unwrap();
-    for invalid in [13, 21, 22, 40, 51, 63] {
+    for invalid in [5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63] {
         reads.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
         assert!(
@@ -2113,8 +2113,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 .refresh_and_claim_observed_landing(
                     &mut landing,
                     &fixture_token,
-                    "owner",
-                    "repo",
+                    &observer_policy,
                     "land-refresh"
                 )
                 .await
@@ -2127,13 +2126,25 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     }
     mode.store(0, Ordering::SeqCst);
     reads.store(0, Ordering::SeqCst);
+    let mut changed_policy = observer_policy.clone();
+    changed_policy.required_reviews = 2;
+    assert!(matches!(
+        observer_app
+            .refresh_and_claim_observed_landing(
+                &mut landing,
+                &fixture_token,
+                &changed_policy,
+                "land-refresh"
+            )
+            .await,
+        Err(sluss::github::LandingRefreshError::Scope)
+    ));
     assert_eq!(
         observer_app
             .refresh_and_claim_observed_landing(
                 &mut landing,
                 &fixture_token,
-                "owner",
-                "repo",
+                &observer_policy,
                 "land-refresh"
             )
             .await

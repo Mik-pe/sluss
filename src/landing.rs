@@ -142,6 +142,12 @@ impl LandingPlan {
 pub struct LandingJournal {
     conn: Connection,
 }
+pub(crate) struct RefreshTarget {
+    pub plan: LandingPlan,
+    pub run_id: u64,
+    pub members: Vec<crate::store::AdmissionCandidate>,
+    pub repository_policy_digest: String,
+}
 impl LandingJournal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LandingError> {
         let conn = Connection::open(path)?;
@@ -361,7 +367,7 @@ impl LandingJournal {
     pub(crate) fn refresh_target(
         &mut self,
         operation_id: &str,
-    ) -> Result<(LandingPlan, u64), LandingError> {
+    ) -> Result<RefreshTarget, LandingError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -382,9 +388,31 @@ impl LandingJournal {
             |r| r.get(0),
         )?;
         let saved: crate::scheduler::CiObservationRecord = serde_json::from_str(&body)?;
-        let id = saved.run_id;
+        let (batch, _) = crate::store::checked_batch(&tx, &plan.batch_id)?;
+        let mut members = Vec::with_capacity(batch.candidates.len());
+        for candidate in batch.candidates {
+            let digest: String = tx.query_row(
+                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                params![plan.batch_id, candidate.number as i64],
+                |r| r.get(0),
+            )?;
+            members.push(crate::store::AdmissionCandidate {
+                candidate,
+                evidence_digest: digest,
+            });
+        }
+        let repository_policy_digest: String = tx.query_row(
+            "SELECT policy_digest FROM repository_binding WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
         tx.commit()?;
-        Ok((plan, id))
+        Ok(RefreshTarget {
+            plan,
+            run_id: saved.run_id,
+            members,
+            repository_policy_digest,
+        })
     }
     /// Only an unclaimed intent can be cancelled without external reconciliation.
     pub fn cancel(&mut self, id: &str) -> Result<bool, LandingError> {

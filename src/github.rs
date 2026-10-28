@@ -1117,16 +1117,15 @@ pub enum LandingRefreshError {
     Journal(#[from] crate::landing::LandingError),
 }
 impl App {
-    /// Refresh the recorded Actions run immediately before claiming an
-    /// experimental batch-bound intent. This is not landing authorization:
+    /// Refresh the PRs, reviews, refs and recorded Actions run immediately
+    /// before claiming an experimental batch-bound intent. This is not authorization:
     /// approvals, trusted policy and provider state can still change later.
     /// No GitHub mutation is sent by this method.
     pub async fn refresh_and_claim_observed_landing(
         &self,
         journal: &mut crate::landing::LandingJournal,
         token: &InstallationToken,
-        owner: &str,
-        repository: &str,
+        policy: &crate::reconcile::RepositoryPolicy,
         operation_id: &str,
     ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
         #[derive(Deserialize, PartialEq, Eq)]
@@ -1134,6 +1133,8 @@ impl App {
             id: u64,
             node_id: String,
         }
+        let owner = &policy.owner;
+        let repository = &policy.name;
         if !valid_name(owner)
             || !valid_name(repository)
             || token.app_client_id != self.client_id
@@ -1141,9 +1142,17 @@ impl App {
         {
             return Err(LandingRefreshError::Scope);
         }
-        let (plan, run_id) = journal.refresh_target(operation_id)?;
+        let target = journal.refresh_target(operation_id)?;
+        let plan = &target.plan;
         if i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
             || i64::try_from(token.installation_id).ok() != Some(plan.installation_id)
+            || policy.installation != plan.installation_id
+            || policy.repository != plan.repository_id
+            || plan.target_ref != format!("refs/heads/{}", policy.target_branch)
+            || crate::reconcile::policy_digest(self, policy)
+                .ok()
+                .as_deref()
+                != Some(target.repository_policy_digest.as_str())
         {
             return Err(LandingRefreshError::Scope);
         }
@@ -1152,14 +1161,68 @@ impl App {
         if first_repo.id != token.repository_id || first_repo.node_id != plan.repository_node_id {
             return Err(LandingRefreshError::Scope);
         }
+        let base = self
+            .observe_target_branch(token, owner, repository, &policy.target_branch)
+            .await?;
+        if base.commit.sha != plan.base_sha {
+            return Err(LandingRefreshError::Changed);
+        }
+        let short_ref = plan
+            .staging_ref
+            .strip_prefix("refs/")
+            .ok_or(LandingRefreshError::Scope)?;
+        let ref_path = format!("{root}/git/ref/{short_ref}");
+        let stage: DispatchRef = self.get_json(token, &ref_path, None).await?;
+        if stage.reference != plan.staging_ref
+            || stage.object.kind != "commit"
+            || stage.object.sha != plan.staged_sha
+        {
+            return Err(LandingRefreshError::Changed);
+        }
+        for member in &target.members {
+            let observed = self
+                .observe_authorized_pull(token, owner, repository, member.candidate.number)
+                .await?;
+            let admission_policy = crate::admission::Policy {
+                target_branch: policy.target_branch.clone(),
+                required_reviews: policy.required_reviews,
+                block_labels: policy.block_labels.clone(),
+                authorized_reviewers: observed.authorized_reviewers.clone(),
+            };
+            let eligible = crate::admission::evaluate(&observed.snapshot, &admission_policy)
+                .map_err(|_| LandingRefreshError::Changed)?;
+            if eligible.pull_number != member.candidate.number
+                || eligible.head_sha != member.candidate.head_sha
+                || eligible.base_sha != plan.base_sha
+                || observed.snapshot.pull.base.repo.id != token.repository_id
+                || crate::reconcile::admission_digest(&observed)
+                    .ok()
+                    .as_deref()
+                    != Some(member.evidence_digest.as_str())
+            {
+                return Err(LandingRefreshError::Changed);
+            }
+        }
+        let run_id = target.run_id;
         let run_path = format!("{root}/actions/runs/{run_id}");
         let first: ActionsRun = self.get_json(token, &run_path, None).await?;
         let snapshot = self
             .observe_actions_attempt(token, owner, repository, run_id, 1)
             .await?;
         let last: ActionsRun = self.get_json(token, &run_path, None).await?;
+        let last_stage: DispatchRef = self.get_json(token, &ref_path, None).await?;
+        let last_base = self
+            .observe_target_branch(token, owner, repository, &policy.target_branch)
+            .await?;
         let last_repo: Identity = self.get_json(token, &root, None).await?;
-        if first_repo != last_repo || first != last || last != snapshot.run || last.run_attempt != 1
+        if first_repo != last_repo
+            || first != last
+            || last != snapshot.run
+            || last.run_attempt != 1
+            || last_base != base
+            || last_stage.reference != plan.staging_ref
+            || last_stage.object.kind != "commit"
+            || last_stage.object.sha != plan.staged_sha
         {
             return Err(LandingRefreshError::Changed);
         }
