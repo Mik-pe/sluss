@@ -45,6 +45,12 @@ pub enum StoreError {
     PlanningMigrationBusy,
     #[error("a pending split is larger than the new maximum batch size")]
     PlanningMigrationSplitTooLarge,
+    #[error("pause Sluss before migrating CI bisection")]
+    BisectionMigrationNeedsPause,
+    #[error(
+        "CI bisection migration requires no active batches, reservations, unresolved dispatches or unfinished investigations"
+    )]
+    BisectionMigrationBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -141,6 +147,9 @@ impl Store {
             );
             CREATE TABLE IF NOT EXISTS candidate_evidence (number INTEGER PRIMARY KEY, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_bisection_config (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)));
+            CREATE TABLE IF NOT EXISTS ci_bisection_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision >= 0));
+            CREATE TABLE IF NOT EXISTS ci_bisection_migrations (revision INTEGER PRIMARY KEY, previous_enabled INTEGER NOT NULL, next_enabled INTEGER NOT NULL, migrated_ms INTEGER NOT NULL);
+            INSERT OR IGNORE INTO ci_bisection_revision(id,revision) SELECT 1,0 WHERE NOT EXISTS(SELECT 1 FROM ci_bisection_migrations);
             CREATE TABLE IF NOT EXISTS ci_investigations (batch_id TEXT PRIMARY KEY, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_candidate_completions (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, base_sha TEXT NOT NULL, batch_id TEXT NOT NULL, conclusion TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
@@ -687,8 +696,137 @@ impl Store {
         if existing != enabled {
             return Err(StoreError::PolicyMismatch);
         }
+        let revisions: Option<(i64, i64)> = tx.query_row(
+            "SELECT revision,(SELECT COALESCE(MAX(revision),0) FROM ci_bisection_migrations) FROM ci_bisection_revision WHERE id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        if !matches!(revisions, Some((revision, last)) if revision >= 0 && revision == last) {
+            return Err(StoreError::PolicyMismatch);
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The revision prevents a stale operator from changing a mode that has
+    /// since changed away and back to the same value.
+    pub fn ci_bisection_mode(&self) -> Result<Option<(bool, i64)>, StoreError> {
+        let row: Option<(bool, Option<i64>, i64)> = self.conn.query_row(
+            "SELECT c.enabled,r.revision,(SELECT COALESCE(MAX(revision),0) FROM ci_bisection_migrations) FROM ci_bisection_config c LEFT JOIN ci_bisection_revision r ON r.id=c.id WHERE c.id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        match row {
+            None => Ok(None),
+            Some((enabled, Some(revision), last)) if revision >= 0 && revision == last => {
+                Ok(Some((enabled, revision)))
+            }
+            Some(_) => Err(StoreError::PolicyMismatch),
+        }
+    }
+
+    /// Switch CI bisection only after operators stop workers and drain all
+    /// active work and investigations. History and completed holds remain.
+    pub fn migrate_ci_bisection(
+        &mut self,
+        expected_revision: i64,
+        enabled: bool,
+        installation: i64,
+        repository: i64,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        if expected_revision < 0 {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let paused: bool = tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !paused {
+            return Err(StoreError::BisectionMigrationNeedsPause);
+        }
+        let binding: Option<(i64,i64,String)> = tx.query_row(
+            "SELECT r.installation,r.repository,t.branch FROM repository_binding r JOIN observed_target t ON r.id=t.id WHERE r.id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        match binding {
+            Some((i, r, _)) if (i, r) != (installation, repository) => {
+                return Err(StoreError::RepositoryMismatch);
+            }
+            Some((_, _, branch)) if branch != target => return Err(StoreError::PolicyMismatch),
+            None => return Err(StoreError::Unbound),
+            _ => {}
+        }
+        let current: Option<(bool,i64)> = tx.query_row(
+            "SELECT c.enabled,r.revision FROM ci_bisection_config c JOIN ci_bisection_revision r ON r.id=c.id WHERE c.id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let (old, revision) = current.ok_or(StoreError::Unbound)?;
+        let last: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(revision),0) FROM ci_bisection_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if revision != expected_revision || revision != last {
+            return Err(StoreError::PolicyMismatch);
+        }
+        {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let batch: Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    batch.state,
+                    State::Planned
+                        | State::Building
+                        | State::Testing { .. }
+                        | State::Verified { .. }
+                ) {
+                    return Err(StoreError::BisectionMigrationBusy);
+                }
+            }
+        }
+        for (table, predicate) in [
+            ("capacity_reservations", "1"),
+            ("dispatch_intents", "state NOT IN ('finished','cancelled')"),
+            (
+                "ci_investigations",
+                "state NOT IN ('stale','inconclusive','needs-review')",
+            ),
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if exists
+                && tx.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"),
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                return Err(StoreError::BisectionMigrationBusy);
+            }
+        }
+        if old == enabled {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let next = revision.checked_add(1).ok_or(StoreError::InvalidBatch)?;
+        tx.execute(
+            "UPDATE ci_bisection_config SET enabled=?1 WHERE id=1",
+            [enabled],
+        )?;
+        tx.execute(
+            "UPDATE ci_bisection_revision SET revision=?1 WHERE id=1",
+            [next],
+        )?;
+        tx.execute("INSERT INTO ci_bisection_migrations(revision,previous_enabled,next_enabled,migrated_ms) VALUES(?1,?2,?3,?4)", params![next,old,enabled,now_ms()?])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Summarize bounded CI investigation progress for operators.

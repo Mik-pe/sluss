@@ -119,6 +119,19 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Change CI bisection after stopping workers and draining investigations.
+    MigrateCiBisection {
+        /// Current CI bisection revision from `sluss status`.
+        #[arg(long)]
+        expected_revision: i64,
+        /// Configuration identifying the bound repository and target.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, required_unless_present = "enable", conflicts_with = "enable")]
+        disable: bool,
+    },
     /// Expand capacity while paused and drained, preserving old rerun budgets.
     MigrateCapacity {
         /// Current capacity digest from `sluss status`.
@@ -1811,6 +1824,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("planning settings already match; Sluss remains paused");
             }
         }
+        Command::MigrateCiBisection {
+            expected_revision,
+            config,
+            enable,
+            disable: _,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let mut store = store;
+            if store.migrate_ci_bisection(
+                expected_revision,
+                enable,
+                config.github.installation_id,
+                config.github.repository_id,
+                &config.queue.target,
+            )? {
+                println!("CI bisection migrated; history and holds retained; Sluss remains paused");
+            } else {
+                println!("CI bisection already matches; Sluss remains paused");
+            }
+        }
         Command::MigrateCapacity {
             expected_digest,
             config,
@@ -2121,6 +2154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 println!("planning digest: unbound");
+            }
+            if let Some((enabled, revision)) = store.ci_bisection_mode()? {
+                println!(
+                    "CI bisection: {}; revision: {revision}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            } else {
+                println!("CI bisection: unbound");
             }
             for (batch, state) in store.ci_investigations()? {
                 println!("CI investigation {batch}: {state} (not a merge approval)");

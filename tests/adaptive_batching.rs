@@ -310,6 +310,167 @@ fn old_adaptive_history_does_not_invent_investigation_costs() {
 }
 
 #[test]
+fn bisection_mode_migration_drains_work_preserves_history_and_rejects_stale_revision() {
+    use sluss::store::StoreError;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("migration.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    queue(&mut store, &mut inbox, 1, 4);
+    store.bind_ci_bisection(true).unwrap();
+    assert_eq!(store.ci_bisection_mode().unwrap(), Some((true, 0)));
+    assert!(matches!(
+        store.migrate_ci_bisection(0, false, 1, 2, "main"),
+        Err(StoreError::BisectionMigrationNeedsPause)
+    ));
+    let root = plan(&mut store);
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_ci_bisection(0, false, 1, 2, "main"),
+        Err(StoreError::BisectionMigrationBusy)
+    ));
+    store.set_paused(false).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure", 12);
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_ci_bisection(0, false, 1, 2, "main"),
+        Err(StoreError::BisectionMigrationBusy)
+    ));
+    store.set_paused(false).unwrap();
+    for run in 2..=3 {
+        let child = plan(&mut store);
+        finish(&mut store, &mut scheduler, &child, run, "success", 6);
+    }
+    let history = store.ci_investigations().unwrap();
+    let holds = store.ci_only_completions().unwrap();
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_ci_bisection(0, false, 1, 3, "main"),
+        Err(StoreError::RepositoryMismatch)
+    ));
+    assert!(matches!(
+        store.migrate_ci_bisection(0, false, 1, 2, "other"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(store.migrate_ci_bisection(0, false, 1, 2, "main").unwrap());
+    assert_eq!(store.ci_bisection_mode().unwrap(), Some((false, 1)));
+    assert_eq!(store.ci_investigations().unwrap(), history);
+    assert_eq!(store.ci_only_completions().unwrap(), holds);
+    assert!(matches!(
+        store.bind_ci_bisection(true),
+        Err(StoreError::PolicyMismatch)
+    ));
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    assert_eq!(store.ci_bisection_mode().unwrap(), Some((false, 1)));
+    assert!(!store.migrate_ci_bisection(1, false, 1, 2, "main").unwrap());
+    assert!(store.migrate_ci_bisection(1, true, 1, 2, "main").unwrap());
+    assert_eq!(store.ci_bisection_mode().unwrap(), Some((true, 2)));
+    assert!(matches!(
+        store.migrate_ci_bisection(0, false, 1, 2, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ci_bisection_migrations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 2);
+    conn.execute("DELETE FROM ci_bisection_revision", [])
+        .unwrap();
+    drop(conn);
+    drop(store);
+    let mut reopened = Store::open(&db).unwrap();
+    assert!(matches!(
+        reopened.ci_bisection_mode(),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        reopened.bind_ci_bisection(true),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        reopened.migrate_ci_bisection(0, false, 1, 2, "main"),
+        Err(StoreError::Unbound)
+    ));
+}
+
+#[test]
+fn concurrent_bisection_migrations_cannot_reuse_a_revision() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("migration.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    queue(&mut store, &mut inbox, 1, 4);
+    store.bind_ci_bisection(true).unwrap();
+    store.set_paused(true).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut store = Store::open(db).unwrap();
+            barrier.wait();
+            store.migrate_ci_bisection(0, false, 1, 2, "main")
+        }));
+    }
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(sluss::store::StoreError::PolicyMismatch)))
+            .count(),
+        1
+    );
+    assert_eq!(store.ci_bisection_mode().unwrap(), Some((false, 1)));
+}
+
+#[test]
+fn bisection_migration_cli_uses_bound_repository_and_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("migration.sqlite");
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config, "version=1\n[github]\napp_client_id='test'\ninstallation_id=1\nrepository_id=2\nowner='owner'\nrepository='repo'\n[queue]\ntarget='main'\nmax_batch_size=2\nmax_active_batches=1\ndebounce_seconds=0\nbatch_window_seconds=0\n[checks]\nrequired_reviews=1\n").unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    queue(&mut store, &mut inbox, 1, 4);
+    store.bind_ci_bisection(false).unwrap();
+    store.set_paused(true).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "migrate-ci-bisection",
+            "--expected-revision",
+            "0",
+            "--enable",
+            "--config",
+        ])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("CI bisection: enabled; revision: 1"));
+    assert!(store.paused().unwrap());
+}
+
+#[test]
 fn missing_runtime_and_bisection_children_do_not_change_the_controller() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("adaptive.sqlite");
