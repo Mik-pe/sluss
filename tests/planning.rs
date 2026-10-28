@@ -238,7 +238,8 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
         scheduler.claim_dispatch(id),
         Err(SchedulerError::StaleBatch)
     ));
-    assert!(scheduler.cancel_prepared(id).unwrap());
+    assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 1);
+    assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 0);
     assert!(!scheduler.claim_dispatch(id).unwrap());
     assert!(!scheduler.cancel_prepared(id).unwrap());
     assert!(scheduler.pending_dispatches().unwrap().is_empty());
@@ -540,7 +541,7 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
             },
         )]),
     };
-    let mut scheduler = Scheduler::open(&db, capacity).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
     let plan = DispatchPlan {
         installation_id: 1,
         repository_id: 2,
@@ -618,4 +619,16 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
         store.batch(id).unwrap().unwrap().0.state,
         State::Invalidated { .. }
     ));
+    assert_eq!(scheduler.stale_dispatches().unwrap(), vec![id.to_string()]);
+    assert!(matches!(
+        scheduler.claim_stale_cancellation(id).unwrap(),
+        sluss::scheduler::CancellationClaim::New(_)
+    ));
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity).unwrap();
+    assert_eq!(
+        scheduler.claim_stale_cancellation(id).unwrap(),
+        sluss::scheduler::CancellationClaim::Uncertain
+    );
+    assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
 }

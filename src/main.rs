@@ -26,6 +26,12 @@ enum Command {
         /// Enable automatic observation using operator-owned configuration.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cancel known runs when their batch is invalidated.
+        #[arg(long, requires_all = ["config", "capacity"])]
+        cancel_stale: bool,
+        /// Capacity configuration used by stale-run cancellation.
+        #[arg(long, requires = "cancel_stale")]
+        capacity: Option<PathBuf>,
     },
     /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
     Reconcile(ReconcileArgs),
@@ -101,6 +107,15 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Request cancellation of a known run for an invalidated batch.
+    CancelStale {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Release a reservation only if its dispatch has not been claimed.
     CancelDispatch {
         #[arg(long)]
@@ -154,7 +169,13 @@ struct ReconcileArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Command::Serve { listen, config } = cli.command {
+    if let Command::Serve {
+        listen,
+        config,
+        cancel_stale,
+        capacity,
+    } = cli.command
+    {
         let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
         let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
         let worker = if let Some(path) = config {
@@ -183,9 +204,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let app = sluss::webhook::router_with_scope(secret.into_bytes(), cli.db.clone(), scope)?;
         let listener = tokio::net::TcpListener::bind(listen).await?;
         if let Some((app, policy, poll, rescan)) = worker {
+            if cancel_stale {
+                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                eprintln!(
+                    "automatic stale-run cancellation enabled; capacity is not automatically released"
+                );
+                tokio::spawn(sluss::worker::supervise_stale_cancellation(
+                    app.clone(),
+                    cli.db.clone(),
+                    capacity,
+                    policy.clone(),
+                    poll,
+                ));
+            }
             tokio::spawn(sluss::worker::supervise(app, cli.db, policy, poll, rescan));
             eprintln!(
-                "webhook listener on {listen}; automatic observations enabled, CI dispatch and landing disabled"
+                "webhook listener on {listen}; automatic observations enabled, automatic dispatch and landing disabled"
             );
         } else {
             eprintln!("webhook listener on {listen}; reconciliation worker is not enabled");
@@ -518,13 +552,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             let placement = sluss::verification::check_host_placement(&snapshot, runners)?;
             let recorded = scheduler.record_job_metrics(&batch_id, &snapshot)?;
-            let ci = scheduler.record_ci_observation(&batch_id, &snapshot)?;
-            println!("provider CI observation: {ci:?} (not an attestation)");
+            let batch = store.batch(&batch_id)?.ok_or("unknown batch")?.0;
+            if matches!(batch.state, sluss::batch::State::Invalidated { .. }) {
+                println!("batch is stale; no CI result is accepted");
+            } else {
+                let ci = scheduler.record_ci_observation(&batch_id, &snapshot)?;
+                println!("provider CI observation: {ci:?} (not an attestation)");
+            }
             println!(
                 "run {}: status {}, conclusion {:?}, placement {:?}; {} new completed job measurements",
                 snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement, recorded
             );
             println!("observation does not authorize landing or release reserved capacity");
+        }
+        Command::CancelStale {
+            batch_id,
+            config,
+            capacity,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            if store.repository_scope()?
+                != (
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+            {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app =
+                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let token = app
+                .dispatch_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let outcome = app
+                .cancel_stale_run(
+                    &mut scheduler,
+                    &token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &batch_id,
+                )
+                .await?;
+            println!(
+                "stale cancellation: {outcome:?}; capacity remains reserved until separately reconciled"
+            );
         }
         Command::CancelDispatch { batch_id, capacity } => {
             let mut scheduler =

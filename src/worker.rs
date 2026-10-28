@@ -106,3 +106,71 @@ pub async fn run(
         sleep(poll).await;
     }
 }
+
+/// Optional stale-run cancellation loop. It cannot release capacity and never
+/// retries an ambiguous cancellation POST. Provider failures back off.
+pub async fn supervise_stale_cancellation(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(60));
+    let mut delay = minimum;
+    loop {
+        let path = db.clone();
+        let limits = capacity.clone();
+        let scheduler =
+            tokio::task::spawn_blocking(move || crate::scheduler::Scheduler::open(path, limits))
+                .await;
+        let result = match scheduler {
+            Ok(Ok(mut scheduler)) => match scheduler
+                .cancel_invalidated_prepared()
+                .and_then(|_| scheduler.stale_dispatches())
+            {
+                Ok(ids) if ids.is_empty() => Ok(()),
+                Ok(ids) => match app
+                    .dispatch_token(policy.installation as u64, policy.repository as u64)
+                    .await
+                {
+                    Ok(token) => {
+                        let mut result = Ok(());
+                        for id in ids {
+                            match app
+                                .cancel_stale_run(
+                                    &mut scheduler,
+                                    &token,
+                                    &policy.owner,
+                                    &policy.name,
+                                    &id,
+                                )
+                                .await
+                            {
+                                Ok(crate::github::StaleCancellation::Uncertain) => {
+                                    eprintln!(
+                                        "stale-run cancellation outcome is uncertain; capacity remains reserved"
+                                    );
+                                    result = Err(());
+                                }
+                                Err(_) => result = Err(()),
+                                _ => {}
+                            }
+                        }
+                        result
+                    }
+                    Err(_) => Err(()),
+                },
+                Err(_) => Err(()),
+            },
+            _ => Err(()),
+        };
+        if result.is_err() {
+            eprintln!("stale-run cancellation failed; it will be checked again");
+            delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+        } else {
+            delay = minimum;
+        }
+        sleep(delay).await;
+    }
+}

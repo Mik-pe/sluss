@@ -24,6 +24,8 @@ To try webhook intake locally, set `SLUSS_WEBHOOK_SECRET` in the environment and
 
 To enable the experimental observer, copy [examples/sluss.toml](examples/sluss.toml) to an operator-controlled location, set `SLUSS_WEBHOOK_SECRET` and `SLUSS_GITHUB_PRIVATE_KEY_PATH`, then run `cargo run -- serve --config /path/to/sluss.toml`. Startup and periodic scans recover missed notifications, and failed work remains queued for retry. Only the configured repository is processed. This path has only been tested with a local GitHub stub; do not deploy this preview as a production GitHub App.
 
+For experimental cancellation of known runs after their batches are invalidated, add `--cancel-stale --capacity /path/to/capacity.toml` to `serve --config ...`. Sluss requests normal GitHub cancellation once and keeps capacity reserved; a missing response remains uncertain and is not blindly retried. `sluss cancel-stale` performs the same check manually. Neither path has been tested against a real GitHub App or runner.
+
 For development, `sluss reconcile --help` describes a manual, one-shot reconciliation command. It requires `SLUSS_GITHUB_PRIVATE_KEY_PATH` and explicit, operator-controlled App, installation and repository IDs. It reads all open PRs and their reviews, checks reviewer permissions, and atomically updates local queue observations if no newer event arrived. This path has only been tested with a local GitHub stub. A database is bound to one repository and policy; a policy change fails closed and currently requires an explicit migration that is not yet implemented.
 
 For an experimental local Git exercise, reconcile a repository first, then freeze an observed base and prepare an integration in a local bare staging repository:

@@ -155,9 +155,24 @@ async fn dispatched_run(
     let attempt = if mode == 21 && latest { 2 } else { 1 };
     let workflow_id = if mode == 23 { 18 } else { 17 };
     let sha = if mode == 22 && count >= 3 { "b" } else { "a" };
+    let status = if mode == 31 {
+        "in_progress"
+    } else {
+        "completed"
+    };
+    let conclusion = if mode == 31 { None } else { Some("success") };
     Json(
-        json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
+        json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
+}
+async fn cancel_run(State(state): State<ServerState>, headers: HeaderMap) -> StatusCode {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    state.permissions.fetch_add(1, Ordering::SeqCst);
+    if state.mode.load(Ordering::SeqCst) == 32 {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::ACCEPTED
+    }
 }
 async fn doctor_branch(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -1095,7 +1110,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         store::{AdmissionCandidate, Store},
         webhook::Inbox,
     };
-    let (key_dir, _private, public) = keys();
+    let (key_dir, private, public) = keys();
     let posts = Arc::new(AtomicUsize::new(0));
     let mode = Arc::new(AtomicU8::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
@@ -1118,6 +1133,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             post(dispatch_post),
         )
         .route("/repos/owner/repo/actions/runs/123", get(dispatched_run))
+        .route(
+            "/repos/owner/repo/actions/runs/123/cancel",
+            post(cancel_run),
+        )
         .route(
             "/repos/owner/repo/actions/runs/123/attempts/1",
             get(dispatched_run),
@@ -1310,6 +1329,77 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("already claimed"));
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let cancel_args = vec![
+        "cancel-stale".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+    ];
+    let before_stale = launch(cancel_args.clone()).await.unwrap();
+    assert!(!before_stale.status.success());
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let mut store = Store::open(&db).unwrap();
+    store.remove_candidate(1).unwrap();
+    mode.store(31, Ordering::SeqCst);
+    let worker_app =
+        Arc::new(App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap());
+    let limits: sluss::scheduler::Capacity =
+        toml::from_str(&std::fs::read_to_string(&capacity).unwrap()).unwrap();
+    let policy = sluss::config::Config::load(&config).unwrap().policy();
+    let worker = tokio::spawn(sluss::worker::supervise_stale_cancellation(
+        worker_app,
+        db.clone(),
+        limits,
+        policy,
+        std::time::Duration::from_millis(10),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while posts.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.abort();
+    let cancelled = launch(cancel_args.clone()).await.unwrap();
+    assert!(
+        cancelled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cancelled.stdout).contains("AlreadyRequested"));
+    let repeated = launch(cancel_args.clone()).await.unwrap();
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("AlreadyRequested"));
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    mode.store(0, Ordering::SeqCst);
+    let completed = launch(cancel_args).await.unwrap();
+    assert!(completed.status.success());
+    assert!(String::from_utf8_lossy(&completed.stdout).contains("Completed"));
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    let stale_observation = launch(vec![
+        "observe-dispatch".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        stale_observation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_observation.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale_observation.stdout)
+            .contains("batch is stale; no CI result is accepted")
+    );
     let doctor = launch(vec![
         "doctor".into(),
         "--config".into(),
@@ -1344,6 +1434,6 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     .unwrap();
     assert!(!unstable_doctor.status.success());
     assert!(String::from_utf8_lossy(&unstable_doctor.stderr).contains("UnstableObservation"));
-    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
     server.abort();
 }

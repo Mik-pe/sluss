@@ -1181,3 +1181,87 @@ fn encoded_branch_segment(branch: &str) -> Option<String> {
     url.path_segments_mut().ok()?.push(branch);
     Some(url.path().trim_start_matches('/').to_string())
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleCancellation {
+    Requested,
+    AlreadyRequested,
+    Completed,
+    /// The provider may have received the cancellation; do not blindly retry.
+    Uncertain,
+}
+impl App {
+    /// Cancel only a known run belonging to a terminally invalidated batch.
+    /// A cancellation request does not free the physical-host reservation.
+    pub async fn cancel_stale_run(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+    ) -> Result<StaleCancellation, DispatchError> {
+        use crate::scheduler::CancellationClaim;
+        if !token.actions_write || !valid_name(owner) || !valid_name(repository) {
+            return Err(DispatchError::Invalid);
+        }
+        let stale = scheduler.stale_run(id)?;
+        if stale.plan.installation_id != token.installation_id
+            || stale.plan.repository_id != token.repository_id
+        {
+            return Err(DispatchError::Invalid);
+        }
+        let path = format!("repos/{owner}/{repository}/actions/runs/{}", stale.run_id);
+        let run: ActionsRun = self.get_json(token, &path, None).await?;
+        let branch = stale
+            .plan
+            .staging_ref
+            .strip_prefix("refs/heads/")
+            .ok_or(DispatchError::Invalid)?;
+        if run.id != stale.run_id
+            || run.run_attempt == 0
+            || run.repository.id != stale.plan.repository_id
+            || run.head_repository.as_ref().map(|r| r.id) != Some(stale.plan.repository_id)
+            || run.workflow_id != stale.plan.workflow_id
+            || run.head_sha != stale.plan.integration_sha
+            || run.head_branch.as_deref() != Some(branch)
+            || run.event != "workflow_dispatch"
+        {
+            return Err(DispatchError::RunMismatch);
+        }
+        if run.status == "completed" {
+            return Ok(StaleCancellation::Completed);
+        }
+        if !matches!(
+            run.status.as_str(),
+            "queued" | "in_progress" | "waiting" | "requested" | "pending"
+        ) {
+            return Ok(StaleCancellation::Uncertain);
+        }
+        match scheduler.claim_stale_cancellation(id)? {
+            CancellationClaim::AlreadyRequested => return Ok(StaleCancellation::AlreadyRequested),
+            CancellationClaim::Uncertain => return Ok(StaleCancellation::Uncertain),
+            CancellationClaim::New(claimed) if claimed == stale => {}
+            CancellationClaim::New(_) => return Err(DispatchError::RunMismatch),
+        }
+        let url = self
+            .api
+            .join(&format!("{path}/cancel"))
+            .map_err(|_| DispatchError::Uncertain)?;
+        let response = self
+            .client
+            .post(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(token.secret())
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
+                scheduler.record_stale_cancellation(id, stale.run_id)?;
+                Ok(StaleCancellation::Requested)
+            }
+            _ => Ok(StaleCancellation::Uncertain),
+        }
+    }
+}

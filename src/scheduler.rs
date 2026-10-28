@@ -62,6 +62,8 @@ pub enum SchedulerError {
     DispatchTransition,
     #[error("batch, queue, or repository changed before dispatch")]
     StaleBatch,
+    #[error("dispatch is not attached to an invalidated batch with a known run")]
+    NotStale,
     #[error("stored reservation refers to an unknown host or pool")]
     Corrupt,
 }
@@ -83,7 +85,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS stale_cancellations (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL);")?;
         crate::metrics::ensure_schema(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<String> = tx
@@ -908,4 +911,132 @@ impl Scheduler {
         tx.commit()?;
         Ok(observation)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRun {
+    pub plan: DispatchPlan,
+    pub run_id: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancellationClaim {
+    New(StaleRun),
+    AlreadyRequested,
+    Uncertain,
+}
+impl Scheduler {
+    /// Retire unstarted reservations for invalidated batches in one transaction.
+    pub fn cancel_invalidated_prepared(&mut self) -> Result<usize, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT d.id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.state='prepared' ORDER BY d.id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut cancelled = 0;
+        for (id, body) in rows {
+            let batch: crate::batch::Batch = serde_json::from_str(&body)?;
+            if !matches!(batch.state, crate::batch::State::Invalidated { .. }) {
+                continue;
+            }
+            if tx.execute(
+                "UPDATE dispatch_intents SET state='cancelled' WHERE id=?1 AND state='prepared'",
+                [&id],
+            )? != 1
+                || tx.execute("DELETE FROM capacity_reservations WHERE id=?1", [&id])? != 1
+            {
+                return Err(SchedulerError::Corrupt);
+            }
+            tx.execute("INSERT INTO capacity_finished(id) VALUES(?1)", [&id])?;
+            cancelled += 1;
+        }
+        tx.commit()?;
+        Ok(cancelled)
+    }
+    /// List only invalidated, batch-bound dispatches with a known provider run.
+    pub fn stale_dispatches(&self) -> Result<Vec<String>, SchedulerError> {
+        let mut stmt = self.conn.prepare("SELECT d.id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.state IN ('accepted','observed') ORDER BY d.id")?;
+        let mut rows = stmt.query([])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let batch: crate::batch::Batch = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            if matches!(batch.state, crate::batch::State::Invalidated { .. }) {
+                result.push(id);
+            }
+        }
+        Ok(result)
+    }
+    /// Read a stale run identity before contacting GitHub. State is checked
+    /// again atomically when the cancellation attempt is claimed.
+    pub fn stale_run(&self, id: &str) -> Result<StaleRun, SchedulerError> {
+        let row: Option<(String,String,Option<String>,String)> = self.conn.query_row("SELECT d.plan,d.state,d.run_id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        stale_run_from_row(row)
+    }
+    pub fn claim_stale_cancellation(
+        &mut self,
+        id: &str,
+    ) -> Result<CancellationClaim, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,Option<String>,String)> = tx.query_row("SELECT d.plan,d.state,d.run_id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let stale = stale_run_from_row(row)?;
+        let prior: Option<(String, String)> = tx
+            .query_row(
+                "SELECT run_id,state FROM stale_cancellations WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let result = match prior {
+            Some((run, state)) if run == stale.run_id.to_string() && state == "accepted" => {
+                CancellationClaim::AlreadyRequested
+            }
+            Some((run, state)) if run == stale.run_id.to_string() && state == "sending" => {
+                CancellationClaim::Uncertain
+            }
+            Some(_) => return Err(SchedulerError::Corrupt),
+            None => {
+                tx.execute(
+                    "INSERT INTO stale_cancellations(id,run_id,state) VALUES(?1,?2,'sending')",
+                    params![id, stale.run_id.to_string()],
+                )?;
+                CancellationClaim::New(stale)
+            }
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+    pub fn record_stale_cancellation(
+        &mut self,
+        id: &str,
+        run_id: u64,
+    ) -> Result<(), SchedulerError> {
+        let updated = self.conn.execute("UPDATE stale_cancellations SET state='accepted' WHERE id=?1 AND run_id=?2 AND state='sending'", params![id,run_id.to_string()])?;
+        if updated != 1 {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        Ok(())
+    }
+}
+fn stale_run_from_row(
+    row: Option<(String, String, Option<String>, String)>,
+) -> Result<StaleRun, SchedulerError> {
+    let (body, state, run, batch) = row.ok_or(SchedulerError::NotStale)?;
+    let plan: DispatchPlan = serde_json::from_str(&body)?;
+    let batch: crate::batch::Batch = serde_json::from_str(&batch)?;
+    let run_id = run
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n != 0)
+        .ok_or(SchedulerError::NotStale)?;
+    if !plan.valid()
+        || !matches!(state.as_str(), "accepted" | "observed")
+        || !matches!(batch.state, crate::batch::State::Invalidated { .. })
+    {
+        return Err(SchedulerError::NotStale);
+    }
+    Ok(StaleRun { plan, run_id })
 }
