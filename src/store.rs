@@ -26,6 +26,8 @@ pub enum StoreError {
     InvalidBatch,
     #[error("queue has not been bound by provider reconciliation")]
     Unbound,
+    #[error("system clock is outside the supported range")]
+    Clock,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +57,7 @@ impl Store {
                 id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS candidate_evidence (number INTEGER PRIMARY KEY, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS repository_binding (
                 id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
@@ -89,9 +92,11 @@ impl Store {
         {
             return Err(StoreError::InvalidCandidate);
         }
+        let now = now_ms()?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO candidate_stability(number,changed_ms) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET changed_ms=excluded.changed_ms", params![candidate.number as i64,now])?;
         tx.execute(
             "INSERT INTO candidates (number, head_sha, sequence)
             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM candidates))
@@ -187,6 +192,7 @@ impl Store {
         }) {
             return Err(StoreError::InvalidCandidate);
         }
+        let now = now_ms()?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -252,6 +258,25 @@ impl Store {
                 )
                 .optional()?;
             let new_evidence = digests.map(|values| values[index].as_str());
+            let old_head: Option<String> = tx
+                .query_row(
+                    "SELECT head_sha FROM candidates WHERE number=?1",
+                    [candidate.number as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let changed = old_head.as_deref() != Some(&candidate.head_sha)
+                || existing_evidence.as_deref() != new_evidence
+                || new_evidence.is_none();
+            if changed {
+                tx.execute("INSERT INTO candidate_stability(number,changed_ms) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET changed_ms=excluded.changed_ms", params![candidate.number as i64,now])?;
+            } else {
+                // A pre-migration candidate starts its debounce window now.
+                tx.execute(
+                    "INSERT OR IGNORE INTO candidate_stability(number,changed_ms) VALUES(?1,?2)",
+                    params![candidate.number as i64, now],
+                )?;
+            }
             if existing_evidence.as_deref() != new_evidence {
                 invalidate_batches(&tx, candidate.number, None)?;
             }
@@ -301,6 +326,27 @@ impl Store {
         max_batch_size: usize,
         max_active_batches: usize,
     ) -> Result<Option<Batch>, StoreError> {
+        self.plan_batch_debounced(
+            id,
+            base_sha,
+            max_batch_size,
+            max_active_batches,
+            Duration::ZERO,
+        )
+    }
+    /// Select only candidates whose head and admission evidence have remained
+    /// unchanged for the requested duration. An unchanged scan preserves age.
+    pub fn plan_batch_debounced(
+        &mut self,
+        id: &str,
+        base_sha: &str,
+        max_batch_size: usize,
+        max_active_batches: usize,
+        debounce: Duration,
+    ) -> Result<Option<Batch>, StoreError> {
+        let now = now_ms()?;
+        let debounce_ms =
+            i64::try_from(debounce.as_millis()).map_err(|_| StoreError::InvalidBatch)?;
         let valid_sha = |value: &str| {
             value.len() == 40
                 && value
@@ -383,6 +429,19 @@ impl Store {
                     return Err(StoreError::InvalidCandidate);
                 }
                 if !occupied.contains(&number) {
+                    let changed: Option<i64> = tx
+                        .query_row(
+                            "SELECT changed_ms FROM candidate_stability WHERE number=?1",
+                            [number as i64],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if debounce_ms > 0
+                        && changed
+                            .is_none_or(|time| time < 0 || now.saturating_sub(time) < debounce_ms)
+                    {
+                        continue;
+                    }
                     let evidence: Option<String> = tx
                         .query_row(
                             "SELECT digest FROM candidate_evidence WHERE number=?1",
@@ -587,4 +646,11 @@ fn invalidate_batches(
         }
     }
     Ok(())
+}
+
+fn now_ms() -> Result<i64, StoreError> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| StoreError::Clock)?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| StoreError::Clock)
 }

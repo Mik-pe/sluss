@@ -276,3 +276,90 @@ fn changed_review_evidence_invalidates_batch_without_changing_head() {
         Err(StoreError::Conflict)
     ));
 }
+
+#[test]
+fn debounce_survives_restart_and_resets_only_for_changed_candidates() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute("UPDATE candidate_stability SET changed_ms=1", [])
+        .unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox
+        .record("unchanged", "pull_request", &[8; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates = store.candidates().unwrap();
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
+        .unwrap();
+    let timestamp: i64 = raw
+        .query_row(
+            "SELECT changed_ms FROM candidate_stability WHERE number=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(timestamp, 1);
+    inbox
+        .record("new-push", "pull_request", &[9; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates = store.candidates().unwrap();
+    candidates[0].head_sha = "f".repeat(40);
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    let batch = store
+        .plan_batch_debounced(
+            "batch-0123456789abcdef",
+            &"a".repeat(40),
+            4,
+            2,
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        batch
+            .candidates
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    assert!(
+        store
+            .plan_batch_debounced(
+                "batch-1123456789abcdef",
+                &"a".repeat(40),
+                4,
+                2,
+                Duration::from_secs(60)
+            )
+            .unwrap()
+            .is_none()
+    );
+    raw.execute(
+        "UPDATE candidate_stability SET changed_ms=1 WHERE number=1",
+        [],
+    )
+    .unwrap();
+    let batch = store
+        .plan_batch_debounced(
+            "batch-1123456789abcdef",
+            &"a".repeat(40),
+            4,
+            2,
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.candidates[0].number, 1);
+    assert_eq!(batch.candidates[0].head_sha, "f".repeat(40));
+}
