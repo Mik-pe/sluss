@@ -270,6 +270,15 @@ async fn graphql_schema(
             return Json(json!({"data":null,"errors":[{"message":"unavailable"}]}));
         }
         let count = state.token_calls.fetch_add(1, Ordering::SeqCst);
+        if mode == 121 && count == 0 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while state.mode.load(Ordering::SeqCst) == 121 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("preview race test must release provider read");
+        }
         let decision = match mode {
             104 => Some("REVIEW_REQUIRED"),
             105 => Some("CHANGES_REQUESTED"),
@@ -2915,6 +2924,107 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let mut selected_trust = trust.clone();
     selected_trust.suites = ["api-tests".into(), "ui-tests".into()].into();
     selected_trust.selection_policy_digest = Some(Policy::load(&policy).unwrap().digest().unwrap());
+    let mut preview = sluss::landing::LandingJournal::open_read_only(&db).unwrap();
+    mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        observer_app
+            .preview_trusted_batch(
+                &mut preview,
+                &fixture_token,
+                &security_token,
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .unwrap()
+            .staged_sha,
+        "a".repeat(40)
+    );
+    let trust_file = data.path().join("trusted-ci.toml");
+    std::fs::write(&trust_file, toml::to_string(&selected_trust).unwrap()).unwrap();
+    let output = launch(vec![
+        "preview-trusted-batch".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--policy".into(),
+        trust_file.to_str().unwrap().into(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("not an attestation or merge authorization")
+    );
+    let check = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = check
+        .query_row("SELECT count(*) FROM landing_intents_v1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "preview must not create a landing intent");
+    for invalid in [13, 16, 21, 22, 40, 63, 64, 67, 77, 104, 110, 117] {
+        mode.store(invalid, Ordering::SeqCst);
+        graphql_counts.store(0, Ordering::SeqCst);
+        assert!(
+            observer_app
+                .preview_trusted_batch(
+                    &mut preview,
+                    &fixture_token,
+                    &security_token,
+                    &observer_policy,
+                    &selected_trust,
+                    id
+                )
+                .await
+                .is_err()
+        );
+    }
+    mode.store(121, Ordering::SeqCst);
+    graphql_counts.store(0, Ordering::SeqCst);
+    let (raced, _) = tokio::join!(
+        observer_app.preview_trusted_batch(
+            &mut preview,
+            &fixture_token,
+            &security_token,
+            &observer_policy,
+            &selected_trust,
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while graphql_counts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            inbox
+                .record("preview-race", "pull_request_review", &[88; 32], 42, 7)
+                .unwrap();
+            mode.store(0, Ordering::SeqCst);
+        }
+    );
+    assert!(
+        raced.is_err(),
+        "a local webhook during provider refresh must invalidate the preview"
+    );
+    let event = inbox.pending().unwrap().remove(0);
+    let mut reconciled = Store::open(&db).unwrap();
+    sluss::reconcile::reconcile_once(
+        &observer_app,
+        &fixture_token,
+        &mut reconciled,
+        &event,
+        &observer_policy,
+    )
+    .await
+    .unwrap();
     let frozen_landing = landing
         .prepare_trusted_batch("land-refresh", id, &selected_trust)
         .unwrap();

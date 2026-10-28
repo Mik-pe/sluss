@@ -242,13 +242,49 @@ impl LandingPlan {
 pub struct LandingJournal {
     conn: Connection,
 }
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RefreshTarget {
     pub plan: LandingPlan,
     pub run_id: u64,
     pub members: Vec<crate::store::AdmissionCandidate>,
     pub repository_policy_digest: String,
+    pub snapshot: crate::github::ActionsSnapshot,
 }
 impl LandingJournal {
+    /// Open an existing database without creating or modifying its schema.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, LandingError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+    pub(crate) fn preview_target(
+        &mut self,
+        batch_id: &str,
+        policy: &TrustedCiPolicy,
+    ) -> Result<RefreshTarget, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let plan = observed_plan(&tx, "preview-policy", batch_id, &policy.repository_node_id)?;
+        verify_trusted_policy(&tx, &plan, policy)?;
+        let target = refresh_target_details(&tx, plan)?;
+        tx.commit()?;
+        Ok(target)
+    }
+    pub(crate) fn verify_preview(
+        &mut self,
+        expected: &RefreshTarget,
+        policy: &TrustedCiPolicy,
+        snapshot: &crate::github::ActionsSnapshot,
+    ) -> Result<LandingPlan, LandingError> {
+        let current = self.preview_target(&expected.plan.batch_id, policy)?;
+        let mut fresh = snapshot.clone();
+        fresh.jobs.sort_by_key(|job| job.id);
+        if current != *expected || current.snapshot != fresh {
+            return Err(LandingError::StaleBatch);
+        }
+        Ok(current.plan)
+    }
     /// Compare a frozen local batch to an operator policy without creating a
     /// journal intent or querying the provider. The database is opened read-only.
     pub fn inspect_trusted_batch(
@@ -570,37 +606,9 @@ impl LandingJournal {
         }
         verify_trust_binding(&tx, &plan, Some(policy))?;
         verify_trusted_policy(&tx, &plan, policy)?;
-        let body: String = tx.query_row(
-            "SELECT body FROM ci_observations WHERE id=?1",
-            [&plan.batch_id],
-            |r| r.get(0),
-        )?;
-        let saved: crate::scheduler::CiObservationRecord = serde_json::from_str(&body)?;
-        let (batch, _) = crate::store::checked_batch(&tx, &plan.batch_id)?;
-        let mut members = Vec::with_capacity(batch.candidates.len());
-        for candidate in batch.candidates {
-            let digest: String = tx.query_row(
-                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
-                params![plan.batch_id, candidate.number as i64],
-                |r| r.get(0),
-            )?;
-            members.push(crate::store::AdmissionCandidate {
-                candidate,
-                evidence_digest: digest,
-            });
-        }
-        let repository_policy_digest: String = tx.query_row(
-            "SELECT policy_digest FROM repository_binding WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let target = refresh_target_details(&tx, plan)?;
         tx.commit()?;
-        Ok(RefreshTarget {
-            plan,
-            run_id: saved.run_id,
-            members,
-            repository_policy_digest,
-        })
+        Ok(target)
     }
     /// Only an unclaimed intent can be cancelled without external reconciliation.
     pub fn cancel(&mut self, id: &str) -> Result<bool, LandingError> {
@@ -675,6 +683,42 @@ impl LandingJournal {
     }
 }
 
+fn refresh_target_details(
+    tx: &rusqlite::Transaction<'_>,
+    plan: LandingPlan,
+) -> Result<RefreshTarget, LandingError> {
+    let body: String = tx.query_row(
+        "SELECT body FROM ci_observations WHERE id=?1",
+        [&plan.batch_id],
+        |r| r.get(0),
+    )?;
+    let saved: crate::scheduler::CiObservationRecord = serde_json::from_str(&body)?;
+    let (batch, _) = crate::store::checked_batch(tx, &plan.batch_id)?;
+    let mut members = Vec::with_capacity(batch.candidates.len());
+    for candidate in batch.candidates {
+        let digest: String = tx.query_row(
+            "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+            params![plan.batch_id, candidate.number as i64],
+            |r| r.get(0),
+        )?;
+        members.push(crate::store::AdmissionCandidate {
+            candidate,
+            evidence_digest: digest,
+        });
+    }
+    let repository_policy_digest: String = tx.query_row(
+        "SELECT policy_digest FROM repository_binding WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(RefreshTarget {
+        plan,
+        run_id: saved.run_id,
+        members,
+        repository_policy_digest,
+        snapshot: saved.snapshot.ok_or(LandingError::StaleBatch)?,
+    })
+}
 fn verify_trust_binding(
     tx: &rusqlite::Transaction<'_>,
     plan: &LandingPlan,

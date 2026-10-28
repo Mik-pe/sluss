@@ -1385,6 +1385,41 @@ impl App {
         trusted_ci: &crate::landing::TrustedCiPolicy,
         operation_id: &str,
     ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
+        let target = journal.refresh_target(operation_id, trusted_ci)?;
+        let snapshot = self
+            .refresh_landing_provider(token, security_token, policy, &target)
+            .await?;
+        journal
+            .claim_with_fresh_snapshot(operation_id, &snapshot, trusted_ci)
+            .map_err(Into::into)
+    }
+    /// Compare a current provider scan with the frozen local batch. This is a
+    /// transient observation, does not create a landing intent or attestation,
+    /// and does not guarantee provider state stays unchanged afterward.
+    pub async fn preview_trusted_batch(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        security_token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        trusted_ci: &crate::landing::TrustedCiPolicy,
+        batch_id: &str,
+    ) -> Result<crate::landing::LandingPlan, LandingRefreshError> {
+        let target = journal.preview_target(batch_id, trusted_ci)?;
+        let snapshot = self
+            .refresh_landing_provider(token, security_token, policy, &target)
+            .await?;
+        journal
+            .verify_preview(&target, trusted_ci, &snapshot)
+            .map_err(Into::into)
+    }
+    async fn refresh_landing_provider(
+        &self,
+        token: &InstallationToken,
+        security_token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        target: &crate::landing::RefreshTarget,
+    ) -> Result<ActionsSnapshot, LandingRefreshError> {
         #[derive(Deserialize, PartialEq, Eq)]
         struct Identity {
             id: u64,
@@ -1404,7 +1439,6 @@ impl App {
         {
             return Err(LandingRefreshError::Scope);
         }
-        let target = journal.refresh_target(operation_id, trusted_ci)?;
         let plan = &target.plan;
         let app_identity = self.observe_app_identity().await?;
         if i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
@@ -1553,9 +1587,7 @@ impl App {
         {
             return Err(LandingRefreshError::Changed);
         }
-        journal
-            .claim_with_fresh_snapshot(operation_id, &snapshot, trusted_ci)
-            .map_err(Into::into)
+        Ok(snapshot)
     }
 }
 

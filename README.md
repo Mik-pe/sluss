@@ -20,6 +20,8 @@ The App claim additionally requires an operator-supplied `TrustedCiPolicy` froze
 
 To compare a policy locally, independently review a trusted commit and list every policy dependency. Run `sluss policy-digest --source /path/to/trusted/repo --commit <full-sha> --policy-file .github/workflows/sluss-ci.yml`, repeating `--policy-file` for every dependency. Fill in an operator-owned policy based on [the example](examples/trusted-ci-policy.toml), then run `sluss --db sluss.sqlite inspect-ci-policy --batch-id <id> --policy /path/to/trusted-ci-policy.toml`. `sluss ci-evidence --batch-id <id>` displays the recorded job, suite and policy values for comparison; observations are not recommendations. These commands cannot establish that the policy list is complete, that a commit or runner is trustworthy, or that the provider state is current. They do not create an intent, issue an attestation or authorize a merge.
 
+With an installed App, `SLUSS_GITHUB_PRIVATE_KEY_PATH` and repository configuration, `sluss --db sluss.sqlite preview-trusted-batch --batch-id <id> --config /path/to/sluss.toml --policy /path/to/trusted-ci-policy.toml` additionally compares the batch against fresh GitHub observations. It requires visible branch security consistent with the experimental strict-landing assessment, and rechecks local state after the network reads. The provider can change immediately afterward. This command creates no landing intent or check, is not an attestation or authorization, and has only been tested against a local GitHub stub.
+
 ```sh
 cargo test
 cargo run -- status

@@ -251,6 +251,15 @@ enum Command {
         #[arg(long)]
         policy: PathBuf,
     },
+    /// Refresh a trusted-policy comparison from GitHub without creating an intent.
+    PreviewTrustedBatch {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
     /// Hash declared policy files from an explicitly selected local commit.
     PolicyDigest {
         #[arg(long)]
@@ -309,6 +318,53 @@ struct ReconcileArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::PreviewTrustedBatch {
+        batch_id,
+        config,
+        policy,
+    } = &cli.command
+    {
+        let config = sluss::config::Config::load(config)?;
+        let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
+        let mut journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let app = sluss::github::App::new(
+            config.github.app_client_id.clone(),
+            &std::fs::read(key_path)?,
+            &config.github.api,
+        )?;
+        let read = app
+            .read_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let security = app
+            .runner_inventory_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let plan = app
+            .preview_trusted_batch(
+                &mut journal,
+                &read,
+                &security,
+                &config.policy(),
+                &trust,
+                batch_id,
+            )
+            .await?;
+        println!(
+            "provider observations matched the frozen batch {} at staging commit {}",
+            plan.batch_id, plan.staged_sha
+        );
+        println!(
+            "This is a point-in-time comparison, not an attestation or merge authorization; no landing intent or check was created."
+        );
+        return Ok(());
+    }
     if let Command::InspectCiPolicy { batch_id, policy } = &cli.command {
         let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
         let plan =
@@ -1299,6 +1355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::InspectCiPolicy { .. } => {
             unreachable!("policy inspection is handled before opening the database")
+        }
+        Command::PreviewTrustedBatch { .. } => {
+            unreachable!("batch preview is handled before opening the database")
         }
         Command::PolicyDigest { .. } => {
             unreachable!("policy digest is handled before opening the database")
