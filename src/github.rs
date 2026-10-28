@@ -1507,6 +1507,45 @@ pub struct RepositoryPreflight {
     pub rules: Vec<serde_json::Value>,
 }
 
+/// A 403/404 is deliberately not classified as absence of protection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtectionObservation {
+    Present(serde_json::Value),
+    Unavailable(u16),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesetSecurityObservation {
+    pub id: u64,
+    pub detail: serde_json::Value,
+    /// False means GitHub omitted or withheld the bypass list.
+    pub bypass_visible: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchSecurityObservation {
+    pub branch: BranchInfo,
+    pub rules: BranchRulesSnapshot,
+    pub protection: ProtectionObservation,
+    pub rulesets: Vec<RulesetSecurityObservation>,
+}
+fn valid_bypass_actor(actor: &serde_json::Value) -> bool {
+    let kind = actor.get("actor_type").and_then(|v| v.as_str());
+    let mode = actor.get("bypass_mode").and_then(|v| v.as_str());
+    if !matches!(mode, Some("always" | "pull_request" | "exempt")) {
+        return false;
+    }
+    match kind {
+        Some("Integration" | "RepositoryRole" | "Team" | "User") => actor
+            .get("actor_id")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|id| id > 0),
+        Some("DeployKey") => {
+            actor.get("actor_id").is_some_and(|v| v.is_null()) && mode != Some("pull_request")
+        }
+        Some("OrganizationAdmin") => true,
+        _ => false,
+    }
+}
+
 /// Provider-visible active branch rules only. Bypass actors and legacy branch
 /// protection may require other permissions and endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1541,6 +1580,155 @@ impl BranchRulesSnapshot {
     }
 }
 impl App {
+    /// Inspect legacy branch protection and each active ruleset's visible
+    /// bypass list using a repository-scoped Administration-read token. This
+    /// is a sampled diagnostic, not a proof that a bypass is safe or exclusive.
+    pub async fn observe_branch_security(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+    ) -> Result<BranchSecurityObservation, GitHubError> {
+        if !token.runner_inventory_read || !valid_name(owner) || !valid_name(repository) {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let first = self
+            .fetch_branch_security(token, owner, repository, branch)
+            .await?;
+        let second = self
+            .fetch_branch_security(token, owner, repository, branch)
+            .await?;
+        if first != second {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(second)
+    }
+
+    async fn fetch_branch_security(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+    ) -> Result<BranchSecurityObservation, GitHubError> {
+        let first_branch = self
+            .observe_target_branch(token, owner, repository, branch)
+            .await?;
+        let rules = self
+            .observe_branch_rules(token, owner, repository, branch)
+            .await?;
+        let segment = encoded_branch_segment(branch).ok_or(GitHubError::InvalidConfiguration)?;
+        let root = format!("repos/{owner}/{repository}");
+        let protection = match self
+            .get_json::<serde_json::Value>(
+                token,
+                &format!("{root}/branches/{segment}/protection"),
+                None,
+            )
+            .await
+        {
+            Ok(value) if value.is_object() => ProtectionObservation::Present(value),
+            Ok(_) => return Err(GitHubError::UnstableObservation),
+            Err(GitHubError::Status(status @ (403 | 404))) => {
+                ProtectionObservation::Unavailable(status)
+            }
+            Err(error) => return Err(error),
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        for rule in &rules.rules {
+            let id = rule
+                .get("ruleset_id")
+                .and_then(|v| v.as_u64())
+                .filter(|id| *id > 0)
+                .ok_or(GitHubError::UnstableObservation)?;
+            ids.insert(id);
+        }
+        if ids.len() > 100 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut rulesets = Vec::new();
+        let mut total = 0usize;
+        for id in ids {
+            let detail: serde_json::Value = self
+                .get_json(token, &format!("{root}/rulesets/{id}"), None)
+                .await?;
+            total = total.saturating_add(
+                serde_json::to_vec(&detail)
+                    .map_err(|_| GitHubError::UnstableObservation)?
+                    .len(),
+            );
+            let active_rules = detail
+                .get("rules")
+                .and_then(|v| v.as_array())
+                .ok_or(GitHubError::UnstableObservation)?;
+            if total > 1024 * 1024
+                || detail.get("id").and_then(|v| v.as_u64()) != Some(id)
+                || detail.get("target").and_then(|v| v.as_str()) != Some("branch")
+                || detail.get("enforcement").and_then(|v| v.as_str()) != Some("active")
+                || rules
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.get("ruleset_id").and_then(|v| v.as_u64()) == Some(id))
+                    .any(|rule| {
+                        let source = rule
+                            .get("ruleset_source")
+                            .and_then(|v| v.as_str())
+                            .filter(|value| !value.is_empty());
+                        let detail_source = detail
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .filter(|value| !value.is_empty());
+                        let source_type = rule
+                            .get("ruleset_source_type")
+                            .and_then(|v| v.as_str())
+                            .filter(|value| !value.is_empty());
+                        let detail_type = detail
+                            .get("source_type")
+                            .and_then(|v| v.as_str())
+                            .filter(|value| !value.is_empty());
+                        source
+                            .zip(detail_source)
+                            .is_none_or(|(left, right)| !left.eq_ignore_ascii_case(right))
+                            || source_type.is_none()
+                            || source_type != detail_type
+                            || !active_rules.iter().any(|entry| {
+                                entry.get("type") == rule.get("type")
+                                    && entry.get("parameters") == rule.get("parameters")
+                            })
+                    })
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let bypass_visible = match detail.get("bypass_actors") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Array(actors)) => {
+                    if actors.iter().any(|actor| !valid_bypass_actor(actor)) {
+                        return Err(GitHubError::UnstableObservation);
+                    }
+                    true
+                }
+                Some(_) => return Err(GitHubError::UnstableObservation),
+            };
+            rulesets.push(RulesetSecurityObservation {
+                id,
+                detail,
+                bypass_visible,
+            });
+        }
+        let last_branch = self
+            .observe_target_branch(token, owner, repository, branch)
+            .await?;
+        if first_branch != last_branch {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(BranchSecurityObservation {
+            branch: last_branch,
+            rules,
+            protection,
+            rulesets,
+        })
+    }
     /// Compare two paginated reads of active rules, independently of rule
     /// order. This does not inspect bypass actors or authorize a merge.
     pub async fn observe_branch_rules(

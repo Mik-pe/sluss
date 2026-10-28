@@ -307,8 +307,40 @@ async fn doctor_rules(
     let different = mode == 64
         || (matches!(mode, 65 | 66) && state.token_calls.fetch_add(1, Ordering::SeqCst) % 2 == 1);
     Json(
-        json!([{"type":if different {"required_linear_history"} else {"pull_request"},"ruleset_id":10}]),
+        json!([{"type":if different {"required_linear_history"} else {"pull_request"},"ruleset_id":10,"ruleset_source_type":"Repository","ruleset_source":"owner/repo"}]),
     )
+}
+async fn doctor_protection(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    if state.mode.load(Ordering::SeqCst) == 69 {
+        return (StatusCode::NOT_FOUND, Json(json!({"message":"not found"})));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false}})),
+    )
+}
+async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let mut body = json!({"id":10,"target":"branch","enforcement":"active","source_type":"Repository","source":if mode == 74 {"owner/other"} else {"owner/repo"},"rules":[{"type":if mode == 71 {"deletion"} else {"pull_request"}}],"bypass_actors":[{"actor_type":"Integration","actor_id":17,"bypass_mode":"always"}]});
+    if mode == 67 {
+        body.as_object_mut().unwrap().remove("bypass_actors");
+    }
+    if mode == 68 {
+        body["description"] = json!(state.token_calls.fetch_add(1, Ordering::SeqCst) % 2);
+    }
+    if mode == 72 {
+        body["bypass_actors"] =
+            json!([{"actor_type":"Integration","actor_id":null,"bypass_mode":"always"}]);
+    }
+    if mode == 73 {
+        body["bypass_actors"] = json!([]);
+    }
+    Json(body)
 }
 async fn repository_runners(
     State(state): State<ServerState>,
@@ -1456,6 +1488,11 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         )
         .route("/repos/owner/repo/rules/branches/main", get(doctor_rules))
         .route(
+            "/repos/owner/repo/branches/main/protection",
+            get(doctor_protection),
+        )
+        .route("/repos/owner/repo/rulesets/10", get(doctor_ruleset))
+        .route(
             "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
             get(dispatch_ref),
         )
@@ -1501,6 +1538,58 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let fixture_app =
         App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
     let fixture_token = fixture_app.read_token(42, 7).await.unwrap();
+    let security_token = fixture_app.runner_inventory_token(42, 7).await.unwrap();
+    assert!(
+        fixture_app
+            .observe_branch_security(&fixture_token, "owner", "repo", "main")
+            .await
+            .is_err()
+    );
+    let security = fixture_app
+        .observe_branch_security(&security_token, "owner", "repo", "main")
+        .await
+        .unwrap();
+    assert_eq!(security.rulesets.len(), 1);
+    assert!(security.rulesets[0].bypass_visible);
+    assert!(matches!(
+        security.protection,
+        sluss::github::ProtectionObservation::Present(_)
+    ));
+    mode.store(67, Ordering::SeqCst);
+    assert!(
+        !fixture_app
+            .observe_branch_security(&security_token, "owner", "repo", "main")
+            .await
+            .unwrap()
+            .rulesets[0]
+            .bypass_visible
+    );
+    mode.store(73, Ordering::SeqCst);
+    let empty = fixture_app
+        .observe_branch_security(&security_token, "owner", "repo", "main")
+        .await
+        .unwrap();
+    assert!(empty.rulesets[0].bypass_visible);
+    assert_eq!(empty.rulesets[0].detail["bypass_actors"], json!([]));
+    mode.store(69, Ordering::SeqCst);
+    assert!(matches!(
+        fixture_app
+            .observe_branch_security(&security_token, "owner", "repo", "main")
+            .await
+            .unwrap()
+            .protection,
+        sluss::github::ProtectionObservation::Unavailable(404)
+    ));
+    for invalid in [68, 71, 72, 74] {
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(
+            fixture_app
+                .observe_branch_security(&security_token, "owner", "repo", "main")
+                .await
+                .is_err()
+        );
+    }
+    mode.store(0, Ordering::SeqCst);
     assert!(
         fixture_app
             .inspect_ref_update_schema(&fixture_token)
@@ -2351,6 +2440,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let info = String::from_utf8_lossy(&doctor.stdout);
     assert!(info.contains("target: main"));
     assert!(info.contains("active branch rules returned: 1"));
+    assert!(info.contains("active rulesets inspected: 1; bypass lists unavailable: 0"));
+    assert!(info.contains("classic branch protection: readable"));
     assert!(info.contains("GraphQL updateRefs and expected-old fields appear in the schema"));
     assert!(info.contains("repository runner inventory matches configured hosts: 1 runners"));
     assert!(info.contains("repository-scoped read, staging and Actions credentials were issued"));

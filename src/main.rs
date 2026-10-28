@@ -484,6 +484,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 preflight.branch.name, preflight.branch.commit.sha, preflight.branch.protected
             );
             println!("active branch rules returned: {}", preflight.rules.len());
+            let mut preflight_rules = preflight.rules.clone();
+            preflight_rules.sort_by_cached_key(|rule| rule.to_string());
+            match app
+                .observe_branch_security(
+                    &inventory_token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &config.queue.target,
+                )
+                .await
+            {
+                Ok(security)
+                    if security.branch == preflight.branch
+                        && security.rules.rules == preflight_rules =>
+                {
+                    let hidden = security
+                        .rulesets
+                        .iter()
+                        .filter(|rule| !rule.bypass_visible)
+                        .count();
+                    println!(
+                        "active rulesets inspected: {}; bypass lists unavailable: {}",
+                        security.rulesets.len(),
+                        hidden
+                    );
+                    let visible_actors: usize = security
+                        .rulesets
+                        .iter()
+                        .filter_map(|rule| {
+                            rule.detail
+                                .get("bypass_actors")
+                                .and_then(|value| value.as_array())
+                        })
+                        .map(Vec::len)
+                        .sum();
+                    println!("visible ruleset bypass actors: {visible_actors}");
+                    match security.protection {
+                        sluss::github::ProtectionObservation::Present(protection) => {
+                            println!("classic branch protection: readable");
+                            if protection
+                                .pointer("/enforce_admins/enabled")
+                                .and_then(|v| v.as_bool())
+                                == Some(false)
+                            {
+                                eprintln!(
+                                    "classic protection does not enforce rules for administrators"
+                                );
+                            }
+                            if protection
+                                .pointer("/allow_force_pushes/enabled")
+                                .and_then(|v| v.as_bool())
+                                == Some(true)
+                            {
+                                eprintln!("classic protection allows force pushes");
+                            }
+                        }
+                        sluss::github::ProtectionObservation::Unavailable(status) => eprintln!(
+                            "classic branch protection unavailable (HTTP {status}); absence is not confirmed"
+                        ),
+                    }
+                }
+                Ok(_) => eprintln!("branch or rules changed between diagnostic observations"),
+                Err(_) => {
+                    eprintln!("branch protection and ruleset bypass details could not be inspected")
+                }
+            }
             match app.inspect_ref_update_schema(&read).await {
                 Ok(true) => println!(
                     "GraphQL updateRefs and expected-old fields appear in the schema (semantics and permissions not verified)"
