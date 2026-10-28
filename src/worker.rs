@@ -506,10 +506,25 @@ async fn observe_deliveries_inner(
     let mut journal = crate::delivery::DeliveryJournal::open(db).map_err(|e| e.to_string())?;
     let mut token = None;
     let mut observed = 0usize;
-    for _ in 0..4 {
-        let Some(claim) = journal.next(policy, &digest).map_err(|e| e.to_string())? else {
+    let mut seen = std::collections::HashSet::new();
+    for slot in 0..4 {
+        let priority = if slot < 2 {
+            journal
+                .next_priority(policy, &digest)
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let claim = match priority {
+            Some(claim) => Some(claim),
+            None => journal.next(policy, &digest).map_err(|e| e.to_string())?,
+        };
+        let Some(claim) = claim else {
             break;
         };
+        if !seen.insert(claim.number) {
+            continue;
+        }
         if token.is_none() {
             token = Some(
                 app.read_token(policy.installation as u64, policy.repository as u64)

@@ -49,6 +49,25 @@ impl DeliveryJournal {
         policy: &RepositoryPolicy,
         digest: &str,
     ) -> Result<Option<DeliveryClaim>, DeliveryError> {
+        self.claim(policy, digest, false)
+    }
+
+    /// Prefer the newest unexamined ended admission episode. A normal scan
+    /// still gets a share of each pass, even under sustained arrivals.
+    pub fn next_priority(
+        &mut self,
+        policy: &RepositoryPolicy,
+        digest: &str,
+    ) -> Result<Option<DeliveryClaim>, DeliveryError> {
+        self.claim(policy, digest, true)
+    }
+
+    fn claim(
+        &mut self,
+        policy: &RepositoryPolicy,
+        digest: &str,
+        priority: bool,
+    ) -> Result<Option<DeliveryClaim>, DeliveryError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -65,12 +84,18 @@ impl DeliveryJournal {
             [],
             |r| r.get(0),
         )?;
-        let number: Option<i64> = tx.query_row("SELECT DISTINCT a.number FROM admission_observations_v1 a WHERE a.number>?1 AND a.ended_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM candidates c WHERE c.number=a.number) ORDER BY a.number LIMIT 1", [after], |r| r.get(0)).optional()?;
+        let number: Option<i64> = if priority {
+            tx.query_row("SELECT a.number FROM admission_observations_v1 a WHERE a.ended_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM candidates c WHERE c.number=a.number) AND NOT EXISTS(SELECT 1 FROM admission_observations_v1 newer WHERE newer.number=a.number AND newer.id>a.id) AND NOT EXISTS(SELECT 1 FROM ci_delivery_priority_claims p WHERE p.number=a.number AND p.observation_id>=a.id) ORDER BY a.id DESC LIMIT 1", [], |r| r.get(0)).optional()?
+        } else {
+            tx.query_row("SELECT DISTINCT a.number FROM admission_observations_v1 a WHERE a.number>?1 AND a.ended_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM candidates c WHERE c.number=a.number) ORDER BY a.number LIMIT 1", [after], |r| r.get(0)).optional()?
+        };
         let Some(number) = number else {
-            tx.execute(
-                "UPDATE ci_delivery_cursor SET after_number=0 WHERE id=1",
-                [],
-            )?;
+            if !priority {
+                tx.execute(
+                    "UPDATE ci_delivery_cursor SET after_number=0 WHERE id=1",
+                    [],
+                )?;
+            }
             tx.commit()?;
             return Ok(None);
         };
@@ -90,10 +115,13 @@ impl DeliveryJournal {
             _ => return Err(DeliveryError::Invalid),
         };
         tx.execute("INSERT INTO ci_delivery_claims(number,revision) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET revision=excluded.revision", params![number,revision])?;
-        tx.execute(
-            "UPDATE ci_delivery_cursor SET after_number=?1 WHERE id=1",
-            [number],
-        )?;
+        if !priority {
+            tx.execute(
+                "UPDATE ci_delivery_cursor SET after_number=?1 WHERE id=1",
+                [number],
+            )?;
+        }
+        tx.execute("INSERT INTO ci_delivery_priority_claims(number,observation_id) SELECT ?1,MAX(id) FROM admission_observations_v1 WHERE number=?1 HAVING MAX(id)>0 ON CONFLICT(number) DO UPDATE SET observation_id=MAX(observation_id,excluded.observation_id)", [number])?;
         let event_revision = event_revision(&tx)?;
         tx.commit()?;
         Ok(Some(DeliveryClaim {
@@ -401,5 +429,43 @@ mod tests {
             ),
             (0, 1, 0)
         );
+
+        // Fresh episodes receive priority, but the historical cursor still
+        // advances independently and prevents an endless stream of new PRs
+        // from starving old observations.
+        let conn = Connection::open(&db).unwrap();
+        for number in [100, 200] {
+            conn.execute("INSERT INTO admission_observations_v1(number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain) SELECT ?1,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain FROM admission_observations_v1 WHERE number=19 LIMIT 1", [number]).unwrap();
+        }
+        assert_eq!(
+            journal
+                .next_priority(&policy, &digest)
+                .unwrap()
+                .unwrap()
+                .number,
+            200
+        );
+        assert_eq!(journal.next(&policy, &digest).unwrap().unwrap().number, 100);
+        assert!(journal.next_priority(&policy, &digest).unwrap().is_none());
+        conn.execute("INSERT INTO admission_observations_v1(number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain) SELECT number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain FROM admission_observations_v1 WHERE number=100 LIMIT 1", []).unwrap();
+        let fresh = journal.next_priority(&policy, &digest).unwrap().unwrap();
+        assert_eq!(fresh.number, 100);
+        assert_eq!(journal.next(&policy, &digest).unwrap().unwrap().number, 200);
+        conn.execute("INSERT INTO admission_observations_v1(number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain) SELECT number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain FROM admission_observations_v1 WHERE number=200 LIMIT 1", []).unwrap();
+        assert_eq!(
+            journal
+                .next_priority(&policy, &digest)
+                .unwrap()
+                .unwrap()
+                .number,
+            200
+        );
+        drop(journal); // Crash after claiming and before the provider read.
+        let mut journal = DeliveryJournal::open(&db).unwrap();
+        assert!(journal.next_priority(&policy, &digest).unwrap().is_none());
+        assert!(journal.next(&policy, &digest).unwrap().is_none());
+        assert_eq!(journal.next(&policy, &digest).unwrap().unwrap().number, 19);
+        assert_eq!(journal.next(&policy, &digest).unwrap().unwrap().number, 100);
+        assert_eq!(journal.next(&policy, &digest).unwrap().unwrap().number, 200);
     }
 }

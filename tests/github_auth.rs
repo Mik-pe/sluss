@@ -10169,5 +10169,26 @@ async fn delivery_worker_counts_only_stable_observed_merges() {
             .unwrap(),
         0
     );
+    // New episodes are sampled promptly without stopping the historical
+    // cursor from moving forward through older PRs.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for number in 20..=25 {
+        conn.execute("INSERT INTO admission_observations_v1(number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain) SELECT ?1,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain FROM admission_observations_v1 WHERE number=19 LIMIT 1", [number]).unwrap();
+    }
+    assert_eq!(
+        sluss::worker::observe_deliveries_once(&app, &db, &policy)
+            .await
+            .unwrap(),
+        3
+    );
+    let recorded: String = conn.query_row("SELECT group_concat(number, ',') FROM (SELECT number FROM ci_delivery_records ORDER BY number)", [], |row| row.get(0)).unwrap();
+    assert_eq!(recorded, "19,20,24,25");
+    assert_eq!(
+        sluss::worker::observe_deliveries_once(&app, &db, &policy)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(store.metrics().unwrap().observed_deliveries, 7);
     server.abort();
 }

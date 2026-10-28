@@ -56,6 +56,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS ci_job_metrics_batch_attempt ON ci_job_metrics(repository_id, json_extract(body, '$.batch_id'), json_extract(body, '$.attempt')) WHERE json_valid(body);
         CREATE TABLE IF NOT EXISTS ci_delivery_cursor (id INTEGER PRIMARY KEY CHECK(id=1), after_number INTEGER NOT NULL CHECK(after_number>=0));
         CREATE TABLE IF NOT EXISTS ci_delivery_claims (number INTEGER PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>0));
+        CREATE TABLE IF NOT EXISTS ci_delivery_priority_claims (number INTEGER PRIMARY KEY, observation_id INTEGER NOT NULL CHECK(observation_id>0));
         CREATE TABLE IF NOT EXISTS ci_delivery_records (number INTEGER PRIMARY KEY, repository_id INTEGER NOT NULL, target TEXT NOT NULL, merged_ms INTEGER NOT NULL, head_sha TEXT, observed_ready_ms INTEGER, conflicted INTEGER NOT NULL CHECK(conflicted IN (0,1)));
         CREATE TABLE IF NOT EXISTS ci_capacity_waits (id INTEGER PRIMARY KEY, batch_id TEXT NOT NULL, request TEXT NOT NULL, started_ms INTEGER NOT NULL, ended_ms INTEGER);
         CREATE UNIQUE INDEX IF NOT EXISTS ci_capacity_waits_open ON ci_capacity_waits(batch_id) WHERE ended_ms IS NULL;")
