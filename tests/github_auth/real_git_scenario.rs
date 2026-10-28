@@ -42,6 +42,9 @@ async fn app_token(
 ) -> impl axum::response::IntoResponse {
     token(State(s.server), path, headers, body).await
 }
+async fn app_info(State(s): State<Scenario>, headers: HeaderMap) -> Json<Value> {
+    authenticated_app(State(s.server), headers).await
+}
 async fn repo(State(s): State<Scenario>, headers: HeaderMap) -> Json<Value> {
     dispatch_repo(State(s.server), headers).await
 }
@@ -99,7 +102,15 @@ async fn runners(
     }
     repository_runners(State(s.server), headers, query).await
 }
-async fn workflow(State(s): State<Scenario>, headers: HeaderMap) -> Json<Value> {
+async fn workflow(
+    State(s): State<Scenario>,
+    headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
+) -> Json<Value> {
+    if s.multi_host && uri.0.path().ends_with("/18") {
+        assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+        return Json(json!({"id":18,"path":".github/workflows/ci-mac.yml","state":"active"}));
+    }
     doctor_workflow(State(s.server), headers).await
 }
 async fn rules(
@@ -164,6 +175,7 @@ async fn blob(
 async fn send(
     State(s): State<Scenario>,
     headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
     body: Json<Value>,
 ) -> impl axum::response::IntoResponse {
     if s.multi_host {
@@ -171,8 +183,8 @@ async fn send(
         let host = body["inputs"]["sluss_host"].as_str().unwrap();
         let suite = body["inputs"]["sluss_suites"].as_str().unwrap();
         let run = match (host, suite) {
-            ("sluss-host-linux", "compile") => 123,
-            ("sluss-host-mac", "test") => 124,
+            ("sluss-host-linux", "compile") if uri.0.path().contains("/workflows/17/") => 123,
+            ("sluss-host-mac", "test") if uri.0.path().contains("/workflows/18/") => 124,
             _ => panic!("unexpected lane dispatch"),
         };
         assert_eq!(body["ref"], "refs/heads/sluss/batch-0123456789abcdef");
@@ -187,6 +199,7 @@ async fn run(
     uri: axum::extract::OriginalUri,
 ) -> Json<Value> {
     let linux = s.multi_host && uri.0.path().contains("/runs/123");
+    let mac = s.multi_host && uri.0.path().contains("/runs/124");
     let partial = linux && s.server.mode.load(Ordering::SeqCst) == 32;
     let fail = s.multi_host
         && s.fail_mac
@@ -197,6 +210,11 @@ async fn run(
         &s.remote,
         &["rev-parse", "refs/heads/sluss/batch-0123456789abcdef"]
     ));
+    if mac {
+        value["workflow_id"] = json!(18);
+        value["path"] =
+            json!(".github/workflows/ci-mac.yml@refs/heads/sluss/batch-0123456789abcdef");
+    }
     if fail {
         value["conclusion"] = json!("failure");
     }
@@ -744,6 +762,11 @@ async fn two_host_scenario(fail_mac: bool) {
         WORKFLOW_GOOD,
     )
     .unwrap();
+    std::fs::write(
+        source.path().join(".github/workflows/ci-mac.yml"),
+        WORKFLOW_GOOD,
+    )
+    .unwrap();
     std::fs::write(source.path().join("base"), "base\n").unwrap();
     git(source.path(), &["add", "."]);
     git(
@@ -788,6 +811,7 @@ async fn two_host_scenario(fail_mac: bool) {
         fail_mac,
     };
     let router = Router::new()
+        .route("/app", get(app_info))
         .route("/app/installations/{id}/access_tokens", post(app_token))
         .route("/graphql", post(graphql))
         .route("/repos/owner/repo", get(repo))
@@ -801,6 +825,7 @@ async fn two_host_scenario(fail_mac: bool) {
         )
         .route("/repos/owner/repo/actions/runners", get(runners))
         .route("/repos/owner/repo/actions/workflows/17", get(workflow))
+        .route("/repos/owner/repo/actions/workflows/18", get(workflow))
         .route("/repos/owner/repo/rules/branches/main", get(rules))
         .route(
             "/repos/owner/repo/branches/main/protection",
@@ -815,6 +840,10 @@ async fn two_host_scenario(fail_mac: bool) {
         .route("/repos/owner/repo/git/blobs/{id}", get(blob))
         .route(
             "/repos/owner/repo/actions/workflows/17/dispatches",
+            post(send),
+        )
+        .route(
+            "/repos/owner/repo/actions/workflows/18/dispatches",
             post(send),
         )
         .route("/repos/owner/repo/actions/runs/123", get(run))
@@ -842,7 +871,7 @@ async fn two_host_scenario(fail_mac: bool) {
     let token = app.read_token(42, 7).await.unwrap();
     let capacity: Capacity = toml::from_str("[pools]\nlinux=1\nmacos=1\n[hosts.sluss-host-linux]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-linux.pools]\nlinux=1\n[hosts.sluss-host-mac]\nslots=1\nrunner_ids=[2]\n[hosts.sluss-host-mac.pools]\nmacos=1\n").unwrap();
     let lane_policy = data.path().join("lanes.toml");
-    std::fs::write(&lane_policy, "version=1\n[lanes.compile]\nworkflow_id=17\nsuites=['compile']\nrequired_jobs=['compile-job']\n[lanes.compile.request.pools]\nlinux=1\n[lanes.test]\nworkflow_id=17\nsuites=['test']\nrequired_jobs=['test-job']\n[lanes.test.request.pools]\nmacos=1\n").unwrap();
+    std::fs::write(&lane_policy, "version=1\n[lanes.compile]\nworkflow_id=17\nsuites=['compile']\nrequired_jobs=['compile-job']\n[lanes.compile.request.pools]\nlinux=1\n[lanes.test]\nworkflow_id=18\nsuites=['test']\nrequired_jobs=['test-job']\n[lanes.test.request.pools]\nmacos=1\n").unwrap();
     let verification = data.path().join("verification.toml");
     std::fs::write(&verification, "version=1\nfull_suites=['compile','test']\n[[components]]\nname='all'\npaths=['src/']\nsuites=['compile','test']\n").unwrap();
     let selection_policy = sluss::selective::Policy::load(&verification).unwrap();
@@ -850,6 +879,44 @@ async fn two_host_scenario(fail_mac: bool) {
         policy: lane_policy,
         verification_policy: Some(verification),
     };
+    let capacity_path = data.path().join("capacity.toml");
+    std::fs::write(&capacity_path, toml::to_string(&capacity).unwrap()).unwrap();
+    let doctor_config = config.clone();
+    let doctor_lane_policy = settings.policy.clone();
+    let doctor_verification = settings.verification_policy.clone().unwrap();
+    let doctor_key = _keys.path().join("test-key.pem");
+    let diagnostic = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .args(["doctor", "--ci-only", "--config"])
+            .arg(doctor_config)
+            .arg("--capacity")
+            .arg(capacity_path)
+            .arg("--lane-policy")
+            .arg(doctor_lane_policy)
+            .arg("--verification-policy")
+            .arg(doctor_verification)
+            .args([
+                "--policy-file",
+                ".github/workflows/ci.yml",
+                "--policy-file",
+                ".github/workflows/ci-mac.yml",
+            ])
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", doctor_key)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!diagnostic.status.success()); // The stub is not a supported GitHub staging origin.
+    let report = String::from_utf8(diagnostic.stdout).unwrap();
+    assert!(
+        report.contains("lane compile: workflow 17") && report.contains("lane test: workflow 18")
+    );
+    assert!(
+        String::from_utf8(diagnostic.stderr)
+            .unwrap()
+            .contains("Git staging is unsupported")
+    );
     let mut inbox = Inbox::open(&db).unwrap();
     inbox
         .record("initial", "pull_request", &[1; 32], 42, 7)
@@ -866,7 +933,10 @@ async fn two_host_scenario(fail_mac: bool) {
         id,
         remote.path(),
         "main",
-        &[".github/workflows/ci.yml".into()],
+        &[
+            ".github/workflows/ci.yml".into(),
+            ".github/workflows/ci-mac.yml".into(),
+        ],
     )
     .unwrap();
     store
