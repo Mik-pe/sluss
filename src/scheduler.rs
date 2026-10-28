@@ -49,6 +49,8 @@ pub enum SchedulerError {
     DispatchManaged,
     #[error("dispatch transition or run identity is invalid")]
     DispatchTransition,
+    #[error("batch, queue, or repository changed before dispatch")]
+    StaleBatch,
     #[error("stored reservation refers to an unknown host or pool")]
     Corrupt,
 }
@@ -68,7 +70,8 @@ impl Scheduler {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS capacity_config (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
-            CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);")?;
+            CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
+            CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<String> = tx
             .query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
@@ -101,7 +104,7 @@ impl Scheduler {
         id: &str,
         request: &Request,
     ) -> Result<Option<Reservation>, SchedulerError> {
-        self.reserve_inner(id, request, None)
+        self.reserve_inner(id, request, None, None)
     }
     /// Atomically record the frozen dispatch intent and reserve capacity.
     /// No provider request is made here.
@@ -114,13 +117,28 @@ impl Scheduler {
         if !plan.valid() {
             return Err(SchedulerError::Invalid);
         }
-        self.reserve_inner(id, request, Some(plan))
+        self.reserve_inner(id, request, Some(plan), None)
+    }
+    /// Reserve a dispatch bound to a frozen batch in the same database.
+    /// Provider policy, staging-ref protection and runner placement still need
+    /// independent verification before executing this intent.
+    pub fn reserve_batch_dispatch(
+        &mut self,
+        batch_id: &str,
+        request: &Request,
+        plan: &DispatchPlan,
+    ) -> Result<Option<Reservation>, SchedulerError> {
+        if !plan.valid() || plan.staging_ref != format!("refs/heads/sluss/{batch_id}") {
+            return Err(SchedulerError::Invalid);
+        }
+        self.reserve_inner(batch_id, request, Some(plan), Some(batch_id))
     }
     fn reserve_inner(
         &mut self,
         id: &str,
         request: &Request,
         plan: Option<&DispatchPlan>,
+        batch_id: Option<&str>,
     ) -> Result<Option<Reservation>, SchedulerError> {
         if id.is_empty()
             || request.pools.is_empty()
@@ -154,6 +172,9 @@ impl Scheduler {
         if active_config != self.encoded {
             return Err(SchedulerError::ConfigChanged);
         }
+        if let (Some(batch_id), Some(plan)) = (batch_id, plan) {
+            validate_batch_dispatch(&tx, batch_id, plan)?;
+        }
         let finished: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM capacity_finished WHERE id=?1)",
             [id],
@@ -180,6 +201,16 @@ impl Scheduler {
                 (Some(stored), Some(plan))
                     if serde_json::from_str::<DispatchPlan>(&stored)? == *plan => {}
                 _ => return Err(SchedulerError::IdConflict),
+            }
+            let stored_batch: Option<String> = tx
+                .query_row(
+                    "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if stored_batch.as_deref() != batch_id {
+                return Err(SchedulerError::IdConflict);
             }
             let old: Request = serde_json::from_str(&encoded)?;
             if old != *request {
@@ -256,6 +287,12 @@ impl Scheduler {
             tx.execute(
                 "INSERT INTO dispatch_intents(id,plan,state) VALUES(?1,?2,'prepared')",
                 params![id, serde_json::to_string(plan)?],
+            )?;
+        }
+        if let Some(batch_id) = batch_id {
+            tx.execute(
+                "INSERT INTO dispatch_batches(id,batch_id) VALUES(?1,?2)",
+                params![id, batch_id],
             )?;
         }
         tx.commit()?;
@@ -364,10 +401,58 @@ impl Scheduler {
     /// Only the worker that changes Prepared to Sending may issue the request.
     /// Sending is deliberately not retried after a crash or ambiguous response.
     pub fn claim_dispatch(&mut self, id: &str) -> Result<bool, SchedulerError> {
-        Ok(self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let intent: Option<(String, String)> = tx
+            .query_row(
+                "SELECT state,plan FROM dispatch_intents WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, plan)) = intent else {
+            return Ok(false);
+        };
+        if state != "prepared" {
+            return Ok(false);
+        }
+        let batch_id: Option<String> = tx
+            .query_row(
+                "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(batch_id) = batch_id {
+            validate_batch_dispatch(&tx, &batch_id, &serde_json::from_str(&plan)?)?;
+        }
+        let claimed = tx.execute(
             "UPDATE dispatch_intents SET state='sending' WHERE id=?1 AND state='prepared'",
             [id],
-        )? == 1)
+        )? == 1;
+        tx.commit()?;
+        Ok(claimed)
+    }
+    /// Cancel only before a provider request is claimed; this atomically frees
+    /// the reservation and permanently retires the identifier.
+    pub fn cancel_prepared(&mut self, id: &str) -> Result<bool, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE dispatch_intents SET state='cancelled' WHERE id=?1 AND state='prepared'",
+            [id],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if tx.execute("DELETE FROM capacity_reservations WHERE id=?1", [id])? != 1 {
+            return Err(SchedulerError::Corrupt);
+        }
+        tx.execute("INSERT INTO capacity_finished(id) VALUES(?1)", [id])?;
+        tx.commit()?;
+        Ok(true)
     }
     /// Save the direct provider receipt before validating the run details.
     pub fn record_receipt(&mut self, id: &str, run_id: u64) -> Result<(), SchedulerError> {
@@ -473,7 +558,7 @@ impl Scheduler {
     /// Read durable, nonterminal intents for startup recovery. Sending intents
     /// need provider reconciliation, never blind redispatch.
     pub fn pending_dispatches(&self) -> Result<Vec<PendingDispatch>, SchedulerError> {
-        let mut stmt = self.conn.prepare("SELECT d.id,d.plan,d.state,d.run_id,r.host,r.request FROM dispatch_intents d LEFT JOIN capacity_reservations r ON r.id=d.id WHERE d.state != 'finished' ORDER BY d.id")?;
+        let mut stmt = self.conn.prepare("SELECT d.id,d.plan,d.state,d.run_id,r.host,r.request FROM dispatch_intents d LEFT JOIN capacity_reservations r ON r.id=d.id WHERE d.state NOT IN ('finished','cancelled') ORDER BY d.id")?;
         let mut rows = stmt.query([])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
@@ -517,4 +602,67 @@ impl Scheduler {
         }
         Ok(result)
     }
+}
+
+fn validate_batch_dispatch(
+    tx: &rusqlite::Transaction<'_>,
+    batch_id: &str,
+    plan: &DispatchPlan,
+) -> Result<(), SchedulerError> {
+    use crate::batch::{Batch, State};
+    let binding: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT installation,repository FROM repository_binding WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if binding
+        != Some((
+            i64::try_from(plan.installation_id).map_err(|_| SchedulerError::StaleBatch)?,
+            i64::try_from(plan.repository_id).map_err(|_| SchedulerError::StaleBatch)?,
+        ))
+    {
+        return Err(SchedulerError::StaleBatch);
+    }
+    let paused: bool = tx.query_row(
+        "SELECT value != 0 FROM settings WHERE key='paused'",
+        [],
+        |r| r.get(0),
+    )?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM reconciliations WHERE installation=?1 AND repository=?2)",
+        params![plan.installation_id as i64, plan.repository_id as i64],
+        |r| r.get(0),
+    )?;
+    let body: Option<String> = tx
+        .query_row("SELECT body FROM batches WHERE id=?1", [batch_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let batch: Batch = serde_json::from_str(&body.ok_or(SchedulerError::StaleBatch)?)?;
+    if paused
+        || pending
+        || batch.id != batch_id
+        || batch.state
+            != (State::Testing {
+                integration_sha: plan.integration_sha.clone(),
+            })
+    {
+        return Err(SchedulerError::StaleBatch);
+    }
+    for candidate in batch.candidates {
+        let number = i64::try_from(candidate.number).map_err(|_| SchedulerError::StaleBatch)?;
+        let head: Option<String> = tx
+            .query_row(
+                "SELECT head_sha FROM candidates WHERE number=?1",
+                [number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if head.as_deref() != Some(&candidate.head_sha) {
+            return Err(SchedulerError::StaleBatch);
+        }
+    }
+    Ok(())
 }

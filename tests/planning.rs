@@ -155,3 +155,81 @@ fn direct_batch_insertion_cannot_duplicate_a_live_candidate() {
         Err(StoreError::Conflict)
     ));
 }
+
+#[test]
+fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
+    use sluss::scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError};
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let id = "batch-0123456789abcdef";
+    let mut batch = store
+        .plan_batch(id, &"a".repeat(40), 2, 1)
+        .unwrap()
+        .unwrap();
+    batch.begin_build().unwrap();
+    store.update_batch(&batch, 0).unwrap();
+    batch.begin_testing("b".repeat(40)).unwrap();
+    store.update_batch(&batch, 1).unwrap();
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &db,
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "host".into(),
+                Host {
+                    slots: 1,
+                    pools: pools.clone(),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    let req = Request { pools };
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+    };
+    assert!(
+        scheduler
+            .reserve_batch_dispatch(id, &req, &plan)
+            .unwrap()
+            .is_some()
+    );
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        scheduler.claim_dispatch(id),
+        Err(SchedulerError::StaleBatch)
+    ));
+    store.set_paused(false).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox
+        .record("review-changed", "pull_request_review", &[9; 32], 1, 2)
+        .unwrap();
+    assert!(matches!(
+        scheduler.claim_dispatch(id),
+        Err(SchedulerError::StaleBatch)
+    ));
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates = store.candidates().unwrap();
+    candidates[0].head_sha = "f".repeat(40);
+    store
+        .apply_reconciliation(&event, &"f".repeat(64), &candidates)
+        .unwrap();
+    assert!(matches!(
+        scheduler.claim_dispatch(id),
+        Err(SchedulerError::StaleBatch)
+    ));
+    assert!(scheduler.cancel_prepared(id).unwrap());
+    assert!(!scheduler.claim_dispatch(id).unwrap());
+    assert!(!scheduler.cancel_prepared(id).unwrap());
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+    assert!(scheduler.reserve("next", &req).unwrap().is_some());
+}
