@@ -2,6 +2,8 @@
 
 Sluss must fail closed. The early core is not an authorization service. Explicit experimental commands can create staging refs and dispatch workflows, but cannot update the target branch. Do not install it with branch bypass privileges or use its current states as merge evidence.
 
+The experimental local reference transaction is a separate library function that can update a branch in a trusted local bare repository. Its caller is responsible for authorization and exclusive control of the repository and filesystem; it is not used by the service or CLI and does not enforce the landing protocol.
+
 The GitHub App's credentials, webhook secret, signing keys and any release secrets must not be accessible to code running in PR CI jobs. Persistent self-hosted runners can be compromised by untrusted workloads; deployment must use an isolation and cleanup strategy appropriate to the trust level of the code.
 
 Required design work includes authenticating webhook payloads before persistence, installation-scoped access, replay protection and durable deduplication, explicit trusted workflow and check identity, least privilege, auditable evidence, policy-change invalidation, and concurrency-safe landing. Operator-controlled policies and GitHub rules must prevent PR code from impersonating the attestor or disabling required verification. Doctor must validate relevant permissions and rules, while landing must still revalidate them.

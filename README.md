@@ -6,7 +6,9 @@ Sluss is intended to be a small, open-source CI orchestrator and merge queue for
 
 ## Status: early development
 
-The current development preview contains a durable SQLite queue, batch state machine, physical-host reservations, a Git integration builder, authenticated GitHub App reconciliation, and optional workers for planning, staging, dispatch and observation. These paths have not been validated end-to-end against a real GitHub App and runner. They do not establish trusted CI attestation or update target branches, and the project is not ready for production or a pilot. A `Verified` state is not merge authorization; `doctor` exits unsuccessfully until the required checks exist.
+The current development preview contains a durable SQLite queue, batch state machine, physical-host reservations, a Git integration builder, authenticated GitHub App reconciliation, and optional workers for planning, staging, dispatch and observation. These paths have not been validated end-to-end against a real GitHub App and runner. The service and CLI do not establish trusted CI attestation or update target branches, and the project is not ready for production or a pilot. A `Verified` state is not merge authorization; `doctor` exits unsuccessfully until the required checks exist.
+
+An experimental library function can advance a branch in a trusted **local bare Git repository** using a reference transaction. It is not connected to the service or CLI, does not provide authorization, and is not GitHub landing. See the [protocol](docs/protocol.md) for its assumptions and limitations.
 
 ```sh
 cargo test
