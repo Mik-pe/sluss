@@ -377,6 +377,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_release_topology (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_release_topology_history (body TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, previous_body TEXT NOT NULL, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS ci_rerun_scan_cursor (id INTEGER PRIMARY KEY CHECK(id=1), after_rowid INTEGER NOT NULL CHECK(after_rowid>=0));
+            CREATE TABLE IF NOT EXISTS ci_rerun_scan_progress (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, completed_attempt INTEGER NOT NULL CHECK(completed_attempt BETWEEN 1 AND 100));
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
@@ -1649,6 +1651,122 @@ fn compatible_snapshot(
 }
 
 impl Scheduler {
+    /// Advance a durable round-robin cursor before network reads. A crash may
+    /// defer this item until the next sweep; no send or reservation is changed.
+    pub(crate) fn next_rerun_scan(&mut self) -> Result<Option<(String, u64, u32)>, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if config != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let (installation, repository): (i64, i64) = tx
+            .query_row(
+                "SELECT installation,repository FROM repository_binding WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(SchedulerError::StaleBatch)?;
+        if installation <= 0 || repository <= 0 {
+            return Err(SchedulerError::Corrupt);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO ci_rerun_scan_cursor(id,after_rowid) VALUES(1,0)",
+            [],
+        )?;
+        let after: i64 = tx.query_row(
+            "SELECT after_rowid FROM ci_rerun_scan_cursor WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let candidate: Option<(i64, String)> = tx.query_row(
+            "SELECT d.rowid,d.id FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id AND x.batch_id=d.id JOIN batches b ON b.id=x.batch_id JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id WHERE d.rowid>?1 AND d.state IN ('observed','finished') AND s.source='direct' AND d.run_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts c WHERE c.id=d.id) AND json_extract(d.plan,'$.installation_id')=?2 AND json_extract(d.plan,'$.repository_id')=?3 AND EXISTS(SELECT 1 FROM ci_job_metrics m WHERE m.repository_id=CAST(?3 AS TEXT) AND json_valid(m.body) AND json_extract(m.body,'$.batch_id')=d.id AND json_extract(m.body,'$.attempt')=1) ORDER BY d.rowid LIMIT 1",
+            params![after,installation,repository], |r| Ok((r.get(0)?,r.get(1)?))
+        ).optional()?;
+        let Some((rowid, id)) = candidate else {
+            tx.execute(
+                "UPDATE ci_rerun_scan_cursor SET after_rowid=0 WHERE id=1",
+                [],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        };
+        let (plan, run, _) = direct_metric_identity(&tx, &id)?;
+        if plan.installation_id != installation as u64 || plan.repository_id != repository as u64 {
+            return Err(SchedulerError::Corrupt);
+        }
+        let progress: Option<(String, u32)> = tx
+            .query_row(
+                "SELECT run_id,completed_attempt FROM ci_rerun_scan_progress WHERE id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let completed = match progress {
+            None => 1,
+            Some((saved, completed))
+                if saved == run.to_string() && (1..=100).contains(&completed) =>
+            {
+                completed
+            }
+            Some(_) => return Err(SchedulerError::Corrupt),
+        };
+        tx.execute(
+            "UPDATE ci_rerun_scan_cursor SET after_rowid=?1 WHERE id=1",
+            [rowid],
+        )?;
+        tx.commit()?;
+        Ok(Some((id, run, completed)))
+    }
+
+    /// Advance only a verified contiguous completed prefix. Competing observers
+    /// may report the same prefix; the transaction never moves it backwards.
+    pub(crate) fn advance_rerun_scan(
+        &mut self,
+        id: &str,
+        run: u64,
+        completed: u32,
+    ) -> Result<(), SchedulerError> {
+        if !(1..=100).contains(&completed) {
+            return Err(SchedulerError::Invalid);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if config != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let (_, current, _) = direct_metric_identity(&tx, id)?;
+        if current != run {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT run_id FROM ci_rerun_scan_progress WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing
+            .as_deref()
+            .is_some_and(|saved| saved != run.to_string())
+        {
+            return Err(SchedulerError::Corrupt);
+        }
+        tx.execute("INSERT INTO ci_rerun_scan_progress(id,run_id,completed_attempt) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET completed_attempt=MAX(completed_attempt,excluded.completed_attempt)", params![id,run.to_string(),completed])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Identify a directly acknowledged historical run. This does not read
     /// GitHub or prove that a rerun has completed.
     pub fn rerun_metric_run(&self, id: &str) -> Result<u64, SchedulerError> {
@@ -1705,9 +1823,10 @@ impl Scheduler {
         }
         let mut host: Option<(String, u64)> = None;
         {
-            let mut stmt = tx.prepare("SELECT body FROM ci_job_metrics WHERE repository_id=?1")?;
-            let rows =
-                stmt.query_map([plan.repository_id.to_string()], |r| r.get::<_, String>(0))?;
+            let mut stmt = tx.prepare("SELECT body FROM ci_job_metrics WHERE repository_id=?1 AND json_valid(body) AND json_extract(body,'$.batch_id')=?2 AND json_extract(body,'$.attempt')=1")?;
+            let rows = stmt.query_map(params![plan.repository_id.to_string(), id], |r| {
+                r.get::<_, String>(0)
+            })?;
             for row in rows {
                 let saved: JobMeasurement = serde_json::from_str(&row?)?;
                 if saved.batch_id != id || saved.run_id != expected_run || saved.attempt != 1 {
@@ -3360,4 +3479,134 @@ fn finish_bounded_reservation(
         [id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod rerun_scan_tests {
+    use super::{Capacity, DispatchPlan, Host, Scheduler};
+    use crate::{
+        batch::{Batch, Candidate, State},
+        metrics::JobMeasurement,
+        store::Store,
+        webhook::Inbox,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn cursor_is_bounded_resumable_and_progress_never_moves_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("queue.sqlite");
+        let mut store = Store::open(&db).unwrap();
+        let mut inbox = Inbox::open(&db).unwrap();
+        inbox
+            .record("initial", "pull_request", &[1; 32], 1, 2)
+            .unwrap();
+        let event = inbox.pending().unwrap().remove(0);
+        store
+            .apply_admission_reconciliation(&event, &"f".repeat(64), &[])
+            .unwrap();
+        let pools = BTreeMap::from([("rust".into(), 1)]);
+        let capacity = Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "host".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: BTreeSet::from([41]),
+                    pools,
+                },
+            )]),
+        };
+        let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for n in 1..=6u64 {
+            let id = format!("batch-{n:016x}");
+            let mut batch = Batch::new(
+                id.clone(),
+                "b".repeat(40),
+                vec![Candidate {
+                    number: n,
+                    head_sha: "c".repeat(40),
+                }],
+            )
+            .unwrap();
+            batch.state = State::CiComplete {
+                integration_sha: "a".repeat(40),
+                run_id: n,
+                conclusion: "success".into(),
+            };
+            let plan = DispatchPlan {
+                installation_id: 1,
+                repository_id: 2,
+                workflow_id: 3,
+                integration_sha: "a".repeat(40),
+                staging_ref: format!("refs/heads/sluss/{id}"),
+                policy_digest: "d".repeat(64),
+                required_jobs: BTreeSet::from(["test".into()]),
+                suites: BTreeSet::from(["full".into()]),
+                selection_policy_digest: None,
+            };
+            let metric = JobMeasurement {
+                repository_id: 2,
+                job_id: n,
+                run_id: n,
+                attempt: 1,
+                batch_id: id.clone(),
+                head_sha: "a".repeat(40),
+                name: "test".into(),
+                host: "host".into(),
+                runner_id: 41,
+                started_ms: 100,
+                completed_ms: 200,
+                conclusion: "success".into(),
+            };
+            conn.execute(
+                "INSERT INTO batches(id,version,body) VALUES(?1,0,?2)",
+                rusqlite::params![id, serde_json::to_string(&batch).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES(?1,?2,'finished',?3)",
+                rusqlite::params![id, serde_json::to_string(&plan).unwrap(), n.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dispatch_batches(id,batch_id) VALUES(?1,?1)",
+                [&id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dispatch_receipt_sources(id,source) VALUES(?1,?2)",
+                rusqlite::params![id, if n == 6 { "recovered" } else { "direct" }],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dispatch_workflows(id,path) VALUES(?1,'.github/workflows/ci.yml')",
+                [&id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ci_job_metrics(repository_id,job_id,body) VALUES('2',?1,?2)",
+                rusqlite::params![n.to_string(), serde_json::to_string(&metric).unwrap()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let first = scheduler.next_rerun_scan().unwrap().unwrap();
+        assert_eq!(first, ("batch-0000000000000001".into(), 1, 1));
+        scheduler.advance_rerun_scan(&first.0, first.1, 2).unwrap();
+        scheduler.advance_rerun_scan(&first.0, first.1, 1).unwrap();
+        assert!(scheduler.advance_rerun_scan(&first.0, 99, 3).is_err());
+        assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().1, 2);
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&db, capacity).unwrap();
+        for n in 3..=5 {
+            assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().1, n);
+        }
+        assert!(scheduler.next_rerun_scan().unwrap().is_none());
+        assert_eq!(
+            scheduler.next_rerun_scan().unwrap().unwrap(),
+            (first.0, 1, 2)
+        );
+    }
 }

@@ -1266,6 +1266,8 @@ pub struct RerunMetricsReport {
     pub completed_attempts: usize,
     pub pending_attempts: usize,
     pub new_jobs: usize,
+    /// Highest consecutive completed attempt observed in this pass.
+    pub contiguous_attempt: Option<u32>,
 }
 #[derive(Debug, Error)]
 pub enum RerunMetricsError {
@@ -1435,6 +1437,7 @@ impl App {
             completed_attempts: 0,
             pending_attempts: 0,
             new_jobs: 0,
+            contiguous_attempt: None,
         };
         if let Some(attempt) = attempt {
             if !(2..=100).contains(&attempt) {
@@ -1447,13 +1450,50 @@ impl App {
             result.completed_attempts = 1;
             return Ok(result);
         }
+        self.collect_rerun_metrics_since(scheduler, token, owner, repository, id, 1)
+            .await
+    }
+
+    /// Bounded incremental scan used by the periodic accounting worker.
+    pub(crate) async fn collect_rerun_metrics_since(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        after: u32,
+    ) -> Result<RerunMetricsReport, RerunMetricsError> {
+        if !(1..=100).contains(&after) {
+            return Err(RerunMetricsError::InvalidAttempt);
+        }
+        let (installation, repository_id, run_id) = scheduler.rerun_metric_scope(id)?;
+        if token.installation_id != installation || token.repository_id != repository_id {
+            return Err(GitHubError::InvalidConfiguration.into());
+        }
+        let mut result = RerunMetricsReport {
+            run_id,
+            latest_attempt: None,
+            completed_attempts: 0,
+            pending_attempts: 0,
+            new_jobs: 0,
+            contiguous_attempt: None,
+        };
         let first = self
             .observe_latest_actions_run(token, owner, repository, run_id)
             .await?;
         scheduler.validate_rerun_metric_run(id, &first)?;
+        if first.run_attempt < after {
+            return Err(GitHubError::UnstableObservation.into());
+        }
+        if after > 1 && first.run_attempt == after && first.status != "completed" {
+            return Err(GitHubError::UnstableObservation.into());
+        }
         result.latest_attempt = Some(first.run_attempt);
+        result.contiguous_attempt = Some(after);
         let mut seen_jobs = 0usize;
-        for attempt in 2..=first.run_attempt {
+        let mut gap = false;
+        for attempt in (after + 1)..=first.run_attempt {
             let snapshot = self
                 .observe_actions_attempt(token, owner, repository, run_id, attempt)
                 .await?;
@@ -1468,12 +1508,16 @@ impl App {
                 "completed" => {}
                 "queued" | "in_progress" | "waiting" | "requested" | "pending" => {
                     result.pending_attempts += 1;
+                    gap = true;
                     continue;
                 }
                 _ => return Err(GitHubError::UnstableObservation.into()),
             }
             result.new_jobs += scheduler.record_rerun_metrics(id, &snapshot)?;
             result.completed_attempts += 1;
+            if !gap {
+                result.contiguous_attempt = Some(attempt);
+            }
         }
         let last = self
             .observe_latest_actions_run(token, owner, repository, run_id)

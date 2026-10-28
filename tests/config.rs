@@ -119,6 +119,10 @@ fn invalid_worker_configuration_fails_before_creating_the_database() {
             .unwrap()
     };
     let cap = capacity.to_str().unwrap();
+    let missing = run(&["--observe-reruns"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--capacity"));
+    assert!(!db.exists());
     let flags = [
         "--auto-plan",
         "--auto-stage",
@@ -135,6 +139,9 @@ fn invalid_worker_configuration_fails_before_creating_the_database() {
         "rust=1",
     ];
     std::fs::write(&capacity, "not valid toml").unwrap();
+    let invalid_rerun = run(&["--observe-reruns", "--capacity", cap]);
+    assert!(!invalid_rerun.status.success());
+    assert!(!db.exists());
     let output = run(&flags);
     assert!(!output.status.success());
     assert!(

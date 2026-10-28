@@ -485,6 +485,124 @@ async fn observe_dispatches_inner(
     }
 }
 
+/// Observe a bounded page of historical reruns. The durable cursor cycles
+/// through known direct runs; accounting never changes CI or reservations.
+pub async fn observe_reruns_once(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+) -> Result<usize, String> {
+    observe_reruns_inner(app, db, capacity, policy)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn observe_reruns_inner(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+) -> Result<usize, ObservationPassError> {
+    use crate::{
+        github::{GitHubError, RerunMetricsError},
+        scheduler::SchedulerError,
+    };
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    observation_scope(&store, policy)?;
+    let mut scheduler =
+        crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
+    let mut token = None;
+    let mut recorded = 0usize;
+    for _ in 0..4 {
+        let Some((id, run, after)) = scheduler.next_rerun_scan().map_err(|e| e.to_string())? else {
+            break;
+        };
+        if token.is_none() {
+            token = Some(
+                app.read_token(policy.installation as u64, policy.repository as u64)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        match app
+            .collect_rerun_metrics_since(
+                &mut scheduler,
+                token.as_ref().expect("initialized"),
+                &policy.owner,
+                &policy.name,
+                &id,
+                after,
+            )
+            .await
+        {
+            Ok(report) => {
+                let completed = report
+                    .contiguous_attempt
+                    .ok_or("missing rerun scan progress")?;
+                scheduler
+                    .advance_rerun_scan(&id, run, completed)
+                    .map_err(|e| e.to_string())?;
+                recorded = recorded
+                    .checked_add(report.new_jobs)
+                    .ok_or("rerun metric count overflow")?;
+            }
+            Err(
+                error @ (RerunMetricsError::GitHub(
+                    GitHubError::Status(404) | GitHubError::UnstableObservation,
+                )
+                | RerunMetricsError::Scheduler(
+                    SchedulerError::DispatchTransition
+                    | SchedulerError::DispatchReceiptConflict
+                    | SchedulerError::Metrics(_),
+                )
+                | RerunMetricsError::Limit),
+            ) => {
+                eprintln!("rerun accounting skipped batch {id}: {error}");
+            }
+            Err(error) => return Err(error.to_string().into()),
+        }
+    }
+    Ok(recorded)
+}
+
+/// Periodic, bounded accounting only. Lost hints and restarts are handled by
+/// the durable cursor and repeated provider reads, not by retrying writes.
+pub async fn supervise_rerun_observation(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(60));
+    let mut delay = minimum;
+    loop {
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
+        match observe_reruns_inner(&app, &db, &capacity, &policy).await {
+            Ok(count) => {
+                if count > 0 {
+                    eprintln!("recorded {count} rerun job measurements");
+                }
+                delay = minimum;
+            }
+            Err(ObservationPassError::Unbound) => {
+                delay = minimum;
+                sleep(poll.max(Duration::from_secs(1))).await;
+                continue;
+            }
+            Err(ObservationPassError::Other(error)) => {
+                eprintln!("rerun observation failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
 /// Poll conservatively; an observation never releases its reservation.
 pub async fn supervise_dispatch_observation(
     app: Arc<App>,

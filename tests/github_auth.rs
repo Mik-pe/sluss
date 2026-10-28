@@ -4169,6 +4169,127 @@ async fn cli_dispatches_fixture() {
     sluss::worker::observe_dispatches_once(&fixture_app, &hidden_db, &one_host, &fixture_policy)
         .await
         .unwrap();
+    // The periodic worker must resume its durable scan and count an attempt
+    // only once, including when the first observation finds it still running.
+    let rerun_db = data.path().join("automatic-rerun.sqlite");
+    hidden_conn
+        .execute("VACUUM INTO ?1", [rerun_db.to_str().unwrap()])
+        .unwrap();
+    mode.store(250, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::observe_reruns_once(&fixture_app, &rerun_db, &one_host, &fixture_policy)
+            .await
+            .unwrap(),
+        0
+    );
+    let rerun_conn = rusqlite::Connection::open(&rerun_db).unwrap();
+    let saved: u32 = rerun_conn
+        .query_row(
+            "SELECT completed_attempt FROM ci_rerun_scan_progress WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, 1);
+    assert_eq!(
+        Store::open(&rerun_db)
+            .unwrap()
+            .metrics()
+            .unwrap()
+            .rerun_jobs,
+        0
+    );
+    // Simulate a crash after metric insertion but before its scan checkpoint.
+    let crash_db = data.path().join("rerun-crash.sqlite");
+    rerun_conn
+        .execute("VACUUM INTO ?1", [crash_db.to_str().unwrap()])
+        .unwrap();
+    mode.store(21, Ordering::SeqCst);
+    let mut before_crash = sluss::scheduler::Scheduler::open(&crash_db, one_host.clone()).unwrap();
+    let result = fixture_app
+        .collect_rerun_metrics(
+            &mut before_crash,
+            &fixture_token,
+            "owner",
+            "repo",
+            id,
+            Some(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.new_jobs, 1);
+    drop(before_crash);
+    assert_eq!(
+        sluss::worker::observe_reruns_once(&fixture_app, &crash_db, &one_host, &fixture_policy)
+            .await
+            .unwrap(),
+        0
+    );
+    let crash_conn = rusqlite::Connection::open(&crash_db).unwrap();
+    let checkpoint: u32 = crash_conn
+        .query_row(
+            "SELECT completed_attempt FROM ci_rerun_scan_progress WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint, 2);
+    assert_eq!(
+        Store::open(&crash_db)
+            .unwrap()
+            .metrics()
+            .unwrap()
+            .rerun_jobs,
+        1
+    );
+    drop(crash_conn);
+    mode.store(21, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::observe_reruns_once(&fixture_app, &rerun_db, &one_host, &fixture_policy)
+            .await
+            .unwrap(),
+        1
+    );
+    let saved: u32 = rerun_conn
+        .query_row(
+            "SELECT completed_attempt FROM ci_rerun_scan_progress WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, 2);
+    drop(rerun_conn);
+    assert_eq!(
+        Store::open(&rerun_db)
+            .unwrap()
+            .metrics()
+            .unwrap()
+            .rerun_jobs,
+        1
+    );
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::observe_reruns_once(&fixture_app, &rerun_db, &one_host, &fixture_policy)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        4,
+        "a checkpoint should avoid re-reading completed attempts"
+    );
+    let mut wrong_policy = fixture_policy.clone();
+    wrong_policy.repository = 8;
+    assert!(
+        sluss::worker::observe_reruns_once(&fixture_app, &rerun_db, &one_host, &wrong_policy)
+            .await
+            .is_err()
+    );
+    mode.store(67, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
     let collected = {
         let hidden_db = hidden_db.clone();
         let config = config.clone();

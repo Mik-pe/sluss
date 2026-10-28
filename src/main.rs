@@ -59,6 +59,9 @@ enum Command {
         /// Observe known workflow runs periodically.
         #[arg(long, requires_all = ["config", "capacity"])]
         observe_dispatches: bool,
+        /// Periodically collect rerun metrics for known direct dispatches.
+        #[arg(long, requires_all = ["config", "capacity"])]
+        observe_reruns: bool,
         /// Complete observed CI-only batches without releasing their reservations.
         #[arg(long, requires = "observe_dispatches")]
         complete_ci_only: bool,
@@ -1001,6 +1004,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_stale,
         cancel_stale_checks,
         observe_dispatches,
+        observe_reruns,
         complete_ci_only,
         bisect_ci_failures,
         release_ci_only,
@@ -1027,19 +1031,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = &verification_policy {
             sluss::selective::Policy::load(path)?;
         }
-        let capacity_config =
-            if auto_dispatch || cancel_stale || observe_dispatches || release_ci_only {
-                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
-                sluss::scheduler::validate_capacity(&capacity)
+        let capacity_config = if auto_dispatch
+            || cancel_stale
+            || observe_dispatches
+            || observe_reruns
+            || release_ci_only
+        {
+            let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+            sluss::scheduler::validate_capacity(&capacity).map_err(|error| error.to_string())?;
+            if release_ci_only {
+                sluss::verification::check_release_topology(&capacity)
                     .map_err(|error| error.to_string())?;
-                if release_ci_only {
-                    sluss::verification::check_release_topology(&capacity)
-                        .map_err(|error| error.to_string())?;
-                }
-                Some(capacity)
-            } else {
-                None
-            };
+            }
+            Some(capacity)
+        } else {
+            None
+        };
         let dispatch_settings = if auto_dispatch {
             let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
             let workflow_id = workflow_id.ok_or("workflow ID is required")?;
@@ -1184,6 +1191,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     policy.clone(),
                     poll,
                     release_wakeup.clone(),
+                ));
+            }
+            if observe_reruns {
+                let capacity = capacity_config
+                    .as_ref()
+                    .expect("preflight capacity")
+                    .clone();
+                eprintln!("automatic rerun accounting enabled; this does not authorize landing");
+                tokio::spawn(sluss::worker::supervise_rerun_observation(
+                    app.clone(),
+                    cli.db.clone(),
+                    capacity,
+                    policy.clone(),
+                    poll,
                 ));
             }
             if observe_dispatches {
@@ -3025,7 +3046,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Metrics => {
             let metrics = store.metrics()?;
             println!(
-                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nobserved rerun jobs: {}\nobserved rerun runner-minutes: {:.2}\nOnly jobs recorded by Sluss are included; reruns must be collected explicitly and PR delivery is not measured.",
+                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nobserved rerun jobs: {}\nobserved rerun runner-minutes: {:.2}\nOnly jobs recorded by Sluss are included; rerun accounting is opt-in and PR delivery is not measured.",
                 metrics.completed_jobs,
                 metrics.runner_milliseconds as f64 / 60_000.0,
                 metrics.rerun_jobs,
