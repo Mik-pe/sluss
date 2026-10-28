@@ -70,7 +70,7 @@ impl Policy {
         let mut hash = sha2::Sha256::new();
         // Bump the domain when selection semantics change so old frozen
         // decisions cannot be dispatched under a newly parsed policy.
-        hash.update(b"sluss-selective-policy-v2\0");
+        hash.update(b"sluss-selective-policy-v3\0");
         hash.update(bytes);
         Ok(hex::encode(hash.finalize()))
     }
@@ -132,8 +132,12 @@ impl Policy {
         head: &str,
     ) -> Result<Selection, SelectionError> {
         self.validate()?;
-        match changed_paths(repo, base, head) {
-            Ok(changes) => self.select(&changes),
+        match git_changes(repo, base, head) {
+            Ok(changes) if changes.special_files => Ok(Selection::Full {
+                suites: self.full_suites.iter().cloned().collect(),
+                reason: "changed symbolic link or submodule".into(),
+            }),
+            Ok(changes) => self.select(&changes.paths),
             Err(SelectionError::ChangeList) => Ok(Selection::Full {
                 suites: self.full_suites.iter().cloned().collect(),
                 reason: "change list could not be classified".into(),
@@ -242,10 +246,17 @@ fn matches_rule(rule: &str, path: &str) -> bool {
     }
 }
 fn critical_path(path: &str) -> bool {
-    path.starts_with(".github/")
+    path == ".github"
+        || path.starts_with(".github/")
         || matches!(
             path,
-            ".gitmodules" | ".gitattributes" | "sluss.toml" | "Cargo.toml" | "Cargo.lock"
+            ".gitmodules"
+                | ".gitattributes"
+                | "sluss.toml"
+                | "Cargo.toml"
+                | "Cargo.lock"
+                | "CODEOWNERS"
+                | "docs/CODEOWNERS"
         )
         || path.ends_with("/Cargo.toml")
         || path.ends_with("/Cargo.lock")
@@ -291,6 +302,15 @@ fn selection_git(
 /// List additions and deletions separately so renames classify both paths.
 /// Both objects must be commits and the base must be an ancestor of the head.
 pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>, SelectionError> {
+    Ok(git_changes(repo, base, head)?.paths)
+}
+
+struct GitChanges {
+    paths: Vec<String>,
+    special_files: bool,
+}
+
+fn git_changes(repo: &Path, base: &str, head: &str) -> Result<GitChanges, SelectionError> {
     let valid_sha = |sha: &str| {
         sha.len() == 40
             && sha
@@ -321,7 +341,8 @@ pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>,
         "--no-textconv",
         "--no-renames",
         "--ignore-submodules=none",
-        "--name-only",
+        "--raw",
+        "--no-abbrev",
         "-z",
         base,
         head,
@@ -333,20 +354,50 @@ pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>,
     }
     let output = output.stdout;
     if output.is_empty() {
-        return Ok(Vec::new());
+        return Ok(GitChanges {
+            paths: Vec::new(),
+            special_files: false,
+        });
     }
     if !output.ends_with(&[0]) {
         return Err(SelectionError::ChangeList);
     }
     let mut paths = Vec::new();
-    for name in output[..output.len() - 1].split(|b| *b == 0) {
+    let mut special_files = false;
+    let mut fields = output[..output.len() - 1].split(|b| *b == 0);
+    while let Some(header) = fields.next() {
+        let header = std::str::from_utf8(header).map_err(|_| SelectionError::ChangeList)?;
+        let mut parts = header
+            .strip_prefix(':')
+            .ok_or(SelectionError::ChangeList)?
+            .split(' ');
+        let old_mode = parts.next().ok_or(SelectionError::ChangeList)?;
+        let new_mode = parts.next().ok_or(SelectionError::ChangeList)?;
+        let old_sha = parts.next().ok_or(SelectionError::ChangeList)?;
+        let new_sha = parts.next().ok_or(SelectionError::ChangeList)?;
+        let status = parts.next().ok_or(SelectionError::ChangeList)?;
+        if parts.next().is_some()
+            || !["000000", "100644", "100755", "120000", "160000"].contains(&old_mode)
+            || !["000000", "100644", "100755", "120000", "160000"].contains(&new_mode)
+            || !valid_sha(old_sha)
+            || !valid_sha(new_sha)
+            || !matches!(status, "A" | "D" | "M" | "T")
+        {
+            return Err(SelectionError::ChangeList);
+        }
+        special_files |=
+            matches!(old_mode, "120000" | "160000") || matches!(new_mode, "120000" | "160000");
+        let path = fields.next().ok_or(SelectionError::ChangeList)?;
         paths.push(
-            std::str::from_utf8(name)
+            std::str::from_utf8(path)
                 .map_err(|_| SelectionError::ChangeList)?
                 .to_owned(),
         );
     }
-    Ok(paths)
+    Ok(GitChanges {
+        paths,
+        special_files,
+    })
 }
 
 #[cfg(all(test, unix))]

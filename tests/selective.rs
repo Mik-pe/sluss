@@ -73,9 +73,28 @@ fn changed_selection_semantics_invalidate_previous_policy_digests() {
     use sha2::{Digest, Sha256};
     let policy = sample_policy();
     let mut old = Sha256::new();
-    old.update(b"sluss-selective-policy-v1\0");
+    old.update(b"sluss-selective-policy-v2\0");
     old.update(serde_json::to_vec(&policy).unwrap());
     assert_ne!(policy.digest().unwrap(), hex::encode(old.finalize()));
+}
+
+#[test]
+fn review_policy_paths_require_full_verification_even_when_classified() {
+    let mut policy = sample_policy();
+    policy.components[0].paths.extend([
+        "CODEOWNERS".into(),
+        "docs/CODEOWNERS".into(),
+        ".github".into(),
+    ]);
+    for path in ["CODEOWNERS", "docs/CODEOWNERS", ".github"] {
+        assert!(
+            matches!(
+                policy.select(&[path.into()]).unwrap(),
+                Selection::Full { .. }
+            ),
+            "{path}"
+        );
+    }
 }
 
 #[test]
@@ -156,6 +175,61 @@ fn git(repo: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+#[test]
+fn git_selection_uses_full_suites_for_link_and_submodule_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("crates/core/src")).unwrap();
+    std::fs::write(repo.join("crates/core/src/base.rs"), "base\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "base"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
+    let policy = sample_policy();
+    std::fs::write(repo.join("link-target"), "../../api/src").unwrap();
+    let blob = git(repo, &["hash-object", "-w", "link-target"]);
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{blob},crates/core/src/link"),
+        ],
+    );
+    git(repo, &["commit", "-m", "add link"]);
+    let link = git(repo, &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        policy.select_git(repo, &base, &link).unwrap(),
+        Selection::Full { .. }
+    ));
+    git(
+        repo,
+        &["update-index", "--force-remove", "crates/core/src/link"],
+    );
+    git(repo, &["commit", "-m", "remove link"]);
+    let removed = git(repo, &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        policy.select_git(repo, &link, &removed).unwrap(),
+        Selection::Full { .. }
+    ));
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{base},crates/core/dependency"),
+        ],
+    );
+    git(repo, &["commit", "-m", "add submodule"]);
+    let module = git(repo, &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        policy.select_git(repo, &removed, &module).unwrap(),
+        Selection::Full { .. }
+    ));
 }
 #[test]
 fn git_diff_and_cli_classify_both_sides_of_a_rename() {
@@ -276,6 +350,6 @@ fn submodule_changes_cannot_be_hidden_by_local_diff_configuration() {
         vec!["crates/api/vendor"]
     );
     assert!(
-        matches!(sample_policy().select_git(parent.path(), &base, &head).unwrap(), Selection::Selected { suites, .. } if suites == names(&["api-tests", "ui-tests"]))
+        matches!(sample_policy().select_git(parent.path(), &base, &head).unwrap(), Selection::Full { suites, .. } if suites == names(&["core-tests", "api-tests", "ui-tests"]))
     );
 }
