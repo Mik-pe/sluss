@@ -238,6 +238,23 @@ async fn actions_jobs(
     let jobs: Vec<Value> = (0..count).map(|n| json!({"id":if separate_host { 124 } else { (page-1)*100+n+1 },"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103 | 129) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":if separate_host { 2 } else { 1 }})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
+async fn rerun_run(headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    Json(
+        json!({"id":123,"run_attempt":2,"workflow_id":17,"head_sha":"a".repeat(40),"head_branch":"sluss/batch-0123456789abcdef","path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":"workflow_dispatch","status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":7}}),
+    )
+}
+async fn rerun_jobs(
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query.get("per_page").map(String::as_str), Some("100"));
+    Json(
+        json!({"total_count":1,"jobs":[{"id":101,"run_id":123,"head_sha":"a".repeat(40),"name":"job-1-0","status":"completed","conclusion":"success","started_at":"2026-01-01T00:02:00Z","completed_at":"2026-01-01T00:04:00Z","runner_id":1}]}),
+    )
+}
+
 async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let node = if state.mode.load(Ordering::SeqCst) == 63 {
@@ -3726,6 +3743,14 @@ async fn cli_dispatches_fixture() {
             "/repos/owner/repo/actions/workflows/17/dispatches",
             post(dispatch_post),
         )
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/2",
+            get(rerun_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/2/jobs",
+            get(rerun_jobs),
+        )
         .route("/repos/owner/repo/actions/runs/123", get(dispatched_run))
         .route("/repos/owner/repo/actions/runs/124", get(dispatched_run))
         .route(
@@ -4141,6 +4166,47 @@ async fn cli_dispatches_fixture() {
     sluss::worker::observe_dispatches_once(&fixture_app, &hidden_db, &one_host, &fixture_policy)
         .await
         .unwrap();
+    let collected = {
+        let hidden_db = hidden_db.clone();
+        let config = config.clone();
+        let capacity = capacity.clone();
+        let key = key_dir.path().join("test-key.pem");
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_sluss"))
+                .arg("--db")
+                .arg(&hidden_db)
+                .args([
+                    "collect-rerun-metrics",
+                    "--batch-id",
+                    id,
+                    "--attempt",
+                    "2",
+                    "--config",
+                ])
+                .arg(&config)
+                .arg("--capacity")
+                .arg(&capacity)
+                .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    };
+    assert!(
+        collected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&collected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&collected.stdout)
+            .contains("recorded 1 new completed job measurements")
+    );
+    let rerun_totals = Store::open(&hidden_db).unwrap().metrics().unwrap();
+    assert_eq!(
+        (rerun_totals.rerun_jobs, rerun_totals.rerun_milliseconds),
+        (1, 120_000)
+    );
     let mut hidden_journal = sluss::landing::LandingJournal::open(&hidden_db).unwrap();
     assert!(matches!(
         hidden_journal.prepare_observed_batch("hidden-land", id, "R_repo"),

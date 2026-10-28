@@ -1649,6 +1649,151 @@ fn compatible_snapshot(
 }
 
 impl Scheduler {
+    /// Identify a directly acknowledged historical run. This does not read
+    /// GitHub or prove that a rerun has completed.
+    pub fn rerun_metric_run(&self, id: &str) -> Result<u64, SchedulerError> {
+        let (_, run, _) = direct_metric_identity(&self.conn, id)?;
+        Ok(run)
+    }
+
+    /// Record a completed rerun only when the first attempt anchored a host.
+    /// Callers must obtain an authenticated, consistent provider snapshot.
+    /// This is accounting only and cannot change CI evidence or capacity.
+    pub fn record_rerun_metrics(
+        &mut self,
+        id: &str,
+        snapshot: &crate::github::ActionsSnapshot,
+    ) -> Result<usize, SchedulerError> {
+        use crate::{
+            metrics::{JobMeasurement, MetricsError},
+            verification::{Placement, check_host_placement},
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if config != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let (plan, expected_run, workflow) = direct_metric_identity(&tx, id)?;
+        let run = &snapshot.run;
+        let branch = plan
+            .staging_ref
+            .strip_prefix("refs/heads/")
+            .ok_or(SchedulerError::Invalid)?;
+        if run.id != expected_run
+            || !(2..=100).contains(&run.run_attempt)
+            || run.workflow_id != plan.workflow_id
+            || run.repository.id != plan.repository_id
+            || run.head_repository.as_ref().map(|r| r.id) != Some(plan.repository_id)
+            || run.head_sha != plan.integration_sha
+            || run.head_branch.as_deref() != Some(branch)
+            || run.event != "workflow_dispatch"
+            || run.status != "completed"
+            || run.conclusion.as_deref().is_none_or(str::is_empty)
+            || !crate::github::workflow_path_matches(
+                &workflow,
+                &run.path,
+                &plan.staging_ref,
+                &plan.integration_sha,
+            )
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let mut host: Option<(String, u64)> = None;
+        {
+            let mut stmt = tx.prepare("SELECT body FROM ci_job_metrics WHERE repository_id=?1")?;
+            let rows =
+                stmt.query_map([plan.repository_id.to_string()], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let saved: JobMeasurement = serde_json::from_str(&row?)?;
+                if saved.batch_id != id || saved.run_id != expected_run || saved.attempt != 1 {
+                    continue;
+                }
+                if saved.repository_id != plan.repository_id
+                    || saved.head_sha != plan.integration_sha
+                    || saved.runner_id == 0
+                {
+                    return Err(SchedulerError::Corrupt);
+                }
+                let identity = (saved.host, saved.runner_id);
+                if host.as_ref().is_some_and(|previous| previous != &identity) {
+                    return Err(SchedulerError::Corrupt);
+                }
+                host = Some(identity);
+            }
+        }
+        let (host, original_runner) = host.ok_or(SchedulerError::DispatchTransition)?;
+        let host_config = self
+            .capacity
+            .hosts
+            .get(&host)
+            .ok_or(SchedulerError::Corrupt)?;
+        if !host_config.runner_ids.contains(&original_runner) {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let placement = check_host_placement(snapshot, &host_config.runner_ids)
+            .map_err(|_| MetricsError::InvalidJob)?;
+        let mut ids = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        if snapshot.jobs.iter().any(|job| {
+            job.id == 0
+                || job.run_id != run.id
+                || job.head_sha != run.head_sha
+                || job.name.is_empty()
+                || !ids.insert(job.id)
+                || !names.insert(&job.name)
+                || job.status != "completed"
+                || job.conclusion.as_deref().is_none_or(str::is_empty)
+        }) {
+            return Err(MetricsError::InvalidJob.into());
+        }
+        let runner_id = match placement {
+            Placement::Waiting => return Ok(0),
+            Placement::Confirmed { runner_id } => runner_id,
+        };
+        let mut inserted = 0;
+        for job in &snapshot.jobs {
+            if job.conclusion.as_deref() == Some("skipped") {
+                continue;
+            }
+            if job.runner_id != Some(runner_id) {
+                return Err(MetricsError::InvalidJob.into());
+            }
+            let start = crate::metrics::timestamp_ms(
+                job.started_at.as_deref().ok_or(MetricsError::InvalidJob)?,
+            )?;
+            let end = crate::metrics::timestamp_ms(
+                job.completed_at
+                    .as_deref()
+                    .ok_or(MetricsError::InvalidJob)?,
+            )?;
+            if end < start {
+                return Err(MetricsError::InvalidJob.into());
+            }
+            let measurement = JobMeasurement {
+                repository_id: plan.repository_id,
+                job_id: job.id,
+                run_id: run.id,
+                attempt: run.run_attempt,
+                batch_id: id.into(),
+                head_sha: run.head_sha.clone(),
+                name: job.name.clone(),
+                host: host.clone(),
+                runner_id,
+                started_ms: start,
+                completed_ms: end,
+                conclusion: job.conclusion.clone().ok_or(MetricsError::InvalidJob)?,
+            };
+            inserted += usize::from(crate::metrics::insert(&tx, &measurement)?);
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Record completed, host-checked job timings from a provider observation.
     /// This is accounting data only, not CI attestation or permission to land.
     pub fn record_job_metrics(
@@ -1774,6 +1919,42 @@ impl Scheduler {
         tx.commit()?;
         Ok(inserted)
     }
+}
+
+fn direct_metric_identity(
+    conn: &Connection,
+    id: &str,
+) -> Result<(DispatchPlan, u64, String), SchedulerError> {
+    type Row = (String, String, Option<String>, String, String);
+    let row: Option<Row> = conn.query_row(
+        "SELECT d.plan,d.state,d.run_id,s.source,w.path FROM dispatch_intents d JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id WHERE d.id=?1",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).optional()?;
+    let (body, state, run, source, workflow) = row.ok_or(SchedulerError::DispatchTransition)?;
+    let conflicted: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if conflicted {
+        return Err(SchedulerError::DispatchReceiptConflict);
+    }
+    let plan: DispatchPlan = serde_json::from_str(&body)?;
+    let run = run
+        .and_then(|s| {
+            s.parse::<u64>()
+                .ok()
+                .filter(|v| *v != 0 && v.to_string() == s)
+        })
+        .ok_or(SchedulerError::Corrupt)?;
+    if !plan.valid()
+        || source != "direct"
+        || !matches!(state.as_str(), "observed" | "finished")
+        || !crate::integration::valid_policy_path(&workflow)
+    {
+        return Err(SchedulerError::DispatchTransition);
+    }
+    Ok((plan, run, workflow))
 }
 
 /// Persisted provider-shaped observations, not authenticated attestation or

@@ -368,6 +368,17 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Record measured jobs from a specific completed rerun of a known dispatch.
+    CollectRerunMetrics {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        attempt: u32,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Publish a failure-only check for an observed failed staging run.
     ReportFailedCheck {
         #[arg(long)]
@@ -582,6 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Command::DispatchGithub { .. }
             | Command::RecoverDispatch { .. }
             | Command::ObserveDispatch { .. }
+            | Command::CollectRerunMetrics { .. }
             | Command::ReportFailedCheck { .. }
             | Command::RecoverFailedCheck { .. }
             | Command::CancelStale { .. }
@@ -2162,6 +2174,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("receipt source: {source}");
             println!("observation does not authorize landing or release reserved capacity");
         }
+        Command::CollectRerunMetrics {
+            batch_id,
+            attempt,
+            config,
+            capacity,
+        } => {
+            if !(2..=100).contains(&attempt) {
+                return Err("attempt must be between 2 and 100".into());
+            }
+            let config = sluss::config::Config::load(&config)?;
+            if store.repository_scope()?
+                != (
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+            {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let run_id = scheduler.rerun_metric_run(&batch_id)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = new_cli_app(
+                config.github.app_client_id,
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let token = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let snapshot = app
+                .observe_actions_attempt(
+                    &token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    run_id,
+                    attempt,
+                )
+                .await?;
+            let recorded = scheduler.record_rerun_metrics(&batch_id, &snapshot)?;
+            println!(
+                "recorded {recorded} new completed job measurements for run {run_id} attempt {attempt}"
+            );
+            println!(
+                "Accounting only: this does not attest CI, authorize landing or release capacity."
+            );
+        }
         Command::ReportFailedCheck {
             batch_id,
             config,
@@ -2943,9 +3006,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Metrics => {
             let metrics = store.metrics()?;
             println!(
-                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nOnly completed jobs recorded by Sluss are included; PR delivery and reruns are not yet measured.",
+                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nobserved rerun jobs: {}\nobserved rerun runner-minutes: {:.2}\nOnly jobs recorded by Sluss are included; reruns must be collected explicitly and PR delivery is not measured.",
                 metrics.completed_jobs,
-                metrics.runner_milliseconds as f64 / 60_000.0
+                metrics.runner_milliseconds as f64 / 60_000.0,
+                metrics.rerun_jobs,
+                metrics.rerun_milliseconds as f64 / 60_000.0
             );
             for (pool, wait) in metrics.capacity_waits {
                 println!(

@@ -518,3 +518,127 @@ fn dispatch_overview_shows_uncertain_and_orphaned_work_without_writing() {
         .unwrap();
     assert_eq!(schema_before, schema_after);
 }
+
+#[test]
+fn rerun_metrics_use_direct_run_and_original_host_even_after_release() {
+    use sluss::{
+        github::{ActionsJob, ActionsRepository, ActionsRun, ActionsSnapshot},
+        store::Store,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rerun.sqlite");
+    let mut configured = capacity();
+    configured
+        .hosts
+        .get_mut("mac")
+        .unwrap()
+        .runner_ids
+        .insert(41);
+    let mut scheduler = Scheduler::open(&db, configured).unwrap();
+    scheduler
+        .reserve_dispatch("job", &request(&[("macos", 1)]), &dispatch_plan())
+        .unwrap()
+        .unwrap();
+    scheduler.claim_dispatch("job").unwrap();
+    scheduler.record_receipt("job", 50).unwrap();
+    scheduler.observe_dispatch("job", 50).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO dispatch_workflows(id,path) VALUES('job','.github/workflows/ci.yml')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let mut snapshot = ActionsSnapshot {
+        run: ActionsRun {
+            id: 50,
+            run_attempt: 1,
+            workflow_id: 3,
+            head_sha: "a".repeat(40),
+            head_branch: Some("sluss/batch-0123456789abcdef".into()),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 99,
+            run_id: 50,
+            head_sha: "a".repeat(40),
+            name: "tests".into(),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            started_at: Some("2026-01-01T00:00:30Z".into()),
+            completed_at: Some("2026-01-01T00:02:00Z".into()),
+            runner_id: Some(41),
+        }],
+    };
+    assert_eq!(scheduler.record_job_metrics("job", &snapshot).unwrap(), 1);
+    scheduler.finish_dispatch("job", 50).unwrap();
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity_with_runner()).unwrap();
+    assert_eq!(scheduler.rerun_metric_run("job").unwrap(), 50);
+    snapshot.run.run_attempt = 2;
+    snapshot.run.conclusion = Some("success".into());
+    snapshot.jobs[0].id = 100;
+    snapshot.jobs[0].conclusion = Some("success".into());
+    snapshot.jobs[0].started_at = Some("2026-01-01T00:03:00Z".into());
+    snapshot.jobs[0].completed_at = Some("2026-01-01T00:05:00Z".into());
+    snapshot.jobs[0].runner_id = Some(42);
+    assert!(scheduler.record_rerun_metrics("job", &snapshot).is_err());
+    snapshot.jobs[0].runner_id = Some(41);
+    snapshot.run.path = ".github/workflows/other.yml".into();
+    assert!(scheduler.record_rerun_metrics("job", &snapshot).is_err());
+    snapshot.run.path = ".github/workflows/ci.yml".into();
+    snapshot.run.status = "in_progress".into();
+    assert!(scheduler.record_rerun_metrics("job", &snapshot).is_err());
+    snapshot.run.status = "completed".into();
+    snapshot.jobs[0].status = "in_progress".into();
+    assert!(scheduler.record_rerun_metrics("job", &snapshot).is_err());
+    snapshot.jobs[0].status = "completed".into();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE dispatch_receipt_sources SET source='recovered' WHERE id='job'",
+        [],
+    )
+    .unwrap();
+    assert!(scheduler.rerun_metric_run("job").is_err());
+    assert!(scheduler.record_rerun_metrics("job", &snapshot).is_err());
+    conn.execute(
+        "UPDATE dispatch_receipt_sources SET source='direct' WHERE id='job'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(scheduler.record_rerun_metrics("job", &snapshot).unwrap(), 1);
+    assert_eq!(scheduler.record_rerun_metrics("job", &snapshot).unwrap(), 0);
+    snapshot.jobs[0].completed_at = Some("2026-01-01T00:06:00Z".into());
+    assert!(scheduler.record_rerun_metrics("job", &snapshot).is_err());
+    let totals = Store::open(&db).unwrap().metrics().unwrap();
+    assert_eq!(
+        (totals.completed_jobs, totals.runner_milliseconds),
+        (2, 210_000)
+    );
+    assert_eq!((totals.rerun_jobs, totals.rerun_milliseconds), (1, 120_000));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .args(["--db", db.to_str().unwrap(), "metrics"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("observed rerun jobs: 1"));
+    assert!(text.contains("observed rerun runner-minutes: 2.00"));
+}
+
+fn capacity_with_runner() -> Capacity {
+    let mut configured = capacity();
+    configured
+        .hosts
+        .get_mut("mac")
+        .unwrap()
+        .runner_ids
+        .insert(41);
+    configured
+}

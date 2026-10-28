@@ -36,6 +36,8 @@ pub(crate) struct JobMeasurement {
 pub struct Summary {
     pub completed_jobs: u64,
     pub runner_milliseconds: u64,
+    pub rerun_jobs: u64,
+    pub rerun_milliseconds: u64,
     /// Completed observed scheduling-delay intervals, grouped by requested pool.
     pub capacity_waits: BTreeMap<String, CapacityWaitSummary>,
 }
@@ -147,6 +149,8 @@ pub(crate) fn summarize(conn: &Connection) -> Result<Summary, MetricsError> {
     let mut rows = stmt.query([])?;
     let mut count = 0u64;
     let mut milliseconds = 0u64;
+    let mut rerun_jobs = 0u64;
+    let mut rerun_milliseconds = 0u64;
     while let Some(row) = rows.next()? {
         let measurement: JobMeasurement = serde_json::from_str(&row.get::<_, String>(0)?)?;
         let duration = measurement
@@ -158,6 +162,12 @@ pub(crate) fn summarize(conn: &Connection) -> Result<Summary, MetricsError> {
             .checked_add(duration as u64)
             .ok_or(MetricsError::Overflow)?;
         count = count.checked_add(1).ok_or(MetricsError::Overflow)?;
+        if measurement.attempt > 1 {
+            rerun_jobs = rerun_jobs.checked_add(1).ok_or(MetricsError::Overflow)?;
+            rerun_milliseconds = rerun_milliseconds
+                .checked_add(duration as u64)
+                .ok_or(MetricsError::Overflow)?;
+        }
     }
     let mut capacity_waits: BTreeMap<String, CapacityWaitSummary> = BTreeMap::new();
     let mut stmt = conn.prepare(
@@ -187,6 +197,8 @@ pub(crate) fn summarize(conn: &Connection) -> Result<Summary, MetricsError> {
     Ok(Summary {
         completed_jobs: count,
         runner_milliseconds: milliseconds,
+        rerun_jobs,
+        rerun_milliseconds,
         capacity_waits,
     })
 }
