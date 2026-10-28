@@ -1,6 +1,6 @@
 # Security
 
-Sluss must fail closed. The early core is not an authorization service and does not modify GitHub. Do not install it with branch bypass privileges or use its current states as merge evidence.
+Sluss must fail closed. The early core is not an authorization service. Explicit experimental commands can create staging refs and dispatch workflows, but cannot update the target branch. Do not install it with branch bypass privileges or use its current states as merge evidence.
 
 The GitHub App's credentials, webhook secret, signing keys and any release secrets must not be accessible to code running in PR CI jobs. Persistent self-hosted runners can be compromised by untrusted workloads; deployment must use an isolation and cleanup strategy appropriate to the trust level of the code.
 
@@ -8,7 +8,7 @@ Required design work includes authenticating webhook payloads before persistence
 
 Webhook intake verifies HMAC over the raw payload and deduplicates normal GitHub redelivery IDs. GitHub's signature covers the body, not delivery or event headers, so an intercepted valid body and signature can be replayed with a different ID; deduplication alone is not cryptographic replay protection. Treat all events as hints and reconcile current state, use HTTPS at a trusted proxy, and do not expose the webhook secret or captured signed payloads. The experimental worker retries pending work and periodically rescans; provider-level recovery is not yet validated.
 
-The App authentication helper requests read-only access to one repository, rejects unexpectedly broad returned permissions or repository scope, and does not follow HTTP redirects. Its token issuance has only been tested against a local stub, not a GitHub App installation. The caller must verify that an installation and repository are authorized before requesting a token; an untrusted webhook is not sufficient authorization.
+The App authentication helper issues separate repository-scoped tokens for observation, runner inventory, staging, and workflow dispatch. It rejects unexpectedly broad returned permissions or repository scope and does not follow HTTP redirects. Its token issuance has only been tested against a local stub, not a GitHub App installation. The caller must verify that an installation and repository are authorized before requesting a token; an untrusted webhook is not sufficient authorization.
 
 PR observations fetch all review pages and compare repeated reads. A separate helper checks reviewer identities and effective repository permissions twice, then rereads the PR. GitHub does not expose an atomic snapshot across PRs, reviews, permissions and policy; agreement between reads is not proof that the result stays current. Branch policy, related PRs and code-owner requirements still need to be checked; observations alone cannot admit or land a change.
 
@@ -17,3 +17,5 @@ The CI-planning admission evaluator accepts an explicit list of currently author
 Reconciliation persists an entire repo's queue observations and acknowledges the triggering revision in a single SQLite transaction. A newer event rejects the transaction. The database binds to the App identity, API origin, installation, repository and policy digest; a change is rejected pending a safe policy migration. No production scheduler consumes these observations. Keep configuration outside PR-controlled paths and restart the service after changing it.
 
 No operation may silently fall back from exact-commit strict landing to squash or a different commit. If provider guarantees, evidence, policy identity, or update outcome are uncertain, stop and reconcile rather than land.
+
+`doctor --config ... --capacity ... --workflow-id ...` performs read-only provider observations and checks token issuance, but still exits unsuccessfully. GitHub branch/rules observations do not prove bypass restrictions or race-free authorization; repository runner inventory excludes organization and enterprise runners. Workflow contents, runner isolation, trusted evidence and exact-commit landing remain unverified.

@@ -115,8 +115,15 @@ enum Command {
     Pause,
     /// Clear the local pause flag.
     Resume,
-    /// Explain which prerequisites are not yet implemented.
-    Doctor,
+    /// Inspect GitHub prerequisites without enabling landing.
+    Doctor {
+        #[arg(long, requires_all = ["capacity", "workflow_id"])]
+        config: Option<PathBuf>,
+        #[arg(long, requires_all = ["config", "workflow_id"])]
+        capacity: Option<PathBuf>,
+        #[arg(long, requires_all = ["config", "capacity"])]
+        workflow_id: Option<u64>,
+    },
 }
 
 #[derive(Args)]
@@ -217,9 +224,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    if matches!(cli.command, Command::Doctor) {
+    if let Command::Doctor {
+        config,
+        capacity,
+        workflow_id,
+    } = &cli.command
+    {
+        if let (Some(config), Some(capacity), Some(workflow_id)) = (config, capacity, workflow_id) {
+            let config = sluss::config::Config::load(config)?;
+            let capacity = load_capacity(capacity)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app =
+                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let installation = config.github.installation_id as u64;
+            let repository_id = config.github.repository_id as u64;
+            let read = app.read_token(installation, repository_id).await?;
+            let inventory_token = app
+                .runner_inventory_token(installation, repository_id)
+                .await?;
+            let preflight = app
+                .inspect_repository(
+                    &read,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &config.queue.target,
+                    *workflow_id,
+                )
+                .await?;
+            println!(
+                "repository: {}/{} (ID {})",
+                config.github.owner, config.github.repository, repository_id
+            );
+            println!(
+                "target: {} at {} (GitHub protected: {})",
+                preflight.branch.name, preflight.branch.commit.sha, preflight.branch.protected
+            );
+            println!("active branch rules returned: {}", preflight.rules.len());
+            println!(
+                "workflow: {} ({}, {})",
+                preflight.workflow.id, preflight.workflow.path, preflight.workflow.state
+            );
+            let runners = app
+                .observe_repository_runners(
+                    &inventory_token,
+                    &config.github.owner,
+                    &config.github.repository,
+                )
+                .await?;
+            sluss::verification::check_repository_runner_inventory(&capacity, &runners)?;
+            println!(
+                "repository runner inventory matches configured hosts: {} runners",
+                runners.len()
+            );
+            let _staging = app.staging_token(installation, repository_id).await?;
+            let _dispatch = app.dispatch_token(installation, repository_id).await?;
+            println!("repository-scoped read, staging and Actions credentials were issued");
+            if preflight.workflow.state != "active" {
+                eprintln!("workflow is not active");
+            }
+        } else {
+            eprintln!("To inspect GitHub, supply --config, --capacity and --workflow-id.");
+        }
         eprintln!(
-            "NOT READY: live GitHub permissions, branch rules, CI attestation and strict landing are not verified."
+            "NOT READY: workflow trust, full runner scope, bypass policy, attestation and strict landing are not verified."
         );
         std::process::exit(1);
     }
@@ -499,7 +568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.set_paused(false)?;
             println!("resumed (CI dispatch and landing are unavailable)");
         }
-        Command::Doctor => unreachable!(),
+        Command::Doctor { .. } => unreachable!(),
     }
     Ok(())
 }

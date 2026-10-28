@@ -159,6 +159,28 @@ async fn dispatched_run(
         json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
 }
+async fn doctor_branch(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let sha = if state.mode.load(Ordering::SeqCst) == 30 && count > 0 {
+        "c"
+    } else {
+        "b"
+    };
+    Json(json!({"name":"main","protected":true,"commit":{"sha":sha.repeat(40)}}))
+}
+async fn doctor_workflow(headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    Json(json!({"id":17,"path":".github/workflows/ci.yml","state":"active"}))
+}
+async fn doctor_rules(
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query["page"], "1");
+    Json(json!([{"type":"pull_request","ruleset_id":10}]))
+}
 async fn repository_runners(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1080,6 +1102,12 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo", get(dispatch_repo))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
+        .route("/repos/owner/repo/branches/main", get(doctor_branch))
+        .route(
+            "/repos/owner/repo/actions/workflows/17",
+            get(doctor_workflow),
+        )
+        .route("/repos/owner/repo/rules/branches/main", get(doctor_rules))
         .route(
             "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
             get(dispatch_ref),
@@ -1270,6 +1298,41 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("already claimed"));
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let doctor = launch(vec![
+        "doctor".into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--workflow-id".into(),
+        "17".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(!doctor.status.success());
+    let info = String::from_utf8_lossy(&doctor.stdout);
+    assert!(info.contains("target: main"));
+    assert!(info.contains("active branch rules returned: 1"));
+    assert!(info.contains("repository runner inventory matches configured hosts: 1 runners"));
+    assert!(info.contains("repository-scoped read, staging and Actions credentials were issued"));
+    assert!(String::from_utf8_lossy(&doctor.stderr).contains("NOT READY"));
+    assert!(!info.contains("fake-installation-token"));
+    reads.store(0, Ordering::SeqCst);
+    mode.store(30, Ordering::SeqCst);
+    let unstable_doctor = launch(vec![
+        "doctor".into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--workflow-id".into(),
+        "17".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(!unstable_doctor.status.success());
+    assert!(String::from_utf8_lossy(&unstable_doctor.stderr).contains("UnstableObservation"));
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     server.abort();
 }

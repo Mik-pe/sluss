@@ -1064,3 +1064,120 @@ impl App {
         Err(GitHubError::UnstableObservation)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub protected: bool,
+    pub commit: BranchCommit,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BranchCommit {
+    pub sha: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WorkflowInfo {
+    pub id: u64,
+    pub path: String,
+    pub state: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryPreflight {
+    pub branch: BranchInfo,
+    pub workflow: WorkflowInfo,
+    /// Active rules returned by GitHub, not a complete bypass-policy proof.
+    pub rules: Vec<serde_json::Value>,
+}
+impl App {
+    /// Inspect current branch, workflow registration and active branch rules.
+    /// Agreement across reads is an observation, not a landing authorization.
+    pub async fn inspect_repository(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+        workflow_id: u64,
+    ) -> Result<RepositoryPreflight, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) || workflow_id == 0 {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let branch_segment =
+            encoded_branch_segment(branch).ok_or(GitHubError::InvalidConfiguration)?;
+        let root = format!("repos/{owner}/{repository}");
+        let repo: Repository = self.get_json(token, &root, None).await?;
+        if repo.id != token.repository_id {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let branch_path = format!("{root}/branches/{branch_segment}");
+        let workflow_path = format!("{root}/actions/workflows/{workflow_id}");
+        let rules_path = format!("{root}/rules/branches/{branch_segment}");
+        let branch1: BranchInfo = self.get_json(token, &branch_path, None).await?;
+        let workflow1: WorkflowInfo = self.get_json(token, &workflow_path, None).await?;
+        let rules1 = self.fetch_branch_rules(token, &rules_path).await?;
+        let branch2: BranchInfo = self.get_json(token, &branch_path, None).await?;
+        let workflow2: WorkflowInfo = self.get_json(token, &workflow_path, None).await?;
+        let rules2 = self.fetch_branch_rules(token, &rules_path).await?;
+        if branch1 != branch2
+            || workflow1 != workflow2
+            || rules1 != rules2
+            || branch2.name != branch
+            || !commit_sha(&branch2.commit.sha)
+            || workflow2.id != workflow_id
+            || !workflow2.path.starts_with(".github/workflows/")
+            || workflow2.path.is_empty()
+            || workflow2.state.is_empty()
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(RepositoryPreflight {
+            branch: branch2,
+            workflow: workflow2,
+            rules: rules2,
+        })
+    }
+    async fn fetch_branch_rules(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+    ) -> Result<Vec<serde_json::Value>, GitHubError> {
+        let mut rules = Vec::new();
+        for page in 1..=100u32 {
+            let rows: Vec<serde_json::Value> = self.get_json(token, path, Some(page)).await?;
+            if rows.len() > 100
+                || rows.iter().any(|r| {
+                    r.get("type")
+                        .and_then(|x| x.as_str())
+                        .is_none_or(str::is_empty)
+                })
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let done = rows.len() < 100;
+            rules.extend(rows);
+            if done {
+                return Ok(rules);
+            }
+        }
+        Err(GitHubError::UnstableObservation)
+    }
+}
+fn encoded_branch_segment(branch: &str) -> Option<String> {
+    if branch.is_empty()
+        || branch.len() > 255
+        || branch == "@"
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || !branch
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        || branch
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse("https://example.invalid/").ok()?;
+    url.path_segments_mut().ok()?.push(branch);
+    Some(url.path().trim_start_matches('/').to_string())
+}

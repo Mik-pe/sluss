@@ -18,6 +18,8 @@ cargo run -- resume
 cargo run -- doctor
 ```
 
+`sluss doctor --config /path/to/sluss.toml --capacity /path/to/capacity.toml --workflow-id <id>` inspects the configured branch, active rules, workflow registration, repository runner inventory and App token scopes. It still exits unsuccessfully because those observations do not establish all prerequisites for strict landing. It has only been tested with a local GitHub stub.
+
 To try webhook intake locally, set `SLUSS_WEBHOOK_SECRET` in the environment and run `cargo run -- serve`. It listens on `127.0.0.1:8080` by default; `--listen` changes the address. External traffic requires a trusted HTTPS reverse proxy. Without configuration, this only records deliveries.
 
 To enable the experimental observer, copy [examples/sluss.toml](examples/sluss.toml) to an operator-controlled location, set `SLUSS_WEBHOOK_SECRET` and `SLUSS_GITHUB_PRIVATE_KEY_PATH`, then run `cargo run -- serve --config /path/to/sluss.toml`. Startup and periodic scans recover missed notifications, and failed work remains queued for retry. Only the configured repository is processed. This path has only been tested with a local GitHub stub; do not deploy this preview as a production GitHub App.
