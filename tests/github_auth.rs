@@ -190,6 +190,11 @@ async fn dispatched_run(
         1
     };
     let workflow_id = if mode == 23 { 18 } else { 17 };
+    let workflow_path = if mode == 51 {
+        ".github/workflows/other.yml@refs/heads/sluss/batch-0123456789abcdef"
+    } else {
+        ".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef"
+    };
     let sha = if mode == 22 && count >= 3 { "b" } else { "a" };
     let status = if mode == 31 {
         "in_progress"
@@ -206,7 +211,7 @@ async fn dispatched_run(
         Some("success")
     };
     Json(
-        json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
+        json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":workflow_path,"event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
 }
 async fn cancel_run(State(state): State<ServerState>, headers: HeaderMap) -> StatusCode {
@@ -1999,6 +2004,26 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let observer_capacity: sluss::scheduler::Capacity =
         toml::from_str(&std::fs::read_to_string(&capacity).unwrap()).unwrap();
     let observer_policy = sluss::config::Config::load(&config).unwrap().policy();
+    mode.store(51, Ordering::SeqCst);
+    assert!(
+        sluss::worker::observe_dispatches_once(
+            &observer_app,
+            &db,
+            &observer_capacity,
+            &observer_policy
+        )
+        .await
+        .is_err()
+    );
+    let frozen = sluss::scheduler::Scheduler::open(&db, observer_capacity.clone()).unwrap();
+    assert_eq!(
+        frozen.dispatch_workflow(id).unwrap().as_deref(),
+        Some(".github/workflows/ci.yml")
+    );
+    assert!(matches!(
+        frozen.pending_dispatches().unwrap()[0].state,
+        sluss::scheduler::DispatchState::Accepted { run_id: 123 }
+    ));
     mode.store(23, Ordering::SeqCst);
     assert!(
         sluss::worker::observe_dispatches_once(

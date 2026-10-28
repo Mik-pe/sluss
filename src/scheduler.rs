@@ -92,6 +92,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS stale_cancellations (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL);")?;
@@ -561,24 +562,43 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Recheck a registered workflow against the exact file list bound when
-    /// staging. This is policy coverage, not proof that the workflow is trusted.
-    pub fn validate_dispatch_workflow(
+    /// Observe the file identity frozen with a batch dispatch, if one exists.
+    /// Absence identifies an older or generic dispatch, not trusted evidence.
+    pub fn dispatch_workflow(&self, id: &str) -> Result<Option<String>, SchedulerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path FROM dispatch_workflows WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Claim a batch dispatch and freeze its registered workflow in the same
+    /// transaction as the policy, queue, and prepared-state checks. Provider
+    /// observations and workflow contents are not authenticated here.
+    pub fn claim_batch_dispatch(
         &mut self,
         id: &str,
         workflow_path: &str,
-    ) -> Result<(), SchedulerError> {
-        if !crate::integration::valid_policy_path(workflow_path) {
+    ) -> Result<bool, SchedulerError> {
+        if !crate::github::valid_workflow_path(workflow_path) {
             return Err(SchedulerError::WorkflowPolicyMismatch);
         }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(String,String)> = tx.query_row(
-            "SELECT b.batch_id,d.plan FROM dispatch_batches b JOIN dispatch_intents d ON d.id=b.id WHERE b.id=?1 AND d.state='prepared'",
-            [id], |r| Ok((r.get(0)?,r.get(1)?)),
+        let row: Option<(String,String,String)> = tx.query_row(
+            "SELECT b.batch_id,d.plan,d.state FROM dispatch_batches b JOIN dispatch_intents d ON d.id=b.id WHERE b.id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         ).optional()?;
-        let (batch, body) = row.ok_or(SchedulerError::StaleBatch)?;
+        let Some((batch, body, state)) = row else {
+            return Ok(false);
+        };
+        if state != "prepared" {
+            return Ok(false);
+        }
         let plan: DispatchPlan = serde_json::from_str(&body)?;
         validate_batch_dispatch(&tx, &batch, &plan)?;
         let paths: Option<String> = tx
@@ -595,38 +615,44 @@ impl Scheduler {
         if !paths.iter().any(|path| path == workflow_path) {
             return Err(SchedulerError::WorkflowPolicyMismatch);
         }
+        tx.execute(
+            "INSERT INTO dispatch_workflows(id,path) VALUES(?1,?2)",
+            params![id, workflow_path],
+        )?;
+        let claimed = tx.execute(
+            "UPDATE dispatch_intents SET state='sending' WHERE id=?1 AND state='prepared'",
+            [id],
+        )? == 1;
+        if !claimed {
+            return Err(SchedulerError::DispatchTransition);
+        }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Only the worker that changes Prepared to Sending may issue the request.
-    /// Sending is deliberately not retried after a crash or ambiguous response.
+    /// Claim only an unbound dispatch. Batch-bound requests must use
+    /// `claim_batch_dispatch` so the workflow identity is persisted.
     pub fn claim_dispatch(&mut self, id: &str) -> Result<bool, SchedulerError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let intent: Option<(String, String)> = tx
+        let state: Option<String> = tx
             .query_row(
-                "SELECT state,plan FROM dispatch_intents WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((state, plan)) = intent else {
-            return Ok(false);
-        };
-        if state != "prepared" {
-            return Ok(false);
-        }
-        let batch_id: Option<String> = tx
-            .query_row(
-                "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+                "SELECT state FROM dispatch_intents WHERE id=?1",
                 [id],
                 |r| r.get(0),
             )
             .optional()?;
-        if let Some(batch_id) = batch_id {
-            validate_batch_dispatch(&tx, &batch_id, &serde_json::from_str(&plan)?)?;
+        if state.as_deref() != Some("prepared") {
+            return Ok(false);
+        }
+        let batch: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_batches WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if batch {
+            return Err(SchedulerError::WorkflowPolicyMismatch);
         }
         let claimed = tx.execute(
             "UPDATE dispatch_intents SET state='sending' WHERE id=?1 AND state='prepared'",
@@ -966,6 +992,19 @@ impl Scheduler {
         let (body, state, run_id, host) = row.ok_or(SchedulerError::DispatchTransition)?;
         let plan: DispatchPlan = serde_json::from_str(&body)?;
         let run = &snapshot.run;
+        let workflow_path: Option<String> = tx
+            .query_row(
+                "SELECT path FROM dispatch_workflows WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if workflow_path
+            .as_deref()
+            .is_some_and(|path| !crate::github::workflow_path_matches(path, &run.path))
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
         let branch = plan
             .staging_ref
             .strip_prefix("refs/heads/")
@@ -1048,6 +1087,8 @@ impl Scheduler {
 struct StoredCiObservation {
     run_id: u64,
     plan: DispatchPlan,
+    #[serde(default)]
+    workflow_path: Option<String>,
     observation: crate::verification::CiObservation,
 }
 impl Scheduler {
@@ -1085,6 +1126,19 @@ impl Scheduler {
             return Err(SchedulerError::DispatchTransition);
         }
         validate_batch_dispatch(&tx, &batch_id, &plan)?;
+        let workflow_path: Option<String> = tx
+            .query_row(
+                "SELECT path FROM dispatch_workflows WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if workflow_path
+            .as_deref()
+            .is_some_and(|path| !crate::github::workflow_path_matches(path, &snapshot.run.path))
+        {
+            return Err(CiObservationError::Identity.into());
+        }
         let observation = observe_ci(&plan, run_id, snapshot)?;
         let host_config = self
             .capacity
@@ -1102,6 +1156,7 @@ impl Scheduler {
         let record = StoredCiObservation {
             run_id,
             plan,
+            workflow_path,
             observation: observation.clone(),
         };
         let existing: Option<String> = tx
@@ -1291,10 +1346,18 @@ impl Scheduler {
                 |r| r.get(0),
             )
             .optional()?;
+        let workflow_path: Option<String> = tx
+            .query_row(
+                "SELECT path FROM dispatch_workflows WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
         if state != "observed"
             || source.as_deref() != Some("direct")
             || observation.run_id != run_id
             || observation.plan != plan
+            || observation.workflow_path != workflow_path
         {
             return Err(SchedulerError::DispatchTransition);
         }
@@ -1426,7 +1489,48 @@ fn investigate_ci_batch(
             )?;
             plans.push(serde_json::from_str::<DispatchPlan>(&body)?);
         }
-        let comparable = plans[0].installation_id == plans[1].installation_id
+        let paths: Vec<Option<String>> = observed
+            .iter()
+            .map(|(child, _)| {
+                tx.query_row(
+                    "SELECT path FROM dispatch_workflows WHERE id=?1",
+                    [&child.id],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .collect::<Result<_, _>>()?;
+        let parent_path: Option<String> = tx
+            .query_row(
+                "SELECT path FROM dispatch_workflows WHERE id=?1",
+                [&parent],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let parent_plan: Option<String> = tx
+            .query_row(
+                "SELECT plan FROM dispatch_intents WHERE id=?1",
+                [&parent],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let parent_plan: Option<DispatchPlan> = parent_plan
+            .map(|body| serde_json::from_str(&body))
+            .transpose()?;
+        // Children always use the full suite, so the parent's suite subset can
+        // differ. Their workflow and other policy identities must still match.
+        let comparable = paths[0].is_some()
+            && paths[0] == paths[1]
+            && parent_path == paths[0]
+            && parent_plan.as_ref().is_some_and(|plan| {
+                plan.installation_id == plans[0].installation_id
+                    && plan.repository_id == plans[0].repository_id
+                    && plan.workflow_id == plans[0].workflow_id
+                    && plan.policy_digest == plans[0].policy_digest
+                    && plan.required_jobs == plans[0].required_jobs
+                    && plan.selection_policy_digest == plans[0].selection_policy_digest
+            })
+            && plans[0].installation_id == plans[1].installation_id
             && plans[0].repository_id == plans[1].repository_id
             && plans[0].workflow_id == plans[1].workflow_id
             && plans[0].policy_digest == plans[1].policy_digest
@@ -1462,6 +1566,14 @@ fn investigate_ci_batch(
     } else if matches!(&batch.state, State::CiComplete { conclusion, .. } if conclusion == "failure")
         && batch.candidates.len() > 1
     {
+        let bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_workflows WHERE id=?1)",
+            [&batch.id],
+            |r| r.get(0),
+        )?;
+        if !bound {
+            return Ok(());
+        }
         crate::store::enqueue_bisection(tx, batch)?;
         tx.execute(
             "INSERT OR IGNORE INTO ci_investigations(batch_id,state) VALUES(?1,'pending')",

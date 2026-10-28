@@ -301,7 +301,7 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
     );
     store.set_paused(true).unwrap();
     assert!(matches!(
-        scheduler.claim_dispatch(id),
+        scheduler.claim_batch_dispatch(id, ".github/workflows/ci.yml"),
         Err(SchedulerError::StaleBatch)
     ));
     store.set_paused(false).unwrap();
@@ -310,7 +310,7 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
         .record("review-changed", "pull_request_review", &[9; 32], 1, 2)
         .unwrap();
     assert!(matches!(
-        scheduler.claim_dispatch(id),
+        scheduler.claim_batch_dispatch(id, ".github/workflows/ci.yml"),
         Err(SchedulerError::StaleBatch)
     ));
     let event = inbox.pending().unwrap().remove(0);
@@ -320,12 +320,16 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
         .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
         .unwrap();
     assert!(matches!(
-        scheduler.claim_dispatch(id),
+        scheduler.claim_batch_dispatch(id, ".github/workflows/ci.yml"),
         Err(SchedulerError::StaleBatch)
     ));
     assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 1);
     assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 0);
-    assert!(!scheduler.claim_dispatch(id).unwrap());
+    assert!(
+        !scheduler
+            .claim_batch_dispatch(id, ".github/workflows/ci.yml")
+            .unwrap()
+    );
     assert!(!scheduler.cancel_prepared(id).unwrap());
     assert!(scheduler.pending_dispatches().unwrap().is_empty());
     assert!(scheduler.reserve("next", &req).unwrap().is_some());
@@ -560,7 +564,7 @@ fn changing_target_base_invalidates_dispatch_and_stale_splits_atomically() {
         State::Invalidated { .. }
     ));
     assert!(matches!(
-        scheduler.claim_dispatch(id),
+        scheduler.claim_batch_dispatch(id, ".github/workflows/ci.yml"),
         Err(SchedulerError::StaleBatch)
     ));
     assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 1);
@@ -838,6 +842,9 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
         .plan_batch(id, &"a".repeat(40), 1, 1)
         .unwrap()
         .unwrap();
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
     store.start_integration(id).unwrap();
     store
         .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
@@ -870,7 +877,9 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
         .reserve_batch_dispatch(id, &Request { pools }, &plan)
         .unwrap()
         .unwrap();
-    scheduler.claim_dispatch(id).unwrap();
+    scheduler
+        .claim_batch_dispatch(id, ".github/workflows/ci.yml")
+        .unwrap();
     scheduler.record_receipt(id, 9).unwrap();
     scheduler.observe_dispatch(id, 9).unwrap();
     let mut snapshot = ActionsSnapshot {
@@ -899,6 +908,14 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
             runner_id: Some(7),
         }],
     };
+    let mut wrong_workflow = snapshot.clone();
+    wrong_workflow.run.path = ".github/workflows/other.yml@refs/heads/sluss/example".into();
+    assert!(matches!(
+        scheduler.record_ci_observation(id, &wrong_workflow),
+        Err(SchedulerError::CiObservation(
+            sluss::verification::CiObservationError::Identity
+        ))
+    ));
     assert_eq!(
         scheduler.record_ci_observation(id, &snapshot).unwrap(),
         CiObservation::Successful
@@ -1292,7 +1309,7 @@ fn workflow_policy_paths_must_have_been_frozen_before_staging() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        scheduler.validate_dispatch_workflow(id, ".github/workflows/ci.yml"),
+        scheduler.claim_batch_dispatch(id, ".github/workflows/ci.yml"),
         Err(SchedulerError::WorkflowPolicyMismatch)
     ));
     assert!(scheduler.cancel_prepared(id).unwrap());
@@ -1323,11 +1340,21 @@ fn workflow_policy_paths_must_have_been_frozen_before_staging() {
         .reserve_batch_dispatch(next, &request, &plan(next))
         .unwrap()
         .unwrap();
-    scheduler
-        .validate_dispatch_workflow(next, ".github/workflows/ci.yml")
-        .unwrap();
     assert!(matches!(
-        scheduler.validate_dispatch_workflow(next, ".github/workflows/other.yml"),
+        scheduler.claim_dispatch(next),
         Err(SchedulerError::WorkflowPolicyMismatch)
     ));
+    assert!(matches!(
+        scheduler.claim_batch_dispatch(next, ".github/workflows/other.yml"),
+        Err(SchedulerError::WorkflowPolicyMismatch)
+    ));
+    assert!(
+        scheduler
+            .claim_batch_dispatch(next, ".github/workflows/ci.yml")
+            .unwrap()
+    );
+    assert_eq!(
+        scheduler.dispatch_workflow(next).unwrap().as_deref(),
+        Some(".github/workflows/ci.yml")
+    );
 }

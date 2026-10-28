@@ -867,13 +867,15 @@ impl App {
                 return Err(DispatchError::StaleBase);
             }
         }
-        if target_base.is_some() {
+        let claimed = if target_base.is_some() {
             let workflow = self
                 .observe_registered_workflow(token, owner, repository, pending.plan.workflow_id)
                 .await?;
-            scheduler.validate_dispatch_workflow(id, &workflow.path)?;
-        }
-        if !scheduler.claim_dispatch(id)? {
+            scheduler.claim_batch_dispatch(id, &workflow.path)?
+        } else {
+            scheduler.claim_dispatch(id)?
+        };
+        if !claimed {
             return Err(DispatchError::AlreadyClaimed);
         }
         let path = format!(
@@ -948,6 +950,13 @@ impl App {
         let snapshot = self
             .verify_dispatch_run(token, owner, repository, &pending, run_id)
             .await?;
+        if scheduler
+            .dispatch_workflow(id)?
+            .as_deref()
+            .is_some_and(|path| !workflow_path_matches(path, &snapshot.run.path))
+        {
+            return Err(DispatchError::RunMismatch);
+        }
         scheduler.observe_dispatch(id, run_id)?;
         Ok(snapshot)
     }
@@ -981,6 +990,13 @@ impl App {
         let snapshot = self
             .verify_dispatch_run(token, owner, repository, &pending, run_id)
             .await?;
+        if scheduler
+            .dispatch_workflow(id)?
+            .as_deref()
+            .is_some_and(|path| !workflow_path_matches(path, &snapshot.run.path))
+        {
+            return Err(DispatchError::RunMismatch);
+        }
         scheduler.observe_dispatch(id, run_id)?;
         Ok(snapshot)
     }
@@ -1230,6 +1246,23 @@ pub struct BranchInfo {
 pub struct BranchCommit {
     pub sha: String,
 }
+pub(crate) fn valid_workflow_path(path: &str) -> bool {
+    let filename = path.strip_prefix(".github/workflows/");
+    crate::integration::valid_policy_path(path)
+        && filename.is_some_and(|name| {
+            !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"))
+        })
+}
+
+/// GitHub may append an @ref to the workflow path in a run response. The
+/// SHA, repository and head branch are checked separately by the caller.
+pub(crate) fn workflow_path_matches(expected: &str, reported: &str) -> bool {
+    match reported.split_once('@') {
+        Some((path, reference)) => path == expected && !reference.is_empty(),
+        None => reported == expected,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WorkflowInfo {
     pub id: u64,
@@ -1283,14 +1316,10 @@ impl App {
         let path = format!("repos/{owner}/{repository}/actions/workflows/{workflow_id}");
         let first: WorkflowInfo = self.get_json(token, &path, None).await?;
         let last: WorkflowInfo = self.get_json(token, &path, None).await?;
-        let filename = last.path.strip_prefix(".github/workflows/");
         if first != last
             || last.id != workflow_id
             || last.state != "active"
-            || !crate::integration::valid_policy_path(&last.path)
-            || filename.is_none_or(|name| {
-                name.contains('/') || !(name.ends_with(".yml") || name.ends_with(".yaml"))
-            })
+            || !valid_workflow_path(&last.path)
         {
             return Err(GitHubError::UnstableObservation);
         }
@@ -1426,7 +1455,11 @@ impl App {
             .staging_ref
             .strip_prefix("refs/heads/")
             .ok_or(DispatchError::Invalid)?;
-        if run.id != stale.run_id
+        if scheduler
+            .dispatch_workflow(id)?
+            .as_deref()
+            .is_some_and(|path| !workflow_path_matches(path, &run.path))
+            || run.id != stale.run_id
             || run.run_attempt == 0
             || run.repository.id != stale.plan.repository_id
             || run.head_repository.as_ref().map(|r| r.id) != Some(stale.plan.repository_id)

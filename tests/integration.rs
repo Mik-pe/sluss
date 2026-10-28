@@ -553,7 +553,7 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
         .record("new-review", "pull_request_review", &[2; 32], 1, 2)
         .unwrap();
     assert!(matches!(
-        scheduler.claim_dispatch(id),
+        scheduler.claim_batch_dispatch(id, ".github/workflows/ci.yml"),
         Err(SchedulerError::StaleBatch)
     ));
     assert!(prepare_local(&mut store, id, source.path(), remote.path(), &paths).is_err());

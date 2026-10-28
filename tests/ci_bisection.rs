@@ -84,7 +84,39 @@ fn finish_selected(
     conclusion: &str,
     suite: Option<&str>,
 ) {
+    finish_with_workflow(
+        store,
+        scheduler,
+        batch,
+        run_id,
+        conclusion,
+        suite,
+        ".github/workflows/ci.yml",
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_with_workflow(
+    store: &mut Store,
+    scheduler: &mut Scheduler,
+    batch: &sluss::batch::Batch,
+    run_id: u64,
+    conclusion: &str,
+    suite: Option<&str>,
+    workflow: &str,
+    legacy_db: Option<&std::path::Path>,
+) {
     let id = &batch.id;
+    store
+        .bind_policy_paths(
+            id,
+            &[
+                ".github/workflows/ci.yml".into(),
+                ".github/workflows/other.yml".into(),
+            ],
+        )
+        .unwrap();
     store.start_integration(id).unwrap();
     store
         .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
@@ -126,7 +158,12 @@ fn finish_selected(
         )
         .unwrap()
         .unwrap();
-    assert!(scheduler.claim_dispatch(id).unwrap());
+    assert!(scheduler.claim_batch_dispatch(id, workflow).unwrap());
+    if let Some(db) = legacy_db {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute("DELETE FROM dispatch_workflows WHERE id=?1", [id])
+            .unwrap();
+    }
     scheduler.record_receipt(id, run_id).unwrap();
     scheduler.observe_dispatch(id, run_id).unwrap();
     let snapshot = ActionsSnapshot {
@@ -136,7 +173,7 @@ fn finish_selected(
             workflow_id: 3,
             head_sha: "b".repeat(40),
             head_branch: Some(format!("sluss/{id}")),
-            path: ".github/workflows/ci.yml".into(),
+            path: workflow.into(),
             event: "workflow_dispatch".into(),
             status: "completed".into(),
             conclusion: Some(conclusion.into()),
@@ -860,4 +897,167 @@ fn migration_handles_an_unbound_legacy_manual_selection() {
     store
         .bind_staging_selection(&next.id, Some(&"e".repeat(64)))
         .unwrap();
+}
+
+#[test]
+fn ci_investigation_requires_comparable_frozen_workflow_paths() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    finish(&mut store, &mut scheduler, &left, 2, "failure");
+    let right = plan(&mut store, 3).unwrap();
+    finish_with_workflow(
+        &mut store,
+        &mut scheduler,
+        &right,
+        3,
+        "success",
+        None,
+        ".github/workflows/other.yml",
+        None,
+    );
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "inconclusive".into()))
+    );
+    assert!(plan(&mut store, 4).is_none());
+}
+
+#[test]
+fn matching_children_with_a_different_parent_workflow_are_inconclusive() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    finish_with_workflow(
+        &mut store,
+        &mut scheduler,
+        &left,
+        2,
+        "failure",
+        None,
+        ".github/workflows/other.yml",
+        None,
+    );
+    let right = plan(&mut store, 3).unwrap();
+    finish_with_workflow(
+        &mut store,
+        &mut scheduler,
+        &right,
+        3,
+        "success",
+        None,
+        ".github/workflows/other.yml",
+        None,
+    );
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "inconclusive".into()))
+    );
+    assert!(plan(&mut store, 4).is_none());
+}
+
+#[test]
+fn legacy_run_without_a_workflow_binding_remains_observable_but_is_not_bisected() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_with_workflow(
+        &mut store,
+        &mut scheduler,
+        &root,
+        1,
+        "failure",
+        None,
+        ".github/workflows/ci.yml",
+        Some(&dir.path().join("queue.sqlite")),
+    );
+    assert!(store.ci_investigations().unwrap().is_empty());
+    assert!(plan(&mut store, 2).is_none());
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::CiComplete { .. }
+    ));
+}
+
+#[test]
+fn competing_batch_claims_atomically_freeze_one_workflow_across_restart() {
+    use std::sync::{Arc, Barrier};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    store
+        .bind_policy_paths(&root.id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(&root.id).unwrap();
+    store
+        .finish_integration(&root.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{}", root.id),
+        policy_digest: "c".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    let request = Request {
+        pools: [("rust".into(), 1)].into(),
+    };
+    scheduler
+        .reserve_batch_dispatch(&root.id, &request, &plan)
+        .unwrap()
+        .unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let capacity = Capacity {
+        pools: pools.clone(),
+        hosts: BTreeMap::from([(
+            "sluss-host-test".into(),
+            Host {
+                slots: 1,
+                runner_ids: BTreeSet::from([7]),
+                pools,
+            },
+        )]),
+    };
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let db = db.clone();
+            let capacity = capacity.clone();
+            let barrier = barrier.clone();
+            let id = root.id.clone();
+            std::thread::spawn(move || {
+                let mut scheduler = Scheduler::open(db, capacity).unwrap();
+                barrier.wait();
+                scheduler
+                    .claim_batch_dispatch(&id, ".github/workflows/ci.yml")
+                    .unwrap()
+            })
+        })
+        .collect();
+    assert_eq!(
+        handles
+            .into_iter()
+            .map(|handle| usize::from(handle.join().unwrap()))
+            .sum::<usize>(),
+        1
+    );
+    drop(scheduler);
+    let scheduler = Scheduler::open(&db, capacity).unwrap();
+    assert_eq!(
+        scheduler.dispatch_workflow(&root.id).unwrap().as_deref(),
+        Some(".github/workflows/ci.yml")
+    );
+    assert!(matches!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        sluss::scheduler::DispatchState::Sending
+    ));
 }
