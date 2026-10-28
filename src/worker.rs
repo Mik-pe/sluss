@@ -174,3 +174,108 @@ pub async fn supervise_stale_cancellation(
         sleep(delay).await;
     }
 }
+
+/// Observe known dispatch receipts without starting work or authorizing landing.
+/// A failed provider observation is retried on a later pass.
+pub async fn observe_dispatches_once(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+) -> Result<(), String> {
+    use crate::{batch::State, scheduler::DispatchState};
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    if store.repository_scope().map_err(|e| e.to_string())?
+        != (policy.installation as u64, policy.repository as u64)
+    {
+        return Err("repository does not match the reconciled queue".into());
+    }
+    let mut scheduler =
+        crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
+    let pending = scheduler.pending_dispatches().map_err(|e| e.to_string())?;
+    let mut token = None;
+    let mut failed = false;
+    for dispatch in pending {
+        if !matches!(
+            dispatch.state,
+            DispatchState::Accepted { .. } | DispatchState::Observed { .. }
+        ) {
+            continue;
+        }
+        let id = &dispatch.reservation.id;
+        let Some((batch, _)) = store.batch(id).map_err(|e| e.to_string())? else {
+            failed = true;
+            continue;
+        };
+        if matches!(batch.state, State::Invalidated { .. }) {
+            continue;
+        }
+        let Some(host) = capacity.hosts.get(&dispatch.reservation.host) else {
+            failed = true;
+            continue;
+        };
+        if host.runner_ids.is_empty() {
+            failed = true;
+            continue;
+        }
+        if token.is_none() {
+            token = Some(
+                app.read_token(policy.installation as u64, policy.repository as u64)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let result = async {
+            let snapshot = app
+                .reconcile_dispatch(
+                    &mut scheduler,
+                    token.as_ref().expect("token initialized"),
+                    &policy.owner,
+                    &policy.name,
+                    id,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::verification::check_host_placement(&snapshot, &host.runner_ids)
+                .map_err(|e| e.to_string())?;
+            scheduler
+                .record_job_metrics(id, &snapshot)
+                .map_err(|e| e.to_string())?;
+            scheduler
+                .record_ci_observation(id, &snapshot)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("dispatch observation failed for {id}: {error}");
+            failed = true;
+        }
+    }
+    if failed {
+        Err("one or more dispatch observations failed".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Poll conservatively; an observation never releases its reservation.
+pub async fn supervise_dispatch_observation(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(60));
+    let mut delay = minimum;
+    loop {
+        if let Err(error) = observe_dispatches_once(&app, &db, &capacity, &policy).await {
+            eprintln!("dispatch observation pass failed: {error}");
+            delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+        } else {
+            delay = minimum;
+        }
+        sleep(delay).await;
+    }
+}

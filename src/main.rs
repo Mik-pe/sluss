@@ -29,8 +29,11 @@ enum Command {
         /// Cancel known runs when their batch is invalidated.
         #[arg(long, requires_all = ["config", "capacity"])]
         cancel_stale: bool,
-        /// Capacity configuration used by stale-run cancellation.
-        #[arg(long, requires = "cancel_stale")]
+        /// Observe known workflow runs periodically.
+        #[arg(long, requires_all = ["config", "capacity"])]
+        observe_dispatches: bool,
+        /// Capacity configuration used by cancellation and observation.
+        #[arg(long, requires = "config")]
         capacity: Option<PathBuf>,
     },
     /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
@@ -197,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen,
         config,
         cancel_stale,
+        observe_dispatches,
         capacity,
     } = cli.command
     {
@@ -234,6 +238,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "automatic stale-run cancellation enabled; capacity is not automatically released"
                 );
                 tokio::spawn(sluss::worker::supervise_stale_cancellation(
+                    app.clone(),
+                    cli.db.clone(),
+                    capacity,
+                    policy.clone(),
+                    poll,
+                ));
+            }
+            if observe_dispatches {
+                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                eprintln!(
+                    "automatic dispatch observation enabled; observations do not authorize landing"
+                );
+                tokio::spawn(sluss::worker::supervise_dispatch_observation(
                     app.clone(),
                     cli.db.clone(),
                     capacity,

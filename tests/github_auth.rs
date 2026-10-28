@@ -1342,6 +1342,40 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             .contains("dispatched run 123 to reserved host sluss-host-test")
     );
     mode.store(0, Ordering::SeqCst);
+    let observer_app =
+        App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let observer_capacity: sluss::scheduler::Capacity =
+        toml::from_str(&std::fs::read_to_string(&capacity).unwrap()).unwrap();
+    let observer_policy = sluss::config::Config::load(&config).unwrap().policy();
+    mode.store(23, Ordering::SeqCst);
+    assert!(
+        sluss::worker::observe_dispatches_once(
+            &observer_app,
+            &db,
+            &observer_capacity,
+            &observer_policy,
+        )
+        .await
+        .is_err()
+    );
+    mode.store(0, Ordering::SeqCst);
+    sluss::worker::observe_dispatches_once(
+        &observer_app,
+        &db,
+        &observer_capacity,
+        &observer_policy,
+    )
+    .await
+    .unwrap();
+    // A restarted observer reads the same receipt without duplicating measurements.
+    sluss::worker::observe_dispatches_once(
+        &observer_app,
+        &db,
+        &observer_capacity,
+        &observer_policy,
+    )
+    .await
+    .unwrap();
     let output = launch(vec![
         "observe-dispatch".into(),
         "--batch-id".into(),
@@ -1363,7 +1397,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         String::from_utf8_lossy(&output.stdout)
             .contains("provider CI observation: Successful (not an attestation)")
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 new completed job measurements"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 new completed job measurements"));
     let again = launch(vec![
         "observe-dispatch".into(),
         "--batch-id".into(),
