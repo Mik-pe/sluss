@@ -1525,6 +1525,17 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         }
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let metrics = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&independent_db)
+        .arg("metrics")
+        .output()
+        .unwrap();
+    assert!(metrics.status.success());
+    let report = String::from_utf8_lossy(&metrics.stdout);
+    assert!(report.contains("requests including pool rust"));
+    assert!(report.contains("(1 intervals)"));
+    assert!(report.contains("observed runner-minutes: 0.00"));
     posts.store(0, Ordering::SeqCst);
     // A previously prepared intent is pinned to a now-busy host. A second
     // batch must still reach the other idle host, without resending the first.

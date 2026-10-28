@@ -278,7 +278,15 @@ impl Scheduler {
                 return Err(SchedulerError::IdConflict);
             }
             if eligible_hosts.is_some_and(|hosts| !hosts.contains(&host)) {
+                if let Some(batch_id) = batch_id {
+                    crate::metrics::begin_capacity_wait(&tx, batch_id, request)?;
+                    tx.commit()?;
+                }
                 return Ok(None);
+            }
+            if let Some(batch_id) = batch_id {
+                crate::metrics::end_capacity_wait(&tx, batch_id, request)?;
+                tx.commit()?;
             }
             return Ok(Some(Reservation {
                 id: id.into(),
@@ -319,6 +327,10 @@ impl Scheduler {
             global.get(name).copied().unwrap_or(0) + u64::from(*amount)
                 > u64::from(self.capacity.pools[name])
         }) {
+            if let Some(batch_id) = batch_id {
+                crate::metrics::begin_capacity_wait(&tx, batch_id, request)?;
+                tx.commit()?;
+            }
             return Ok(None);
         }
         let selected = self
@@ -342,6 +354,10 @@ impl Scheduler {
             })
             .map(|(name, _)| name.clone());
         let Some(host) = selected else {
+            if let Some(batch_id) = batch_id {
+                crate::metrics::begin_capacity_wait(&tx, batch_id, request)?;
+                tx.commit()?;
+            }
             return Ok(None);
         };
         tx.execute(
@@ -359,6 +375,9 @@ impl Scheduler {
                 "INSERT INTO dispatch_batches(id,batch_id) VALUES(?1,?2)",
                 params![id, batch_id],
             )?;
+        }
+        if let Some(batch_id) = batch_id {
+            crate::metrics::end_capacity_wait(&tx, batch_id, request)?;
         }
         tx.commit()?;
         Ok(Some(Reservation {

@@ -888,6 +888,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics.completed_jobs,
                 metrics.runner_milliseconds as f64 / 60_000.0
             );
+            for (pool, wait) in metrics.capacity_waits {
+                println!(
+                    "observed scheduling delay for requests including pool {pool}: {:.2} minutes ({} intervals)",
+                    wait.elapsed_milliseconds as f64 / 60_000.0,
+                    wait.intervals
+                );
+            }
+            println!(
+                "Scheduling delay spans first unavailable observation to a later eligible reservation; it includes polling gaps and is not runner time or proof of pool saturation."
+            );
         }
         Command::Queue => {
             let failed: std::collections::BTreeMap<_, _> = store

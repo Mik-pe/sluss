@@ -1059,3 +1059,180 @@ fn busy_host_does_not_block_an_independent_eligible_host() {
         Err(InventoryError::RunnerMismatch)
     ));
 }
+
+#[test]
+fn capacity_wait_measurements_survive_restart_and_do_not_double_count() {
+    use sluss::scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler};
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let id = "batch-0123456789abcdef";
+    store
+        .plan_batch(id, &"a".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let pools = BTreeMap::from([("macos".into(), 1), ("rust".into(), 1)]);
+    let capacity = Capacity {
+        pools: pools.clone(),
+        hosts: BTreeMap::from([(
+            "sluss-host-mac".into(),
+            Host {
+                slots: 1,
+                runner_ids: BTreeSet::from([1]),
+                pools: pools.clone(),
+            },
+        )]),
+    };
+    let request = Request { pools };
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: BTreeSet::from(["test".into()]),
+        suites: BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
+    };
+    let unavailable = BTreeSet::new();
+    let available = BTreeSet::from(["sluss-host-mac".into()]);
+    let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &unavailable)
+            .unwrap()
+            .is_none()
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE ci_capacity_waits SET started_ms=1 WHERE batch_id=?1",
+        [id],
+    )
+    .unwrap();
+    let altered_request = Request {
+        pools: BTreeMap::from([("rust".into(), 1)]),
+    };
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &altered_request, &plan, &unavailable)
+            .unwrap()
+            .is_none()
+    );
+    let restarted_at: i64 = conn
+        .query_row(
+            "SELECT started_ms FROM ci_capacity_waits WHERE batch_id=?1 AND ended_ms IS NULL",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        restarted_at > 1,
+        "a changed request begins a fresh observation"
+    );
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &unavailable)
+            .unwrap()
+            .is_none()
+    );
+    conn.execute(
+        "UPDATE ci_capacity_waits SET started_ms=started_ms-60000 WHERE batch_id=?1",
+        [id],
+    )
+    .unwrap();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let db = db.clone();
+            let capacity = capacity.clone();
+            let request = request.clone();
+            let plan = plan.clone();
+            std::thread::spawn(move || {
+                Scheduler::open(db, capacity)
+                    .unwrap()
+                    .reserve_batch_dispatch_on(id, &request, &plan, &BTreeSet::new())
+                    .unwrap()
+            })
+        })
+        .collect();
+    assert!(
+        handles
+            .into_iter()
+            .all(|handle| handle.join().unwrap().is_none())
+    );
+    let open_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_capacity_waits WHERE batch_id=?1 AND ended_ms IS NULL",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(open_count, 1);
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &unavailable)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store.metrics().unwrap().capacity_waits.is_empty(),
+        "incomplete intervals are not counted"
+    );
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity).unwrap();
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &available)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &available)
+            .unwrap()
+            .is_some()
+    );
+    let summary = store.metrics().unwrap();
+    assert_eq!(summary.capacity_waits.len(), 2);
+    let mac = &summary.capacity_waits["macos"];
+    let rust = &summary.capacity_waits["rust"];
+    assert_eq!(mac.intervals, 1);
+    assert_eq!(
+        mac, rust,
+        "multi-pool intervals appear under each requested pool"
+    );
+    assert!(mac.elapsed_milliseconds >= 60_000);
+    assert_eq!(
+        summary.runner_milliseconds, 0,
+        "waiting is never runner time"
+    );
+    // A later prepared reservation becomes unavailable; a backward wall clock
+    // invalidates that sample without preventing the reservation retry.
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &unavailable)
+            .unwrap()
+            .is_none()
+    );
+    conn.execute(
+        "UPDATE ci_capacity_waits SET started_ms=?2 WHERE batch_id=?1 AND ended_ms IS NULL",
+        rusqlite::params![id, i64::MAX],
+    )
+    .unwrap();
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(id, &request, &plan, &available)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.metrics().unwrap().capacity_waits,
+        summary.capacity_waits
+    );
+}
