@@ -420,7 +420,31 @@ pub async fn supervise_dispatch_observation(
     poll: Duration,
     complete_ci_only: bool,
 ) {
+    supervise_dispatch_observation_with_wakeup(
+        app,
+        db,
+        capacity,
+        policy,
+        poll,
+        complete_ci_only,
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .await;
+}
+
+/// CI hints wake the observer after a debounce, while failed passes retain
+/// their backoff. Lost or cross-process notifications fall back to polling.
+pub async fn supervise_dispatch_observation_with_wakeup(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+    complete_ci_only: bool,
+    wakeup: Arc<tokio::sync::Notify>,
+) {
     let minimum = poll.max(Duration::from_secs(60));
+    let wake_delay = poll.max(Duration::from_secs(5)).min(minimum);
     let mut delay = minimum;
     loop {
         if let Err(error) =
@@ -429,10 +453,14 @@ pub async fn supervise_dispatch_observation(
         {
             eprintln!("dispatch observation pass failed: {error}");
             delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            sleep(delay).await;
         } else {
             delay = minimum;
+            tokio::select! {
+                _ = sleep(minimum) => {}
+                _ = wakeup.notified() => sleep(wake_delay).await,
+            }
         }
-        sleep(delay).await;
     }
 }
 

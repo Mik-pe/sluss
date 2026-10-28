@@ -19,6 +19,7 @@ struct AppState {
     secret: Arc<[u8]>,
     db: PathBuf,
     scope: Option<(i64, i64)>,
+    ci_wakeup: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Construct a webhook-only router. TLS and public ingress belong at a trusted proxy.
@@ -30,6 +31,17 @@ pub fn router_with_scope(
     db: PathBuf,
     scope: Option<(i64, i64)>,
 ) -> Result<Router, &'static str> {
+    router_with_ci_wakeup(secret, db, scope, None)
+}
+
+/// Attach an in-process wakeup for the CI observer. It is only a hint: the
+/// observer still performs an initial scan and periodic provider reads.
+pub fn router_with_ci_wakeup(
+    secret: Vec<u8>,
+    db: PathBuf,
+    scope: Option<(i64, i64)>,
+    ci_wakeup: Option<Arc<tokio::sync::Notify>>,
+) -> Result<Router, &'static str> {
     if secret.is_empty() {
         return Err("webhook secret must not be empty");
     }
@@ -40,6 +52,7 @@ pub fn router_with_scope(
             secret: secret.into(),
             db,
             scope,
+            ci_wakeup,
         }))
 }
 
@@ -173,6 +186,7 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
                 })
             });
     let digest: [u8; 32] = Sha256::digest(&body).into();
+    let ci_wakeup = state.ci_wakeup.clone();
     let delivery = delivery.to_owned();
     let event = event.to_owned();
     match tokio::task::spawn_blocking(move || {
@@ -188,7 +202,13 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     })
     .await
     {
-        Ok(Ok(Record::New | Record::Duplicate)) => StatusCode::ACCEPTED,
+        Ok(Ok(Record::New)) => {
+            if ci_only && let Some(wakeup) = ci_wakeup {
+                wakeup.notify_one();
+            }
+            StatusCode::ACCEPTED
+        }
+        Ok(Ok(Record::Duplicate)) => StatusCode::ACCEPTED,
         Ok(Ok(Record::Collision)) => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }

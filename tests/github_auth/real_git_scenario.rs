@@ -233,10 +233,11 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
 
     let (_keys, private, public) = keys();
     let posts = Arc::new(AtomicUsize::new(0));
+    let mode = Arc::new(AtomicU8::new(0));
     let s = Scenario {
         server: ServerState {
             public_key: Arc::new(public),
-            mode: Arc::new(AtomicU8::new(0)),
+            mode: mode.clone(),
             pulls: Arc::new(AtomicUsize::new(0)),
             permissions: posts.clone(),
             token_calls: Arc::new(AtomicUsize::new(0)),
@@ -333,6 +334,7 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
         },
         verification_policy: None,
     };
+    mode.store(31, Ordering::SeqCst); // The provider reports an in-progress run.
     assert!(matches!(
         sluss::dispatch::batch(&db, &app, &policy, &capacity, &settings, id)
             .await
@@ -351,7 +353,8 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     drop(scheduler);
     drop(app);
     // Reconstruct the application as well as the database handles after dispatch.
-    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let app =
+        Arc::new(App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap());
     assert_eq!(
         sluss::dispatch::batch(&db, &app, &policy, &capacity, &settings, id)
             .await
@@ -359,9 +362,88 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
         sluss::dispatch::Outcome::AlreadyStarted
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
-    sluss::worker::observe_dispatches_with_completion(&app, &db, &capacity, &policy, true)
-        .await
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let observer = tokio::spawn(sluss::worker::supervise_dispatch_observation_with_wakeup(
+        app.clone(),
+        db.clone(),
+        capacity.clone(),
+        policy.clone(),
+        std::time::Duration::from_millis(10),
+        true,
+        wake.clone(),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+            if matches!(
+                scheduler.pending_dispatches().unwrap()[0].state,
+                sluss::scheduler::DispatchState::Observed { run_id: 123 }
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initial observer scan should record the running receipt");
+    assert!(matches!(
+        Store::open(&db)
+            .unwrap()
+            .batch(id)
+            .unwrap()
+            .unwrap()
+            .0
+            .state,
+        BatchState::Testing { .. }
+    ));
+    mode.store(0, Ordering::SeqCst); // The run completes after the first scan.
+    let router = sluss::webhook::router_with_ci_wakeup(
+        b"secret".to_vec(),
+        db.clone(),
+        Some((42, 7)),
+        Some(wake),
+    )
+    .unwrap();
+    let body = r#"{"installation":{"id":42},"repository":{"id":7},"workflow_run":{"id":123},"action":"completed"}"#;
+    use hmac::{Hmac, Mac};
+    use tower::ServiceExt;
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"secret").unwrap();
+    mac.update(body.as_bytes());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/webhook")
+        .header("x-github-event", "workflow_run")
+        .header("x-github-delivery", "ci-finished")
+        .header(
+            "x-hub-signature-256",
+            format!("sha256={}", hex::encode(mac.finalize().into_bytes())),
+        )
+        .body(axum::body::Body::from(body))
         .unwrap();
+    assert_eq!(
+        router.oneshot(request).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            if matches!(
+                Store::open(&db)
+                    .unwrap()
+                    .batch(id)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .state,
+                BatchState::CiComplete { run_id: 123, .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("webhook should wake observation well before the 60-second fallback poll");
+    observer.abort();
     let reopened = Store::open(&db).unwrap();
     assert_eq!(
         reopened.batch(id).unwrap().unwrap().0.state,

@@ -1045,7 +1045,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scope = worker
             .as_ref()
             .map(|(_, policy, _, _, _)| (policy.installation, policy.repository));
-        let app = sluss::webhook::router_with_scope(secret.into_bytes(), cli.db.clone(), scope)?;
+        let ci_wakeup = std::sync::Arc::new(tokio::sync::Notify::new());
+        let app = sluss::webhook::router_with_ci_wakeup(
+            secret.into_bytes(),
+            cli.db.clone(),
+            scope,
+            Some(ci_wakeup.clone()),
+        )?;
         if let Some((app, policy, planning, poll, rescan)) = worker {
             if auto_plan {
                 eprintln!("automatic batch planning enabled; landing remains disabled");
@@ -1135,13 +1141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "automatic dispatch observation enabled; observations do not authorize landing"
                 );
-                tokio::spawn(sluss::worker::supervise_dispatch_observation(
+                tokio::spawn(sluss::worker::supervise_dispatch_observation_with_wakeup(
                     app.clone(),
                     cli.db.clone(),
                     capacity,
                     policy.clone(),
                     poll,
                     complete_ci_only,
+                    ci_wakeup.clone(),
                 ));
             }
             tokio::spawn(sluss::worker::supervise(app, cli.db, policy, poll, rescan));

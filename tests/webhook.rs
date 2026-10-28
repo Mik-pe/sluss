@@ -809,3 +809,143 @@ async fn ci_event_bursts_preserve_admission_scan_but_invalidate_ci_evidence() {
     );
     assert!(inbox.pending_for(17, 25).unwrap().is_some());
 }
+
+#[tokio::test]
+async fn ci_observer_wakeup_requires_new_scoped_signed_delivery() {
+    use std::{sync::Arc, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("wake.sqlite");
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let app = sluss::webhook::router_with_ci_wakeup(
+        b"secret".to_vec(),
+        db.clone(),
+        Some((17, 25)),
+        Some(wake.clone()),
+    )
+    .unwrap();
+    let body = r#"{"installation":{"id":17},"repository":{"id":25},"action":"completed","workflow_run":{"id":123}}"#;
+    let sig = signature(body.as_bytes());
+    assert_eq!(
+        app.clone()
+            .oneshot(request("invalid", "workflow_run", body, "sha256=00"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), wake.notified())
+            .await
+            .is_err()
+    );
+    let foreign = r#"{"installation":{"id":17},"repository":{"id":26},"workflow_run":{"id":123}}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "foreign",
+                "workflow_run",
+                foreign,
+                &signature(foreign.as_bytes())
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), wake.notified())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request("ci", "workflow_run", body, &sig))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), wake.notified())
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request("ci", "workflow_run", body, &sig))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), wake.notified())
+            .await
+            .is_err()
+    );
+    let changed = r#"{"installation":{"id":17},"repository":{"id":25},"workflow_run":{"id":124}}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "ci",
+                "workflow_run",
+                changed,
+                &signature(changed.as_bytes())
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), wake.notified())
+            .await
+            .is_err()
+    );
+    // Concurrent new hints coalesce into at most one pending wakeup.
+    assert_eq!(
+        app.clone()
+            .oneshot(request("ci-2", "workflow_run", body, &sig))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        app.oneshot(request("ci-3", "workflow_run", body, &sig))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), wake.notified())
+            .await
+            .is_ok()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), wake.notified())
+            .await
+            .is_err()
+    );
+    // A delivery that cannot be committed cannot wake the worker.
+    let bad = sluss::webhook::router_with_ci_wakeup(
+        b"secret".to_vec(),
+        dir.path().to_owned(),
+        Some((17, 25)),
+        Some(wake.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        bad.oneshot(request("bad-db", "workflow_run", body, &sig))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), wake.notified())
+            .await
+            .is_err()
+    );
+}
