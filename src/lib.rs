@@ -9,6 +9,7 @@ pub mod batch;
 pub mod benchmark;
 pub mod config;
 pub mod coordinator;
+mod database;
 pub mod dispatch;
 pub mod github;
 pub mod integration;

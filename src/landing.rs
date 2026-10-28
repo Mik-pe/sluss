@@ -802,9 +802,7 @@ impl LandingJournal {
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LandingError> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
+        crate::database::configure_writer(&conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS landing_intents_v1 (
             id TEXT PRIMARY KEY NOT NULL, repository_id INTEGER NOT NULL,

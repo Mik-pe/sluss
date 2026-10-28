@@ -1,6 +1,6 @@
 //! Authenticated webhook intake. Events schedule reconciliation; they do not
 //! authorize changes. A configured worker reconciles the current provider state.
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     Router,
@@ -213,8 +213,7 @@ pub struct Inbox {
 impl Inbox {
     pub fn open(path: impl AsRef<std::path::Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        crate::database::configure_writer(&conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS webhook_deliveries (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,

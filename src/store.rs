@@ -143,8 +143,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        crate::database::configure_writer(&conn)?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);

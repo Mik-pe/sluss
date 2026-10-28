@@ -1,5 +1,7 @@
 # Verification and landing protocol
 
+All SQLite write entry points, including the queue, webhook inbox, scheduler, capacity migration and landing journal, require WAL and set `synchronous=FULL` on their own connection before writing. They verify both settings and fail if WAL cannot be enabled; in-memory databases are therefore unsuitable for these durable paths. This preserves the intended ordering of committed intents and external requests under SQLite’s sync contract. It has not been tested by cutting power, and depends on the filesystem and storage honoring synchronization; backups must include a consistent SQLite snapshot including its WAL. See [SQLite’s synchronous pragma](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
 This is a design contract, not a claim that the protocol is implemented.
 
 1. Reconcile each PR's current head, independent review and blockers. Freeze the target base, ordered PR numbers and heads, and policy identity in a batch.

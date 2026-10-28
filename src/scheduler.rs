@@ -126,7 +126,7 @@ impl Scheduler {
         let next_body = serde_json::to_string(next)?;
         let mut conn =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        crate::database::configure_writer(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let paused: bool = tx.query_row(
             "SELECT value != 0 FROM settings WHERE key='paused'",
@@ -228,8 +228,7 @@ impl Scheduler {
         validate_capacity(&capacity)?;
         let encoded = serde_json::to_string(&capacity)?;
         let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        crate::database::configure_writer(&conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS capacity_config (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_release_topology (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_release_topology_history (body TEXT PRIMARY KEY NOT NULL);
