@@ -67,3 +67,34 @@ fn example_capacity_has_valid_host_labels_and_can_open_scheduler() {
     let dir = tempfile::tempdir().unwrap();
     sluss::scheduler::Scheduler::open(dir.path().join("capacity.sqlite"), capacity).unwrap();
 }
+
+#[test]
+fn adaptive_batching_requires_single_active_batch_and_ci_completion_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("adaptive.toml");
+    let adaptive = VALID.replace(
+        "target = \"main\"",
+        "target = \"main\"\nadaptive_batching = true",
+    );
+    std::fs::write(&config, &adaptive).unwrap();
+    assert!(Config::load(&config).unwrap().planning().adaptive_batching);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args(["serve", "--auto-plan", "--config"])
+        .arg(&config)
+        .env("SLUSS_WEBHOOK_SECRET", "test")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires --complete-ci-only"));
+    std::fs::write(
+        &config,
+        adaptive.replace(
+            "adaptive_batching = true",
+            "adaptive_batching = true\nmax_active_batches = 2",
+        ),
+    )
+    .unwrap();
+    assert!(matches!(Config::load(&config), Err(ConfigError::Invalid)));
+}

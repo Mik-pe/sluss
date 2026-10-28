@@ -29,6 +29,9 @@ pub struct Queue {
     pub target: String,
     #[serde(default = "default_batch_size")]
     pub max_batch_size: usize,
+    /// Adapt the ordinary batch limit from measured completed CI runs.
+    #[serde(default)]
+    pub adaptive_batching: bool,
     #[serde(default = "default_active_batches")]
     pub max_active_batches: usize,
     #[serde(default = "default_batch_window")]
@@ -102,6 +105,7 @@ impl Config {
             || config.queue.target.is_empty()
             || !(1..=100).contains(&config.queue.max_batch_size)
             || !(1..=100).contains(&config.queue.max_active_batches)
+            || (config.queue.adaptive_batching && config.queue.max_active_batches != 1)
             || config.queue.batch_window_seconds > 86400
             || config.queue.debounce_seconds > 86400
             || !(1..=100).contains(&config.checks.required_reviews)
@@ -118,6 +122,7 @@ impl Config {
     pub fn planning(&self) -> crate::store::PlanningSettings {
         crate::store::PlanningSettings {
             max_batch_size: self.queue.max_batch_size,
+            adaptive_batching: self.queue.adaptive_batching,
             max_active_batches: self.queue.max_active_batches,
             debounce: std::time::Duration::from_secs(self.queue.debounce_seconds),
             batch_window: std::time::Duration::from_secs(self.queue.batch_window_seconds),

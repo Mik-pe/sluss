@@ -11,6 +11,7 @@ repository = "your-repository"
 [queue]
 target = "main"
 max_batch_size = 4
+adaptive_batching = false # Optional measured CI-only sizing; requires max_active_batches = 1.
 max_active_batches = 1
 debounce_seconds = 60
 batch_window_seconds = 60

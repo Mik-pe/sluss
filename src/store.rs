@@ -4,6 +4,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
+pub use crate::adaptive::{AdaptiveEvent, AdaptiveStatus};
 use crate::batch::{Batch, Candidate, State};
 
 #[derive(Debug, Error)]
@@ -76,15 +77,22 @@ pub struct FailedCandidate {
 #[serde(deny_unknown_fields)]
 pub struct PlanningSettings {
     pub max_batch_size: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub adaptive_batching: bool,
     pub max_active_batches: usize,
     pub debounce: Duration,
     pub batch_window: Duration,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl PlanningSettings {
     fn validate(&self) -> Result<(), StoreError> {
         if !(1..=100).contains(&self.max_batch_size)
             || !(1..=100).contains(&self.max_active_batches)
+            || (self.adaptive_batching && self.max_active_batches != 1)
             || self.debounce > Duration::from_secs(86400)
             || self.batch_window > Duration::from_secs(86400)
         {
@@ -146,6 +154,10 @@ impl Store {
             CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS planning_config (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS adaptive_batch_epochs_v1 (id INTEGER PRIMARY KEY AUTOINCREMENT, planning_digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS adaptive_batch_state_v1 (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL, planning_digest TEXT NOT NULL, batch_limit INTEGER NOT NULL, streak INTEGER NOT NULL, threshold INTEGER NOT NULL, last_policy_key TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS adaptive_batch_events_v1 (sequence INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT UNIQUE NOT NULL, epoch INTEGER NOT NULL, planning_digest TEXT NOT NULL, policy_key TEXT NOT NULL, batch_size INTEGER NOT NULL, limit_before INTEGER NOT NULL, conclusion TEXT NOT NULL, runner_ms INTEGER NOT NULL, limit_after INTEGER NOT NULL, invalid INTEGER NOT NULL DEFAULT 0 CHECK(invalid IN (0,1)));
+            CREATE INDEX IF NOT EXISTS adaptive_batch_samples_v1 ON adaptive_batch_events_v1(epoch,policy_key,batch_size,conclusion,sequence DESC);
             CREATE TABLE IF NOT EXISTS planning_migrations (id INTEGER PRIMARY KEY, previous_digest TEXT NOT NULL, next_digest TEXT NOT NULL, previous_body TEXT, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_selection_config (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL);
@@ -747,6 +759,19 @@ impl Store {
         .transpose()
     }
 
+    /// Current optional adaptive limit and number of recorded CI-only samples.
+    pub fn adaptive_status(&self) -> Result<Option<AdaptiveStatus>, StoreError> {
+        let Some((settings, _)) = self.planning_settings()? else {
+            return Ok(None);
+        };
+        crate::adaptive::status(&self.conn, &settings)
+    }
+
+    /// Inspect the latest 50 controller samples without modifying the database.
+    pub fn adaptive_history(path: impl AsRef<Path>) -> Result<Vec<AdaptiveEvent>, StoreError> {
+        crate::adaptive::history(path.as_ref())
+    }
+
     /// Migrate settings only while paused and drained. Pending split groups are
     /// preserved and must fit the new limit. Workers must be stopped by the
     /// operator: SQLite cannot establish that an external Git process exited.
@@ -854,6 +879,9 @@ impl Store {
             return Ok(false);
         }
         tx.execute("INSERT INTO planning_config(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [&next_body])?;
+        // A changed configuration starts a fresh control epoch; old samples
+        // remain as history but cannot silently influence the new policy.
+        tx.execute("DELETE FROM adaptive_batch_state_v1 WHERE id=1", [])?;
         tx.execute("INSERT INTO planning_migrations(previous_digest,next_digest,previous_body,next_body,migrated_ms) VALUES(?1,?2,?3,?4,?5)", params![old_digest,next_digest,old_body,next_body,now_ms()?])?;
         tx.commit()?;
         Ok(true)
@@ -883,6 +911,7 @@ impl Store {
         if known_policy != policy_digest || known_target != target {
             return Err(StoreError::PolicyMismatch);
         }
+        settings.validate()?;
         if !(1..=100).contains(&settings.max_batch_size)
             || !(1..=100).contains(&settings.max_active_batches)
             || i64::try_from(settings.debounce.as_millis()).is_err()
@@ -1009,17 +1038,24 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let settings = PlanningSettings {
-            max_batch_size,
-            max_active_batches,
-            debounce,
-            batch_window,
-        };
         let stored_settings: Option<String> = tx
             .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
                 r.get(0)
             })
             .optional()?;
+        let adaptive_batching = stored_settings
+            .as_ref()
+            .map(|body| serde_json::from_str::<PlanningSettings>(body))
+            .transpose()?
+            .is_some_and(|settings| settings.adaptive_batching);
+        let settings = PlanningSettings {
+            max_batch_size,
+            adaptive_batching,
+            max_active_batches,
+            debounce,
+            batch_window,
+        };
+        settings.validate()?;
         let requested_settings = serde_json::to_string(&settings)?;
         if stored_settings
             .as_deref()
@@ -1054,6 +1090,11 @@ impl Store {
         if observed_base.as_deref().is_some_and(|sha| sha != base_sha) {
             return Err(StoreError::StaleBatch);
         }
+        let effective_max = if settings.adaptive_batching {
+            crate::adaptive::limit(&tx, &settings)?
+        } else {
+            max_batch_size
+        };
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM batches WHERE id=?1)",
             [id],
@@ -1204,7 +1245,7 @@ impl Store {
                         number,
                         head_sha: sha,
                     });
-                    if selected.len() == max_batch_size {
+                    if selected.len() == effective_max {
                         break;
                     }
                 }
@@ -1216,7 +1257,7 @@ impl Store {
         }
         // Bisection halves should be verified promptly rather than collected
         // with unrelated candidates. A full ordinary batch is also ready now.
-        if selected_task.is_none() && window_ms > 0 && selected.len() < max_batch_size {
+        if selected_task.is_none() && window_ms > 0 && selected.len() < effective_max {
             let mut oldest = i64::MAX;
             for candidate in &selected {
                 let changed: Option<i64> = tx

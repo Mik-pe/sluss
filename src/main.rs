@@ -421,6 +421,8 @@ enum Command {
         #[arg(long)]
         pr: u64,
     },
+    /// Show recent measured CI-only adaptive batch decisions.
+    AdaptiveHistory,
     /// Show reconciled PR observations.
     Queue,
     /// Persist a pause for future scheduler implementations.
@@ -751,6 +753,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if let Command::AdaptiveHistory = &cli.command {
+        let events = Store::adaptive_history(&cli.db)?;
+        println!("{} adaptive CI-only samples (latest 50)", events.len());
+        for event in events {
+            let timing = event
+                .runner_ms
+                .map(|ms| format!("{:.2} runner-minutes", ms as f64 / 60_000.0))
+                .unwrap_or_else(|| "runner time unavailable".into());
+            println!(
+                "batch {} epoch {} policy {}: {} candidates, {}, {}, limit {} -> {}{}",
+                event.batch_id,
+                event.epoch,
+                event.policy_key,
+                event.batch_size,
+                event.conclusion,
+                timing,
+                event.limit_before,
+                event.limit_after,
+                if event.invalid { " (invalidated)" } else { "" }
+            );
+        }
+        println!(
+            "Samples measure individual CI jobs, not delivered PRs, total investigation cost, or merge authorization."
+        );
+        return Ok(());
+    }
     if let Command::Serve {
         listen,
         config,
@@ -778,6 +806,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
         let worker = if let Some(path) = config {
             let config = sluss::config::Config::load(&path)?;
+            if auto_plan && config.queue.adaptive_batching && !complete_ci_only {
+                return Err("adaptive batching with automatic planning requires --complete-ci-only and dispatch observation".into());
+            }
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
@@ -2066,6 +2097,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     settings.debounce,
                     settings.batch_window
                 );
+                if let Some(adaptive) = store.adaptive_status()? {
+                    println!(
+                        "adaptive batch limit: {}; full successes: {}/{}; recorded CI samples: {} (invalidated: {})",
+                        adaptive.limit,
+                        adaptive.success_streak,
+                        adaptive.increase_threshold,
+                        adaptive.recorded_samples,
+                        adaptive.invalidated_samples
+                    );
+                }
             } else {
                 println!("planning digest: unbound");
             }
@@ -2159,6 +2200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::AdmissionHistory { .. } => {
             unreachable!("history is handled before opening the database")
         }
+        Command::AdaptiveHistory => unreachable!("history is handled before opening the database"),
         Command::InspectCiPolicy { .. } => {
             unreachable!("policy inspection is handled before opening the database")
         }

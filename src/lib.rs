@@ -3,6 +3,7 @@
 //! Optional experimental workers can stage and dispatch CI. Queue data and
 //! provider observations do not authorize a merge.
 
+mod adaptive;
 pub mod admission;
 pub mod batch;
 pub mod benchmark;

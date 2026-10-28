@@ -152,6 +152,7 @@ fn observed_planners_share_limits_and_reject_unbound_policy() {
     ready_queue(&db);
     let mut store = Store::open(&db).unwrap();
     let settings = PlanningSettings {
+        adaptive_batching: false,
         max_batch_size: 4,
         max_active_batches: 1,
         debounce: Duration::ZERO,
@@ -1465,6 +1466,7 @@ fn planner_migration_preserves_pending_split_and_rejects_unsafe_changes() {
         )
         .unwrap();
     let old = PlanningSettings {
+        adaptive_batching: false,
         max_batch_size: 4,
         max_active_batches: 1,
         debounce: Duration::ZERO,
@@ -1636,6 +1638,7 @@ fn concurrent_planner_migrations_compare_the_same_frozen_version() {
         .unwrap();
     store.set_paused(true).unwrap();
     let initial = PlanningSettings {
+        adaptive_batching: false,
         max_batch_size: 4,
         max_active_batches: 1,
         debounce: Duration::ZERO,

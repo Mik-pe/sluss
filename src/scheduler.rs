@@ -1363,6 +1363,7 @@ fn mark_ci_conflict(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), Sche
         rows.collect::<Result<_, _>>()?
     };
     for batch_id in affected {
+        crate::adaptive::invalidate(tx, &batch_id)?;
         tx.execute(
             "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
             [&batch_id],
@@ -2317,9 +2318,9 @@ impl Scheduler {
                 crate::verification::CiObservationError::Ambiguous,
             ));
         }
-        let conclusion = match observation.observation {
+        let conclusion = match &observation.observation {
             CiObservation::Successful => "success".to_owned(),
-            CiObservation::Failed { conclusion } if !conclusion.is_empty() => conclusion,
+            CiObservation::Failed { conclusion } if !conclusion.is_empty() => conclusion.clone(),
             _ => return Err(SchedulerError::DispatchTransition),
         };
         let mut batch: Batch = serde_json::from_str(&batch_body)?;
@@ -2342,6 +2343,7 @@ impl Scheduler {
             )?;
             tx.execute("INSERT INTO ci_candidate_completions(number,head_sha,digest,base_sha,batch_id,conclusion) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,digest=excluded.digest,base_sha=excluded.base_sha,batch_id=excluded.batch_id,conclusion=excluded.conclusion", params![number,candidate.head_sha,digest,batch.base_sha,batch_id,conclusion])?;
         }
+        crate::adaptive::record(&tx, &batch, &observation)?;
         batch.state = State::CiComplete {
             integration_sha: plan.integration_sha,
             run_id,
