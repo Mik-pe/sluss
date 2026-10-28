@@ -46,4 +46,6 @@ Add `--bisect-ci-failures` to investigate failures, `--observe-reruns` for parti
 
 Use a second terminal with the same database to inspect `sluss --db /secure/sluss.sqlite status`, `queue`, `dispatches`, `ci-evidence --batch-id <id>`, `adaptive-history` and `metrics`. `pause` stops new scheduling; it does not by itself cancel running jobs or release their reservations. Resume with `resume`. Do not retry an uncertain send blindly; inspect `dispatches` and follow the recovery commands described in the [README](../README.md).
 
+To adjust the order of future ordinary batches, use `sluss --db /secure/sluss.sqlite priority --pr 123 --value 10`; set the value to zero to clear the override. Existing batches and bisection order do not change.
+
 Measure a pilot independently with the cohort, completeness and attribution requirements in [benchmarking](benchmark.md). The reported local data is partial and does not by itself establish runner-minute savings or ready-to-main latency.

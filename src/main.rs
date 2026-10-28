@@ -548,6 +548,13 @@ enum Command {
     AdaptiveHistory,
     /// Show reconciled PR observations.
     Queue,
+    /// Set a PR's priority for future ordinary batches; zero clears it.
+    Priority {
+        #[arg(long)]
+        pr: u64,
+        #[arg(long, allow_hyphen_values = true)]
+        value: i32,
+    },
     /// Persist a pause for future scheduler implementations.
     Pause,
     /// Clear the local pause flag.
@@ -3257,6 +3264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             unreachable!("App registration URL is handled before opening the database")
         }
         Command::Queue => {
+            let priorities = store.priorities()?;
             let failed: std::collections::BTreeMap<_, _> = store
                 .failed_candidates()?
                 .into_iter()
@@ -3268,19 +3276,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(number, batch, conclusion)| (number, (batch, conclusion)))
                 .collect();
             for pr in store.candidates()? {
+                let priority = priorities.get(&pr.number).copied().unwrap_or(0);
+                let prefix = if priority == 0 {
+                    String::new()
+                } else {
+                    format!(" (priority {priority:+})")
+                };
                 if let Some((batch, conclusion)) = completed.get(&pr.number) {
                     println!(
-                        "#{} {} (historical CI-only first attempt {} in {}; not merge approval)",
-                        pr.number, pr.head_sha, conclusion, batch
+                        "#{} {}{} (historical CI-only result {} in {}; not merge approval)",
+                        pr.number, pr.head_sha, prefix, conclusion, batch
                     );
                 } else if let Some(batch) = failed.get(&pr.number) {
                     println!(
-                        "#{} {} (failed in {}; awaiting change)",
-                        pr.number, pr.head_sha, batch
+                        "#{} {}{} (failed in {}; awaiting change)",
+                        pr.number, pr.head_sha, prefix, batch
                     );
                 } else {
-                    println!("#{} {}", pr.number, pr.head_sha);
+                    println!("#{} {}{}", pr.number, pr.head_sha, prefix);
                 }
+            }
+        }
+        Command::Priority { pr, value } => {
+            let mut store = store;
+            if store.set_priority(pr, value)? {
+                println!("priority for PR #{pr} is {value:+}; existing batches are unchanged");
+            } else {
+                println!("priority for PR #{pr} is already {value:+}");
             }
         }
         Command::Pause => {

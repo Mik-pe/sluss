@@ -31,6 +31,114 @@ fn ready_queue(path: &std::path::Path) {
         .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
         .unwrap();
 }
+
+#[test]
+fn priorities_order_future_batches_and_survive_restart_without_rewriting_frozen_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("priority.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    assert!(store.set_priority(4, 10).unwrap());
+    assert!(store.set_priority(3, 10).unwrap());
+    assert!(store.set_priority(2, -3).unwrap());
+    assert!(!store.set_priority(4, 10).unwrap());
+    assert!(matches!(
+        store.set_priority(999, 10),
+        Err(StoreError::InvalidCandidate)
+    ));
+    assert!(matches!(
+        store.set_priority(1, 101),
+        Err(StoreError::InvalidCandidate)
+    ));
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    assert_eq!(
+        store
+            .candidates()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        [3, 4, 1, 2]
+    );
+    assert!(
+        store
+            .plan_batch_debounced(
+                "batch-2123456789abcdef",
+                &"a".repeat(40),
+                2,
+                2,
+                std::time::Duration::from_secs(86_400)
+            )
+            .unwrap()
+            .is_none()
+    );
+    let first = store
+        .plan_batch("batch-0123456789abcdef", &"a".repeat(40), 2, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first
+            .candidates
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    store.set_priority(1, 100).unwrap();
+    let second = store
+        .plan_batch("batch-1123456789abcdef", &"a".repeat(40), 2, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second
+            .candidates
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(store.batch(&first.id).unwrap().unwrap().0, first);
+    assert!(store.remove_candidate(4).unwrap());
+    assert!(!store.priorities().unwrap().contains_key(&4));
+    store
+        .observe_candidate(&Candidate {
+            number: 4,
+            head_sha: "c".repeat(40),
+        })
+        .unwrap();
+    assert_eq!(store.priorities().unwrap().get(&4), Some(&10));
+    assert!(store.set_priority(4, 0).unwrap());
+    assert!(!store.set_priority(4, 0).unwrap());
+}
+
+#[test]
+fn priority_cli_shows_queue_order_and_accepts_negative_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("priority.sqlite");
+    ready_queue(&db);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["priority", "--pr", "1", "--value", "-4"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .arg("queue")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let queue = String::from_utf8(output.stdout).unwrap();
+    assert!(queue.lines().next().unwrap().starts_with("#2 "));
+    assert!(queue.lines().last().unwrap().contains("priority -4"));
+}
 #[test]
 fn batch_planning_respects_pause_pending_events_capacity_and_order() {
     let dir = tempfile::tempdir().unwrap();

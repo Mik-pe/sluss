@@ -1353,6 +1353,15 @@ fn splits_only_after_an_independent_successful_sibling() {
 }
 
 #[test]
+fn priority_does_not_reorder_an_existing_bisection() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    store.set_priority(4, 100).unwrap();
+    assert_eq!(numbers(&plan(&mut store, 2).unwrap()), [1, 2]);
+}
+
+#[test]
 fn shared_failures_and_timeouts_stop_without_blaming_individual_prs() {
     let (_dir, mut store, _inbox, mut scheduler) = setup();
     let root = plan(&mut store, 1).unwrap();

@@ -153,6 +153,7 @@ impl Store {
                 head_sha TEXT NOT NULL CHECK(length(head_sha) > 0),
                 sequence INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS queue_priorities (number INTEGER PRIMARY KEY CHECK(number > 0), priority INTEGER NOT NULL CHECK(priority BETWEEN -100 AND 100 AND priority != 0));
             CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL
             );
@@ -882,7 +883,7 @@ impl Store {
     pub fn candidates(&self) -> Result<Vec<Candidate>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT number, head_sha FROM candidates ORDER BY sequence, number")?;
+            .prepare("SELECT c.number,c.head_sha FROM candidates c LEFT JOIN queue_priorities p ON p.number=c.number ORDER BY COALESCE(p.priority,0) DESC,c.sequence,c.number")?;
         let result = stmt
             .query_map([], |r| {
                 Ok(Candidate {
@@ -892,6 +893,47 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
+    }
+
+    /// Set an operator priority for a currently admitted PR. Zero clears it.
+    /// This affects future ordinary batches only, never frozen batches or
+    /// bisection order. The value survives head changes and temporary removal.
+    pub fn set_priority(&mut self, number: u64, priority: i32) -> Result<bool, StoreError> {
+        let number = i64::try_from(number).map_err(|_| StoreError::InvalidCandidate)?;
+        if number <= 0 || !(-100..=100).contains(&priority) {
+            return Err(StoreError::InvalidCandidate);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let old: Option<i32> = tx
+            .query_row(
+                "SELECT priority FROM queue_priorities WHERE number=?1",
+                [number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if priority == 0 {
+            tx.execute("DELETE FROM queue_priorities WHERE number=?1", [number])?;
+        } else {
+            let admitted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM candidates WHERE number=?1)",
+                [number],
+                |r| r.get(0),
+            )?;
+            if !admitted {
+                return Err(StoreError::InvalidCandidate);
+            }
+            tx.execute("INSERT INTO queue_priorities(number,priority) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET priority=excluded.priority", params![number,priority])?;
+        }
+        tx.commit()?;
+        Ok(old != (priority != 0).then_some(priority))
+    }
+
+    pub fn priorities(&self) -> Result<std::collections::BTreeMap<u64, i32>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT p.number,p.priority FROM queue_priorities p JOIN candidates c ON c.number=p.number ORDER BY p.number")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Bind the optional CI investigation mode across all workers.
@@ -1558,8 +1600,7 @@ impl Store {
             }
         }
         if selected_task.is_none() {
-            let mut stmt =
-                tx.prepare("SELECT number,head_sha FROM candidates ORDER BY sequence,number")?;
+            let mut stmt = tx.prepare("SELECT c.number,c.head_sha FROM candidates c LEFT JOIN queue_priorities p ON p.number=c.number ORDER BY COALESCE(p.priority,0) DESC,c.sequence,c.number")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let number = row.get::<_, i64>(0)? as u64;
