@@ -34,6 +34,18 @@ pub struct Reservation {
     pub host: String,
     pub request: Request,
 }
+/// Local recovery inventory. These rows are not provider observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOverview {
+    pub id: String,
+    pub state: Option<String>,
+    pub run_id: Option<String>,
+    pub host: Option<String>,
+    pub batch_id: Option<String>,
+    pub batch_state: Option<crate::batch::State>,
+    pub conflicting_runs: Option<(String, String)>,
+}
+
 #[derive(Debug, Error)]
 pub enum SchedulerError {
     #[error(transparent)]
@@ -76,7 +88,7 @@ pub enum SchedulerError {
     WorkflowPolicyMismatch,
     #[error("dispatch is not attached to an invalidated batch with a known run")]
     NotStale,
-    #[error("stored reservation refers to an unknown host or pool")]
+    #[error("stored scheduler state is inconsistent or incomplete")]
     Corrupt,
     #[error("failure check evidence is missing, stale or conflicting")]
     FailureCheckConflict,
@@ -88,6 +100,138 @@ pub struct Scheduler {
     encoded: String,
 }
 impl Scheduler {
+    /// List unresolved local dispatches and reservations without modifying the
+    /// database or assuming that the provider has stopped any run.
+    pub fn dispatch_overview(
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<DispatchOverview>, SchedulerError> {
+        let mut conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        let table = |name: &str| -> Result<bool, rusqlite::Error> {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [name],
+                |row| row.get(0),
+            )
+        };
+        let reservations = table("capacity_reservations")?;
+        let dispatches = table("dispatch_intents")?;
+        if !reservations && !dispatches {
+            for name in ["dispatch_receipt_conflicts", "dispatch_batches"] {
+                if table(name)? {
+                    // The names are fixed internal identifiers, never user input.
+                    let has_rows: bool =
+                        tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {name})"), [], |row| {
+                            row.get(0)
+                        })?;
+                    if has_rows {
+                        return Err(SchedulerError::Corrupt);
+                    }
+                }
+            }
+            return Ok(Vec::new());
+        }
+        if !reservations || !dispatches {
+            return Err(SchedulerError::Corrupt);
+        }
+        let batch_link = table("dispatch_batches")?;
+        let batches = table("batches")?;
+        let conflicts = table("dispatch_receipt_conflicts")?;
+        let releases = table("dispatch_conflict_releases")?;
+        let batch_join = match (batch_link, batches) {
+            (true, true) => {
+                "LEFT JOIN dispatch_batches x ON x.id=d.id LEFT JOIN batches b ON b.id=x.batch_id"
+            }
+            (true, false) => "LEFT JOIN dispatch_batches x ON x.id=d.id",
+            _ => "",
+        };
+        let batch_id_col = if batch_link { "x.batch_id" } else { "NULL" };
+        let batch_col = if batch_link && batches {
+            "b.body"
+        } else {
+            "NULL"
+        };
+        let conflict_join = if conflicts {
+            "LEFT JOIN dispatch_receipt_conflicts c ON c.id=d.id"
+        } else {
+            ""
+        };
+        let conflict_cols = if conflicts {
+            "c.recovered_run,c.direct_run"
+        } else {
+            "NULL,NULL"
+        };
+        let conflict_filter = if conflicts {
+            " OR c.id IS NOT NULL"
+        } else {
+            ""
+        };
+        let standalone_filter = if conflicts {
+            " AND NOT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts c WHERE c.id=r.id)"
+        } else {
+            ""
+        };
+        let orphan_conflicts = if conflicts {
+            " UNION ALL SELECT c.id,NULL,NULL,r.host,NULL,NULL,c.recovered_run,c.direct_run FROM dispatch_receipt_conflicts c LEFT JOIN dispatch_intents d ON d.id=c.id LEFT JOIN capacity_reservations r ON r.id=c.id WHERE d.id IS NULL"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT d.id,d.state,d.run_id,r.host,{batch_id_col},{batch_col},{conflict_cols} FROM dispatch_intents d LEFT JOIN capacity_reservations r ON r.id=d.id {batch_join} {conflict_join} WHERE d.state NOT IN ('finished','cancelled') OR r.id IS NOT NULL{conflict_filter} UNION ALL SELECT r.id,NULL,NULL,r.host,NULL,NULL,NULL,NULL FROM capacity_reservations r LEFT JOIN dispatch_intents d ON d.id=r.id WHERE d.id IS NULL{standalone_filter}{orphan_conflicts} ORDER BY 1"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, state, run_id, host, batch_id, batch, old, new) = row?;
+            let batch_state = batch
+                .map(|body| -> Result<_, SchedulerError> {
+                    let batch: crate::batch::Batch = serde_json::from_str(&body)?;
+                    if batch_id.as_deref() != Some(batch.id.as_str()) || batch.id != id {
+                        return Err(SchedulerError::Corrupt);
+                    }
+                    Ok(batch.state)
+                })
+                .transpose()?;
+            let conflicting_runs = match (old, new) {
+                (Some(old), Some(new)) => Some((old, new)),
+                (None, None) => None,
+                _ => return Err(SchedulerError::Corrupt),
+            };
+            if state.as_deref() == Some("finished")
+                && host.is_none()
+                && conflicting_runs.is_some()
+                && releases
+                && read_conflict_release(&tx, &id)?
+            {
+                continue;
+            }
+            result.push(DispatchOverview {
+                id,
+                state,
+                run_id,
+                host,
+                batch_id,
+                batch_state,
+                conflicting_runs,
+            });
+        }
+        Ok(result)
+    }
+
     /// Inspect the currently bound capacity without creating or migrating a database.
     pub fn capacity_digest(path: impl AsRef<Path>) -> Result<Option<String>, SchedulerError> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;

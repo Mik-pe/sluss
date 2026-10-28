@@ -499,6 +499,8 @@ enum Command {
         #[arg(long)]
         admission_db: Option<PathBuf>,
     },
+    /// Show unresolved local dispatches and reservations without modifying the database.
+    Dispatches,
     /// Show historical local observations that a PR version met admission.
     AdmissionHistory {
         #[arg(long)]
@@ -855,6 +857,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 job.job_id, job.run_id, job.attempt, job.reason, job.started_at, job.completed_at
             );
         }
+        return Ok(());
+    }
+    if let Command::Dispatches = &cli.command {
+        let rows = sluss::scheduler::Scheduler::dispatch_overview(&cli.db)?;
+        if rows.is_empty() {
+            println!("no unresolved local dispatches or reservations");
+        }
+        for row in rows {
+            println!(
+                "dispatch {:?}: state {:?}; run {:?}; reserved host {:?}; batch {:?}: {:?}",
+                row.id, row.state, row.run_id, row.host, row.batch_id, row.batch_state
+            );
+            if let Some((recovered, direct)) = row.conflicting_runs {
+                println!(
+                    "  conflicting run receipts: {:?} and {:?}",
+                    recovered, direct
+                );
+            }
+            if row.state.as_deref() == Some("sending") {
+                println!("  send may have occurred; inspect and reconcile before any retry");
+            }
+            if row.batch_id.is_some() && row.batch_state.is_none() {
+                println!("  bound batch record is missing; investigate before recovery");
+            }
+            if matches!(row.state.as_deref(), Some("finished" | "cancelled")) && row.host.is_some()
+            {
+                println!(
+                    "  terminal dispatch still holds a reservation; investigate before recovery"
+                );
+            }
+            if row.host.is_none() || row.state.is_none() {
+                println!(
+                    "  local reservation or dispatch record is missing; investigate before recovery"
+                );
+            }
+        }
+        println!(
+            "Local journal only; GitHub may have changed and a reservation does not prove a run has stopped."
+        );
         return Ok(());
     }
     if let Command::AdmissionHistory { pr } = &cli.command {
@@ -2922,6 +2963,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::CollectBenchmark { .. } => {
             unreachable!("collection is handled before opening the database")
+        }
+        Command::Dispatches => {
+            unreachable!("dispatches is handled before opening the database")
         }
         Command::AdmissionHistory { .. } => {
             unreachable!("history is handled before opening the database")

@@ -433,3 +433,88 @@ fn legacy_duplicate_run_receipts_block_scheduler_without_deleting_state() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+#[test]
+fn dispatch_overview_shows_uncertain_and_orphaned_work_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.sqlite");
+    assert!(Scheduler::dispatch_overview(&missing).is_err());
+    assert!(!missing.exists());
+    let fresh = dir.path().join("fresh.sqlite");
+    sluss::store::Store::open(&fresh).unwrap();
+    assert!(Scheduler::dispatch_overview(&fresh).unwrap().is_empty());
+    let partial = dir.path().join("partial.sqlite");
+    let partial_db = rusqlite::Connection::open(&partial).unwrap();
+    partial_db.execute_batch("CREATE TABLE dispatch_receipt_conflicts(id TEXT); INSERT INTO dispatch_receipt_conflicts VALUES ('orphan');").unwrap();
+    drop(partial_db);
+    assert!(matches!(
+        Scheduler::dispatch_overview(&partial),
+        Err(SchedulerError::Corrupt)
+    ));
+    let db = dir.path().join("queue.sqlite");
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    scheduler
+        .reserve("standalone", &request(&[("macos", 1)]))
+        .unwrap()
+        .unwrap();
+    drop(scheduler);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES('uncertain','{}','sending',NULL)", []).unwrap();
+    conn.execute(
+        "INSERT INTO capacity_reservations(id,host,request) VALUES('uncertain','linux','{}')",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES('legacy-conflict','{}','finished','41')", []).unwrap();
+    conn.execute("INSERT INTO dispatch_receipt_conflicts(id,recovered_run,direct_run) VALUES('legacy-conflict','41','42')", []).unwrap();
+    conn.execute("INSERT INTO dispatch_receipt_conflicts(id,recovered_run,direct_run) VALUES('orphan-conflict','51','52')", []).unwrap();
+    conn.execute("INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES('terminal','{}','finished','90')", []).unwrap();
+    conn.execute(
+        "INSERT INTO capacity_reservations(id,host,request) VALUES('terminal','linux','{}')",
+        [],
+    )
+    .unwrap();
+    let schema_before: i64 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    let rows = Scheduler::dispatch_overview(&db).unwrap();
+    assert_eq!(rows.len(), 5);
+    let uncertain = rows.iter().find(|row| row.id == "uncertain").unwrap();
+    assert_eq!(uncertain.state.as_deref(), Some("sending"));
+    assert_eq!(uncertain.host.as_deref(), Some("linux"));
+    assert!(uncertain.run_id.is_none());
+    let conflict = rows.iter().find(|row| row.id == "legacy-conflict").unwrap();
+    assert_eq!(
+        conflict.conflicting_runs.as_ref(),
+        Some(&("41".into(), "42".into()))
+    );
+    assert!(conflict.host.is_none());
+    let orphan = rows.iter().find(|row| row.id == "orphan-conflict").unwrap();
+    assert!(orphan.state.is_none());
+    assert_eq!(
+        orphan.conflicting_runs.as_ref(),
+        Some(&("51".into(), "52".into()))
+    );
+    let standalone = rows.iter().find(|row| row.id == "standalone").unwrap();
+    assert!(standalone.state.is_none());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .args(["--db", db.to_str().unwrap(), "dispatches"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("uncertain") && text.contains("send may have occurred"));
+    assert!(text.contains("legacy-conflict") && text.contains("conflicting run receipts"));
+    assert!(text.contains("standalone") && text.contains("record is missing"));
+    assert!(text.contains("terminal dispatch still holds a reservation"));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let schema_after: i64 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(schema_before, schema_after);
+}

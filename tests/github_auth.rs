@@ -2567,6 +2567,13 @@ async fn stale_cancellation_checks_repository_before_retiring_prepared_work() {
             .contains("repository does not match")
     );
     assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+    let overview = Scheduler::dispatch_overview(&db).unwrap();
+    assert_eq!(overview.len(), 1);
+    assert!(matches!(
+        overview[0].batch_state,
+        Some(sluss::batch::State::Invalidated { .. })
+    ));
+    assert_eq!(overview[0].host.as_deref(), Some("host"));
     assert!(scheduler.reserve("other", &request).unwrap().is_none());
     policy.installation = 1;
     policy.repository = 9;
@@ -4505,6 +4512,12 @@ async fn cli_dispatches_fixture() {
     let cancelled_scheduler =
         sluss::scheduler::Scheduler::open(&cancelled_db, one_host.clone()).unwrap();
     assert!(cancelled_scheduler.conflict_release_recorded(id).unwrap());
+    assert!(
+        sluss::scheduler::Scheduler::dispatch_overview(&cancelled_db)
+            .unwrap()
+            .iter()
+            .all(|item| item.id != id)
+    );
     mode.store(0, Ordering::SeqCst);
     let worker_db = data.path().join("conflict-worker.sqlite");
     collision_db
