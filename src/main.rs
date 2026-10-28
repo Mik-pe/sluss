@@ -1176,9 +1176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
         let worker = if let Some(path) = config {
             let config = sluss::config::Config::load(&path)?;
-            if lane_settings.is_some() && config.queue.adaptive_batching {
-                return Err("adaptive batching is not yet supported with lane dispatch".into());
-            }
             if auto_plan && config.queue.adaptive_batching && !complete_ci_only {
                 return Err("adaptive batching with automatic planning requires --complete-ci-only and dispatch observation".into());
             }

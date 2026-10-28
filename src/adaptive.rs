@@ -134,6 +134,37 @@ struct RerunCost {
 /// Previously collected, host-checked job measurements remain partial: this
 /// counts only known reruns and does not infer that all attempts were seen.
 fn rerun_cost(conn: &Connection, batch_id: &str) -> Result<RerunCost, StoreError> {
+    let mut cost = rerun_cost_for_dispatch(conn, batch_id, false)?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_batches')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(cost);
+    }
+    let mut stmt =
+        conn.prepare("SELECT id FROM dispatch_batches WHERE batch_id=?1 AND id<>?1 ORDER BY id")?;
+    let rows = stmt.query_map([batch_id], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let measured = rerun_cost_for_dispatch(conn, &row?, true)?;
+        cost.jobs = cost
+            .jobs
+            .checked_add(measured.jobs)
+            .ok_or(StoreError::InvalidBatch)?;
+        cost.runner_ms = cost
+            .runner_ms
+            .checked_add(measured.runner_ms)
+            .ok_or(StoreError::InvalidBatch)?;
+    }
+    Ok(cost)
+}
+
+fn rerun_cost_for_dispatch(
+    conn: &Connection,
+    batch_id: &str,
+    lane: bool,
+) -> Result<RerunCost, StoreError> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_job_metrics')",
         [],
@@ -167,6 +198,10 @@ fn rerun_cost(conn: &Connection, batch_id: &str) -> Result<RerunCost, StoreError
             return Err(StoreError::InvalidBatch);
         }
         if expected.is_none() {
+            if lane {
+                crate::scheduler::direct_metric_identity(conn, batch_id)
+                    .map_err(|_| StoreError::InvalidBatch)?;
+            }
             let binding: Option<(String, String, String)> = conn.query_row("SELECT d.plan,d.run_id,s.source FROM dispatch_intents d JOIN dispatch_receipt_sources s ON s.id=d.id WHERE d.id=?1 AND d.run_id IS NOT NULL", [batch_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             let (plan, run, source) = binding.ok_or(StoreError::InvalidBatch)?;
             if source != "direct" {
@@ -202,6 +237,12 @@ fn recovery_cost(conn: &Connection, root: &str) -> Result<RecoveryCost, StoreErr
     if !has_costs {
         return Ok(RecoveryCost::default());
     }
+    let has_counts: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='adaptive_split_job_counts_v1')", [], |r| r.get(0))?;
+    let has_lanes: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lane_batch_plans')",
+        [],
+        |r| r.get(0),
+    )?;
     let root_epoch: i64 = conn.query_row(
         "SELECT epoch FROM adaptive_batch_events_v1 WHERE batch_id=?1",
         [root],
@@ -255,7 +296,38 @@ fn recovery_cost(conn: &Connection, root: &str) -> Result<RecoveryCost, StoreErr
             cost.settled = false;
             continue;
         };
-        cost.jobs = cost.jobs.checked_add(1).ok_or(StoreError::InvalidBatch)?;
+        let child = child.as_deref().ok_or(StoreError::InvalidBatch)?;
+        let count: Option<i64> = if has_counts {
+            conn.query_row(
+                "SELECT jobs FROM adaptive_split_job_counts_v1 WHERE child_id=?1",
+                [child],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let lane_child: bool = if has_lanes {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lane_batch_plans WHERE batch_id=?1)",
+                [child],
+                |r| r.get(0),
+            )?
+        } else {
+            false
+        };
+        if count.is_none() && lane_child {
+            cost.settled = false;
+        }
+        let jobs = u64::try_from(count.unwrap_or(if lane_child { 0 } else { 1 }))
+            .map_err(|_| StoreError::InvalidBatch)?;
+        if count.is_some() && jobs == 0 {
+            return Err(StoreError::InvalidBatch);
+        }
+        cost.jobs = cost
+            .jobs
+            .checked_add(jobs)
+            .ok_or(StoreError::InvalidBatch)?;
         cost.runner_ms = cost
             .runner_ms
             .checked_add(ms as u64)
@@ -402,7 +474,6 @@ pub(crate) fn record(
         record_split_cost(tx, batch, record)?;
         return Ok(());
     }
-    let current = limit(tx, &settings)?;
     let conclusion = match &record.observation {
         crate::verification::CiObservation::Successful => "success",
         crate::verification::CiObservation::Failed { conclusion } if conclusion == "failure" => {
@@ -413,22 +484,6 @@ pub(crate) fn record(
     let Some(runner) = record.runner_id else {
         return reset_streak(tx);
     };
-    let elapsed = measured_runner_ms(record);
-    // Preserve missing timing explicitly; it must not look like zero cost or
-    // disappear from later comparisons.
-    let elapsed = elapsed.unwrap_or(0);
-    let size = batch.candidates.len();
-    if size == 0 || size > settings.max_batch_size {
-        return Err(StoreError::InvalidBatch);
-    }
-    let already: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM adaptive_batch_events_v1 WHERE batch_id=?1)",
-        [&batch.id],
-        |r| r.get(0),
-    )?;
-    if already {
-        return Ok(());
-    }
     let policy = serde_json::to_vec(&(
         record.plan.installation_id,
         record.plan.repository_id,
@@ -444,6 +499,118 @@ pub(crate) fn record(
     hash.update(b"sluss-adaptive-ci-policy-v1\0");
     hash.update(policy);
     let key = hex::encode(hash.finalize());
+    record_sample(
+        tx,
+        batch,
+        &settings,
+        conclusion,
+        measured_runner_ms(record),
+        key,
+    )
+}
+
+/// Account for all lanes of one completed CI-only batch. A missing duration
+/// makes the entire batch unmeasured rather than understating runner cost.
+pub(crate) fn record_lanes(
+    tx: &Transaction<'_>,
+    batch: &Batch,
+    plan: &crate::lanes::LanePlan,
+    records: &std::collections::BTreeMap<String, CiObservationRecord>,
+    conclusion: &str,
+) -> Result<(), StoreError> {
+    let config: Option<String> = tx
+        .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let settings: PlanningSettings = serde_json::from_str(&config)?;
+    if !settings.adaptive_batching {
+        return Ok(());
+    }
+    if plan.full_policy.is_none()
+        || records.len() != plan.lanes.len()
+        || records
+            .iter()
+            .any(|(name, record)| !plan.lanes.contains_key(name) || record.runner_id.is_none())
+    {
+        return reset_streak(tx);
+    }
+    let elapsed = records.values().try_fold(0_i64, |sum, record| {
+        sum.checked_add(measured_runner_ms(record)?)
+    });
+    let split: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM split_tasks WHERE child_id=?1)",
+        [&batch.id],
+        |r| r.get(0),
+    )?;
+    if split {
+        let jobs = i64::try_from(records.len()).map_err(|_| StoreError::InvalidBatch)?;
+        return record_split_elapsed(tx, batch, elapsed, jobs);
+    }
+    if !matches!(conclusion, "success" | "failure") {
+        return reset_streak(tx);
+    }
+    let identities: Vec<_> = records
+        .iter()
+        .map(|(name, record)| {
+            (
+                name,
+                record.plan.workflow_id,
+                &record.workflow_path,
+                &record.plan.required_jobs,
+                &record.plan.suites,
+                record.runner_id,
+            )
+        })
+        .collect();
+    let policy = serde_json::to_vec(&(
+        plan.batch.installation_id,
+        plan.batch.repository_id,
+        &plan.batch.policy_digest,
+        &plan.batch.selection_policy_digest,
+        &plan.full_policy,
+        identities,
+    ))?;
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-adaptive-lanes-policy-v1\0");
+    hash.update(policy);
+    record_sample(
+        tx,
+        batch,
+        &settings,
+        conclusion,
+        elapsed,
+        hex::encode(hash.finalize()),
+    )
+}
+
+fn record_sample(
+    tx: &Transaction<'_>,
+    batch: &Batch,
+    settings: &PlanningSettings,
+    conclusion: &str,
+    elapsed: Option<i64>,
+    key: String,
+) -> Result<(), StoreError> {
+    let current = limit(tx, settings)?;
+    // Preserve missing timing explicitly; it must not look like zero cost or
+    // disappear from later comparisons.
+    let elapsed = elapsed.unwrap_or(0);
+    let size = batch.candidates.len();
+    if size == 0 || size > settings.max_batch_size {
+        return Err(StoreError::InvalidBatch);
+    }
+    let already: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM adaptive_batch_events_v1 WHERE batch_id=?1)",
+        [&batch.id],
+        |r| r.get(0),
+    )?;
+    if already {
+        return Ok(());
+    }
     let digest = settings.digest()?;
     let (epoch, streak, threshold, last_policy): (i64, i64, i64, String) = tx.query_row(
         "SELECT epoch,streak,threshold,last_policy_key FROM adaptive_batch_state_v1 WHERE id=1",
@@ -505,6 +672,18 @@ fn record_split_cost(
     batch: &Batch,
     record: &CiObservationRecord,
 ) -> Result<(), StoreError> {
+    record_split_elapsed(tx, batch, measured_runner_ms(record), 1)
+}
+
+fn record_split_elapsed(
+    tx: &Transaction<'_>,
+    batch: &Batch,
+    elapsed: Option<i64>,
+    jobs: i64,
+) -> Result<(), StoreError> {
+    if jobs <= 0 {
+        return Err(StoreError::InvalidBatch);
+    }
     let root: Option<(String,i64)> = tx.query_row(
         "WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM split_tasks WHERE child_id=?1 AND state='planned' UNION SELECT t.parent_id FROM split_tasks t JOIN ancestors a ON t.child_id=a.id WHERE t.state='planned') SELECT e.batch_id,e.epoch FROM ancestors a JOIN adaptive_batch_events_v1 e ON e.batch_id=a.id WHERE e.conclusion='failure' ORDER BY e.sequence LIMIT 1",
         [&batch.id], |r| Ok((r.get(0)?,r.get(1)?)),
@@ -512,7 +691,6 @@ fn record_split_cost(
     let Some((root, epoch)) = root else {
         return Ok(());
     };
-    let elapsed = measured_runner_ms(record);
     tx.execute("INSERT OR IGNORE INTO adaptive_split_costs_v1(child_id,root_id,epoch,runner_ms) VALUES(?1,?2,?3,?4)", params![batch.id,root,epoch,elapsed])?;
     let saved: (String, i64, Option<i64>) = tx.query_row(
         "SELECT root_id,epoch,runner_ms FROM adaptive_split_costs_v1 WHERE child_id=?1",
@@ -520,6 +698,18 @@ fn record_split_cost(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     if saved != (root, epoch, elapsed) {
+        return Err(StoreError::InvalidBatch);
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO adaptive_split_job_counts_v1(child_id,jobs) VALUES(?1,?2)",
+        params![batch.id, jobs],
+    )?;
+    let saved_jobs: i64 = tx.query_row(
+        "SELECT jobs FROM adaptive_split_job_counts_v1 WHERE child_id=?1",
+        [&batch.id],
+        |r| r.get(0),
+    )?;
+    if saved_jobs != jobs {
         return Err(StoreError::InvalidBatch);
     }
     Ok(())

@@ -2539,7 +2539,7 @@ fn validate_metric_run(
     Ok(())
 }
 
-fn direct_metric_identity(
+pub(crate) fn direct_metric_identity(
     conn: &Connection,
     id: &str,
 ) -> Result<(DispatchPlan, u64, String), SchedulerError> {
@@ -3964,6 +3964,7 @@ impl Scheduler {
         }
         validate_batch_dispatch(&tx, batch_id, &frozen.batch)?;
         let mut results = std::collections::BTreeMap::new();
+        let mut records = std::collections::BTreeMap::new();
         for name in frozen.lanes.keys() {
             let id = crate::lanes::LanePlan::dispatch_id(batch_id, name);
             type LaneRow = (
@@ -4030,6 +4031,7 @@ impl Scheduler {
                 _ => return Err(SchedulerError::DispatchTransition),
             };
             results.insert(name.clone(), LaneResult { run_id, conclusion });
+            records.insert(name.clone(), record);
         }
         let conclusion = if results
             .values()
@@ -4044,6 +4046,7 @@ impl Scheduler {
         } else {
             "inconclusive".to_owned()
         };
+        crate::adaptive::record_lanes(&tx, &batch, &frozen, &records, &conclusion)?;
         for candidate in &batch.candidates {
             let number = i64::try_from(candidate.number).map_err(|_| SchedulerError::StaleBatch)?;
             let digest: String = tx.query_row(

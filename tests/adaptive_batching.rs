@@ -169,6 +169,335 @@ fn finish_with_workflow(
     }
 }
 
+fn finish_lanes(
+    store: &mut Store,
+    scheduler: &mut Scheduler,
+    batch: &Batch,
+    run_base: u64,
+    conclusion: &str,
+    seconds: [Option<u32>; 2],
+) -> (String, ActionsSnapshot) {
+    finish_lanes_with_workflow(store, scheduler, batch, run_base, conclusion, seconds, 3)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_lanes_with_workflow(
+    store: &mut Store,
+    scheduler: &mut Scheduler,
+    batch: &Batch,
+    run_base: u64,
+    conclusion: &str,
+    seconds: [Option<u32>; 2],
+    workflow_id: u64,
+) -> (String, ActionsSnapshot) {
+    use sluss::lanes::{Lane, Policy};
+    let id = &batch.id;
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let suites = ["compile".into(), "test".into()].into();
+    store
+        .record_selection(
+            id,
+            &sluss::selective::FrozenSelection {
+                base_sha: batch.base_sha.clone(),
+                integration_sha: "b".repeat(40),
+                policy_digest: "d".repeat(64),
+                selection: sluss::selective::Selection::Selected {
+                    suites,
+                    components: ["all".into()].into(),
+                },
+            },
+        )
+        .unwrap();
+    let request = Request {
+        pools: [("rust".into(), 1)].into(),
+    };
+    let lane = |name: &str| Lane {
+        workflow_id,
+        suites: [name.into()].into(),
+        required_jobs: [format!("{name}-job")].into(),
+        request: request.clone(),
+    };
+    let policy = Policy {
+        version: 1,
+        lanes: [
+            ("compile".into(), lane("compile")),
+            ("test".into(), lane("test")),
+        ]
+        .into(),
+    };
+    let template = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 0,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: Default::default(),
+        suites: ["compile".into(), "test".into()].into(),
+        selection_policy_digest: Some("d".repeat(64)),
+    };
+    let plan = policy
+        .plan(
+            template,
+            &["compile".into(), "test".into()].into(),
+            &capacity(),
+        )
+        .unwrap();
+    scheduler.freeze_lane_plan(id, &plan).unwrap();
+    let eligible = ["sluss-host-test".into()].into();
+    let mut first = None;
+    for (n, name) in ["compile", "test"].into_iter().enumerate() {
+        let run = run_base + n as u64;
+        let result = if n == 0 { conclusion } else { "success" };
+        let reservation = scheduler
+            .reserve_lane_dispatch_on(id, name, &eligible)
+            .unwrap()
+            .unwrap();
+        scheduler
+            .claim_batch_dispatch(&reservation.id, ".github/workflows/ci.yml")
+            .unwrap();
+        scheduler.record_receipt(&reservation.id, run).unwrap();
+        scheduler.observe_dispatch(&reservation.id, run).unwrap();
+        let snapshot = ActionsSnapshot {
+            run: ActionsRun {
+                id: run,
+                run_attempt: 1,
+                workflow_id,
+                head_sha: "b".repeat(40),
+                head_branch: Some(format!("sluss/{id}")),
+                path: ".github/workflows/ci.yml".into(),
+                event: "workflow_dispatch".into(),
+                status: "completed".into(),
+                conclusion: Some(result.into()),
+                repository: ActionsRepository { id: 2 },
+                head_repository: Some(ActionsRepository { id: 2 }),
+            },
+            jobs: vec![ActionsJob {
+                id: run + 1000,
+                run_id: run,
+                head_sha: "b".repeat(40),
+                name: format!("{name}-job"),
+                status: "completed".into(),
+                conclusion: Some(result.into()),
+                started_at: seconds[n].map(|_| "2026-01-01T00:00:00Z".into()),
+                completed_at: seconds[n].map(|value| format!("2026-01-01T00:00:{value:02}Z")),
+                runner_id: Some(7),
+            }],
+        };
+        scheduler
+            .record_ci_observation(&reservation.id, &snapshot)
+            .unwrap();
+        if seconds[n].is_some() {
+            scheduler
+                .record_job_metrics(&reservation.id, &snapshot)
+                .unwrap();
+        }
+        scheduler
+            .release_completed_lane(&reservation.id, run)
+            .unwrap();
+        if n == 0 {
+            first = Some((reservation.id, snapshot));
+        }
+    }
+    assert!(scheduler.complete_lanes_ci_only(id).unwrap());
+    first.unwrap()
+}
+
+#[test]
+fn adaptive_lanes_sum_runner_time_and_observed_reruns_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("lanes-adaptive.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    let mut first = None;
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        let result = finish_lanes(
+            &mut store,
+            &mut scheduler,
+            &batch,
+            serial * 10,
+            "success",
+            [Some(10), Some(20)],
+        );
+        if first.is_none() {
+            first = Some(result);
+        }
+    }
+    let history = Store::adaptive_history(&db).unwrap();
+    assert_eq!(history.len(), 3);
+    assert!(history.iter().all(|event| event.runner_ms == Some(30_000)));
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
+    let (lane_id, mut rerun) = first.unwrap();
+    rerun.run.run_attempt = 2;
+    rerun.jobs[0].id += 10_000;
+    rerun.jobs[0].completed_at = Some("2026-01-01T00:00:50Z".into());
+    assert_eq!(scheduler.record_rerun_metrics(&lane_id, &rerun).unwrap(), 1);
+    assert_eq!(scheduler.record_rerun_metrics(&lane_id, &rerun).unwrap(), 0);
+    drop(scheduler);
+    let history = Store::adaptive_history(&db).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.observed_rerun_ms)
+            .sum::<u64>(),
+        50_000
+    );
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    queue(&mut store, &mut inbox, 4, 4);
+    let batch = plan(&mut store);
+    finish_lanes(
+        &mut store,
+        &mut scheduler,
+        &batch,
+        40,
+        "success",
+        [Some(10), None],
+    );
+    assert_eq!(Store::adaptive_history(&db).unwrap()[0].runner_ms, None);
+}
+
+#[test]
+fn expensive_lane_reruns_change_the_next_batch_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("lane-rerun-cost.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 2);
+        finish_lanes(
+            &mut store,
+            &mut scheduler,
+            &batch,
+            serial * 10,
+            "success",
+            [Some(10), Some(2)],
+        );
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
+    for serial in 4..=6 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 3);
+        let (id, mut snapshot) = finish_lanes(
+            &mut store,
+            &mut scheduler,
+            &batch,
+            serial * 10,
+            "success",
+            [Some(10), Some(5)],
+        );
+        if serial == 4 {
+            snapshot.run.run_attempt = 2;
+            snapshot.jobs[0].id += 10_000;
+            snapshot.jobs[0].completed_at = Some("2026-01-01T00:00:30Z".into());
+            scheduler.record_rerun_metrics(&id, &snapshot).unwrap();
+        }
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
+    assert_eq!(
+        Store::adaptive_history(&db)
+            .unwrap()
+            .iter()
+            .map(|event| event.observed_rerun_ms)
+            .sum::<u64>(),
+        30_000
+    );
+}
+
+#[test]
+fn adaptive_lane_samples_do_not_mix_changed_workflow_policies() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("lane-policy-change.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish_lanes_with_workflow(
+            &mut store,
+            &mut scheduler,
+            &batch,
+            serial * 10,
+            "success",
+            [Some(10), Some(10)],
+            if serial == 3 { 4 } else { 3 },
+        );
+    }
+    let status = store.adaptive_status().unwrap().unwrap();
+    assert_eq!(status.limit, 2);
+    assert_eq!(status.success_streak, 1);
+    let history = Store::adaptive_history(&db).unwrap();
+    assert_ne!(history[0].policy_key, history[1].policy_key);
+}
+
+#[test]
+fn adaptive_lane_bisection_counts_all_child_jobs_and_runner_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("lanes-bisection.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    store.bind_ci_bisection(true).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    queue(&mut store, &mut inbox, 1, 2);
+    let root = plan(&mut store);
+    finish_lanes(
+        &mut store,
+        &mut scheduler,
+        &root,
+        10,
+        "failure",
+        [Some(10), Some(20)],
+    );
+    let left = plan(&mut store);
+    let (lane_id, mut rerun) = finish_lanes(
+        &mut store,
+        &mut scheduler,
+        &left,
+        20,
+        "failure",
+        [Some(10), Some(20)],
+    );
+    rerun.run.run_attempt = 2;
+    rerun.jobs[0].id += 10_000;
+    rerun.jobs[0].completed_at = Some("2026-01-01T00:00:40Z".into());
+    scheduler.record_rerun_metrics(&lane_id, &rerun).unwrap();
+    let right = plan(&mut store);
+    finish_lanes(
+        &mut store,
+        &mut scheduler,
+        &right,
+        30,
+        "success",
+        [Some(10), Some(20)],
+    );
+    let history = Store::adaptive_history(&db).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].runner_ms, Some(30_000));
+    assert_eq!(history[0].recovery_jobs, 4);
+    assert_eq!(history[0].recovery_runner_ms, 60_000);
+    assert_eq!(history[0].observed_rerun_ms, 40_000);
+    assert!(history[0].recovery_settled);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TABLE adaptive_split_job_counts_v1", [])
+        .unwrap();
+    let incomplete = Store::adaptive_history(&db).unwrap();
+    assert!(!incomplete[0].recovery_settled);
+    assert_eq!(incomplete[0].recovery_jobs, 0);
+}
+
 #[test]
 fn adapts_measured_cost_and_failures_across_restart() {
     let dir = tempfile::tempdir().unwrap();
