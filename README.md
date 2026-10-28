@@ -20,7 +20,7 @@ cargo run -- resume
 cargo run -- doctor
 ```
 
-`sluss doctor --config /path/to/sluss.toml --capacity /path/to/capacity.toml --workflow-id <id>` inspects the configured branch, active rules, workflow registration, repository runner inventory and App token scopes. It still exits unsuccessfully because those observations do not establish all prerequisites for strict landing. It has only been tested with a local GitHub stub.
+`sluss doctor --config /path/to/sluss.toml --capacity /path/to/capacity.toml --workflow-id <id>` inspects the configured branch, active rules, workflow registration, repository runner inventory, App token scopes and available GraphQL ref-update schema fields. It still exits unsuccessfully because those observations do not establish all prerequisites for strict landing. The command has only been tested with a local GitHub stub; the separate GraphQL ref-update probe described in the protocol used a user credential and temporary unprotected branches.
 
 To try webhook intake locally, set `SLUSS_WEBHOOK_SECRET` in the environment and run `cargo run -- serve`. It listens on `127.0.0.1:8080` by default; `--listen` changes the address. External traffic requires a trusted HTTPS reverse proxy. Without configuration, this only records deliveries.
 

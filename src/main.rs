@@ -484,6 +484,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 preflight.branch.name, preflight.branch.commit.sha, preflight.branch.protected
             );
             println!("active branch rules returned: {}", preflight.rules.len());
+            match app.inspect_ref_update_schema(&read).await {
+                Ok(true) => println!(
+                    "GraphQL updateRefs and expected-old fields appear in the schema (semantics and permissions not verified)"
+                ),
+                Ok(false) => eprintln!("GraphQL expected-old ref update fields are missing"),
+                Err(_) => eprintln!("GraphQL ref update schema could not be inspected"),
+            }
             println!(
                 "workflow: {} ({}, {})",
                 preflight.workflow.id, preflight.workflow.path, preflight.workflow.state

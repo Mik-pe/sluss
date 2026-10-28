@@ -88,6 +88,74 @@ struct TokenResponse {
 }
 
 impl App {
+    /// Read-only schema discovery. A positive result does not prove that the
+    /// installation can update protected refs or that provider semantics are
+    /// safe for landing; it only checks the presence of the documented fields.
+    pub async fn inspect_ref_update_schema(
+        &self,
+        token: &InstallationToken,
+    ) -> Result<bool, GitHubError> {
+        if token.app_client_id != self.client_id || token.api_origin != self.api.as_str() {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        const QUERY: &str = r#"query { __schema { mutationType { fields { name } } } refUpdate: __type(name: "RefUpdate") { inputFields { name } } updateInput: __type(name: "UpdateRefsInput") { inputFields { name } } }"#;
+        let url = self
+            .api
+            .join("graphql")
+            .map_err(|_| GitHubError::InvalidConfiguration)?;
+        let mut response = self
+            .client
+            .post(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(token.secret())
+            .json(&serde_json::json!({"query": QUERY}))
+            .send()
+            .await
+            .map_err(|_| GitHubError::Request)?;
+        if !response.status().is_success() {
+            return Err(GitHubError::Status(response.status().as_u16()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
+            if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let result: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)?;
+        if result
+            .get("errors")
+            .is_some_and(|errors| !errors.as_array().is_some_and(|v| v.is_empty()))
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let names = |path: &str| -> Option<std::collections::BTreeSet<&str>> {
+            let entries = result.pointer(path)?.as_array()?;
+            let mut names = std::collections::BTreeSet::new();
+            for entry in entries {
+                let name = entry.get("name")?.as_str()?;
+                if name.is_empty() || !names.insert(name) {
+                    return None;
+                }
+            }
+            Some(names)
+        };
+        let mutations =
+            names("/data/__schema/mutationType/fields").ok_or(GitHubError::UnstableObservation)?;
+        let refs = names("/data/refUpdate/inputFields").ok_or(GitHubError::UnstableObservation)?;
+        let input =
+            names("/data/updateInput/inputFields").ok_or(GitHubError::UnstableObservation)?;
+        Ok(mutations.contains("updateRefs")
+            && ["name", "beforeOid", "afterOid", "force"]
+                .iter()
+                .all(|name| refs.contains(name))
+            && ["repositoryId", "refUpdates", "clientMutationId"]
+                .iter()
+                .all(|name| input.contains(name)))
+    }
+
     pub fn supports_github_git(&self) -> bool {
         self.api.as_str() == "https://api.github.com/"
     }

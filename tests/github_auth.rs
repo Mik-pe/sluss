@@ -247,6 +247,34 @@ async fn doctor_branch(State(state): State<ServerState>, headers: HeaderMap) -> 
     };
     Json(json!({"name":"main","protected":true,"commit":{"sha":sha.repeat(40)}}))
 }
+async fn graphql_schema(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let query = body["query"].as_str().unwrap();
+    assert!(query.starts_with("query {"));
+    assert!(query.contains("__schema"));
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 61 {
+        return Json(json!({"errors":[{"message":"introspection disabled"}]}));
+    }
+    let mut fields = vec![
+        json!({"name":"name"}),
+        json!({"name":"afterOid"}),
+        json!({"name":"force"}),
+    ];
+    if mode != 60 {
+        fields.push(json!({"name":"beforeOid"}));
+    }
+    if mode == 62 {
+        fields.push(json!({"name":"beforeOid"}));
+    }
+    Json(
+        json!({"data":{"__schema":{"mutationType":{"fields":[{"name":"updateRefs"}]}},"refUpdate":{"inputFields":fields},"updateInput":{"inputFields":[{"name":"repositoryId"},{"name":"refUpdates"},{"name":"clientMutationId"}]}}}),
+    )
+}
 async fn doctor_workflow(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
@@ -1398,6 +1426,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let reads = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/graphql", post(graphql_schema))
         .route("/repos/owner/repo", get(dispatch_repo))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
         .route("/repos/owner/repo/branches/main", get(doctor_branch))
@@ -1461,6 +1490,27 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let fixture_app =
         App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
     let fixture_token = fixture_app.read_token(42, 7).await.unwrap();
+    assert!(
+        fixture_app
+            .inspect_ref_update_schema(&fixture_token)
+            .await
+            .unwrap()
+    );
+    mode.store(60, Ordering::SeqCst);
+    assert!(
+        !fixture_app
+            .inspect_ref_update_schema(&fixture_token)
+            .await
+            .unwrap()
+    );
+    for invalid in [61, 62] {
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(matches!(
+            fixture_app.inspect_ref_update_schema(&fixture_token).await,
+            Err(GitHubError::UnstableObservation)
+        ));
+    }
+    mode.store(0, Ordering::SeqCst);
     let fixture_policy = sluss::config::Config::load(&config).unwrap().policy();
     sluss::reconcile::reconcile_once(
         &fixture_app,
@@ -2223,6 +2273,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let info = String::from_utf8_lossy(&doctor.stdout);
     assert!(info.contains("target: main"));
     assert!(info.contains("active branch rules returned: 1"));
+    assert!(info.contains("GraphQL updateRefs and expected-old fields appear in the schema"));
     assert!(info.contains("repository runner inventory matches configured hosts: 1 runners"));
     assert!(info.contains("repository-scoped read, staging and Actions credentials were issued"));
     assert!(String::from_utf8_lossy(&doctor.stderr).contains("NOT READY"));
