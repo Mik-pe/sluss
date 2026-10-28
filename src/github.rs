@@ -891,6 +891,258 @@ impl App {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct BenchmarkCollectionNotes {
+    /// Jobs lacking a runner or both timestamps cannot be measured.
+    pub jobs_without_timing: usize,
+    pub jobs_outside_interval: usize,
+    pub boundary_crossing_jobs: usize,
+    pub excluded_jobs: Vec<BenchmarkExcludedJob>,
+    attempts_seen: usize,
+    job_ids_seen: std::collections::BTreeSet<u64>,
+}
+#[derive(Debug)]
+pub struct BenchmarkExcludedJob {
+    pub run_id: u64,
+    pub attempt: u32,
+    pub job_id: u64,
+    pub reason: &'static str,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+impl BenchmarkCollectionNotes {
+    fn exclude(&mut self, run_id: u64, attempt: u32, job: &ActionsJob, reason: &'static str) {
+        self.excluded_jobs.push(BenchmarkExcludedJob {
+            run_id,
+            attempt,
+            job_id: job.id,
+            reason,
+            started_at: job.started_at.clone(),
+            completed_at: job.completed_at.clone(),
+        });
+    }
+}
+#[derive(Debug, Error)]
+pub enum BenchmarkCollectionError {
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Benchmark(#[from] crate::benchmark::BenchmarkError),
+    #[error("selected run, attempt, PR or interval does not match the repository")]
+    Mismatch,
+    #[error("collection exceeds 200 attempts or 10,000 distinct jobs")]
+    Limit,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+struct BenchmarkPull {
+    number: u64,
+    state: String,
+    merged: bool,
+    merged_at: Option<String>,
+    base: BenchmarkPullBase,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+struct BenchmarkPullBase {
+    #[serde(rename = "ref")]
+    branch: String,
+    repo: ActionsRepository,
+}
+
+impl App {
+    /// Collect explicitly selected run attempts and merged PRs through the App.
+    /// Selection and population completeness are deliberately not asserted.
+    pub async fn collect_benchmark(
+        &self,
+        token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        request: &crate::benchmark::CollectionRequest,
+    ) -> Result<(crate::benchmark::Input, BenchmarkCollectionNotes), BenchmarkCollectionError> {
+        request.validate()?;
+        if !token.checks_read
+            || token.repository_id != request.repository_id
+            || i64::try_from(token.repository_id).ok() != Some(policy.repository)
+            || i64::try_from(token.installation_id).ok() != Some(policy.installation)
+            || !valid_name(&policy.owner)
+            || !valid_name(&policy.name)
+        {
+            return Err(BenchmarkCollectionError::Mismatch);
+        }
+        let path = format!("repos/{}/{}", policy.owner, policy.name);
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        let before: Identity = self.get_json(token, &path, None).await?;
+        if before.id != request.repository_id || before.node_id.is_empty() {
+            return Err(BenchmarkCollectionError::Mismatch);
+        }
+        let mut notes = BenchmarkCollectionNotes::default();
+        let baseline = self
+            .collect_benchmark_cohort(token, policy, &request.baseline, &mut notes)
+            .await?;
+        let sluss = self
+            .collect_benchmark_cohort(token, policy, &request.sluss, &mut notes)
+            .await?;
+        let after: Identity = self.get_json(token, &path, None).await?;
+        if before != after {
+            return Err(BenchmarkCollectionError::Mismatch);
+        }
+        let result = crate::benchmark::Input {
+            version: 1,
+            repository_id: request.repository_id,
+            baseline,
+            sluss,
+        };
+        result.report()?;
+        Ok((result, notes))
+    }
+
+    async fn collect_benchmark_cohort(
+        &self,
+        token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        selected: &crate::benchmark::CollectionCohort,
+        notes: &mut BenchmarkCollectionNotes,
+    ) -> Result<crate::benchmark::Cohort, BenchmarkCollectionError> {
+        use crate::benchmark::{Cohort, Delivery, Job};
+        let start = crate::metrics::timestamp_ms(&selected.start)
+            .map_err(|_| BenchmarkCollectionError::Mismatch)?;
+        let end = crate::metrics::timestamp_ms(&selected.end)
+            .map_err(|_| BenchmarkCollectionError::Mismatch)?;
+        let root = format!("repos/{}/{}", policy.owner, policy.name);
+        let mut jobs = Vec::new();
+        for run_id in &selected.run_ids {
+            let path = format!("{root}/actions/runs/{run_id}");
+            let first: ActionsRun = self.get_json(token, &path, None).await?;
+            if first.id != *run_id
+                || first.repository.id != token.repository_id
+                || first.run_attempt == 0
+                || first.run_attempt > 100
+                || first.status != "completed"
+                || first.conclusion.as_deref().is_none_or(str::is_empty)
+                || !commit_sha(&first.head_sha)
+            {
+                return Err(BenchmarkCollectionError::Mismatch);
+            }
+            notes.attempts_seen = notes
+                .attempts_seen
+                .checked_add(first.run_attempt as usize)
+                .ok_or(BenchmarkCollectionError::Limit)?;
+            if notes.attempts_seen > 200 {
+                return Err(BenchmarkCollectionError::Limit);
+            }
+            for attempt in 1..=first.run_attempt {
+                let snapshot = self
+                    .observe_actions_attempt(token, &policy.owner, &policy.name, *run_id, attempt)
+                    .await?;
+                let run = &snapshot.run;
+                if run.status != "completed"
+                    || run.conclusion.as_deref().is_none_or(str::is_empty)
+                    || run.workflow_id != first.workflow_id
+                    || run.head_sha != first.head_sha
+                    || run.repository != first.repository
+                    || run.head_repository != first.head_repository
+                    || run.event != first.event
+                    || run.path != first.path
+                {
+                    return Err(BenchmarkCollectionError::Mismatch);
+                }
+                for job in snapshot.jobs {
+                    if notes.job_ids_seen.len() >= 10_000 {
+                        return Err(BenchmarkCollectionError::Limit);
+                    }
+                    if !notes.job_ids_seen.insert(job.id) {
+                        return Err(BenchmarkCollectionError::Mismatch);
+                    }
+                    if job.status != "completed"
+                        || job.conclusion.as_deref().is_none_or(str::is_empty)
+                    {
+                        return Err(BenchmarkCollectionError::Mismatch);
+                    }
+                    let (Some(runner), Some(begin), Some(finish)) = (
+                        job.runner_id,
+                        job.started_at.clone(),
+                        job.completed_at.clone(),
+                    ) else {
+                        notes.jobs_without_timing += 1;
+                        notes.exclude(*run_id, attempt, &job, "missing-runner-or-timing");
+                        continue;
+                    };
+                    if runner == 0 {
+                        return Err(BenchmarkCollectionError::Mismatch);
+                    }
+                    let begin_ms = crate::metrics::timestamp_ms(&begin)
+                        .map_err(|_| BenchmarkCollectionError::Mismatch)?;
+                    let finish_ms = crate::metrics::timestamp_ms(&finish)
+                        .map_err(|_| BenchmarkCollectionError::Mismatch)?;
+                    if finish_ms < begin_ms {
+                        return Err(BenchmarkCollectionError::Mismatch);
+                    }
+                    if (finish_ms <= start && begin_ms < start) || begin_ms >= end {
+                        notes.jobs_outside_interval += 1;
+                        notes.exclude(*run_id, attempt, &job, "outside-interval");
+                        continue;
+                    }
+                    if begin_ms < start || finish_ms >= end {
+                        notes.boundary_crossing_jobs += 1;
+                        notes.exclude(*run_id, attempt, &job, "crosses-boundary");
+                        continue;
+                    }
+                    jobs.push(Job {
+                        job_id: job.id,
+                        run_id: *run_id,
+                        attempt,
+                        runner_id: runner,
+                        started_at: begin,
+                        completed_at: finish,
+                    });
+                }
+            }
+            let last: ActionsRun = self.get_json(token, &path, None).await?;
+            if first != last {
+                return Err(BenchmarkCollectionError::Mismatch);
+            }
+        }
+        let mut deliveries = Vec::new();
+        for number in &selected.pull_numbers {
+            let path = format!("{root}/pulls/{number}");
+            let first: BenchmarkPull = self.get_json(token, &path, None).await?;
+            let last: BenchmarkPull = self.get_json(token, &path, None).await?;
+            if first != last
+                || first.number != *number
+                || first.state != "closed"
+                || !first.merged
+                || first.base.repo.id != token.repository_id
+                || first.base.branch != policy.target_branch
+            {
+                return Err(BenchmarkCollectionError::Mismatch);
+            }
+            let merged_at = first.merged_at.ok_or(BenchmarkCollectionError::Mismatch)?;
+            let merged_ms = crate::metrics::timestamp_ms(&merged_at)
+                .map_err(|_| BenchmarkCollectionError::Mismatch)?;
+            if merged_ms < start || merged_ms >= end {
+                return Err(BenchmarkCollectionError::Mismatch);
+            }
+            deliveries.push(Delivery {
+                pr: *number,
+                ready_at: None,
+                merged_at,
+                run_id: None,
+                attempt: None,
+            });
+        }
+        Ok(Cohort {
+            start: selected.start.clone(),
+            end: selected.end.clone(),
+            jobs_complete: false,
+            deliveries_complete: false,
+            jobs,
+            deliveries,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictResolution {
     Resolved,

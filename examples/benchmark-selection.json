@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "repository_id": 7,
+  "baseline": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-02T00:00:00Z",
+    "run_ids": [11, 12],
+    "pull_numbers": [101, 102]
+  },
+  "sluss": {
+    "start": "2026-01-02T00:00:00Z",
+    "end": "2026-01-03T00:00:00Z",
+    "run_ids": [13],
+    "pull_numbers": [103, 104]
+  }
+}

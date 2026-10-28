@@ -109,3 +109,41 @@ fn cli_works_without_creating_database_and_labels_unverified_data() {
     assert!(text.contains("not independently verified"));
     assert!(!db.exists());
 }
+
+#[test]
+fn collection_selection_rejects_overlaps_duplicates_and_unbounded_inputs() {
+    let valid = json!({"version":1,"repository_id":7,
+        "baseline":{"start":"2026-01-01T00:00:00Z","end":"2026-01-02T00:00:00Z","run_ids":[10],"pull_numbers":[101]},
+        "sluss":{"start":"2026-01-02T00:00:00Z","end":"2026-01-03T00:00:00Z","run_ids":[20],"pull_numbers":[102]}});
+    let validate = |value: Value| {
+        serde_json::from_value::<sluss::benchmark::CollectionRequest>(value)
+            .unwrap()
+            .validate()
+    };
+    assert!(validate(valid.clone()).is_ok());
+    let mut cases = Vec::new();
+    let mut bad = valid.clone();
+    bad["version"] = json!(2);
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad["repository_id"] = json!(0);
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad["sluss"]["start"] = json!("2026-01-01T23:00:00Z");
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad["sluss"]["run_ids"] = json!([10]);
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad["sluss"]["pull_numbers"] = json!([101]);
+    cases.push(bad);
+    let mut bad = valid.clone();
+    bad["baseline"]["run_ids"] = json!([0]);
+    cases.push(bad);
+    let mut bad = valid;
+    bad["baseline"]["run_ids"] = json!((1..=101).collect::<Vec<_>>());
+    cases.push(bad);
+    for value in cases {
+        assert!(validate(value).is_err());
+    }
+}

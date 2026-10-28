@@ -6311,3 +6311,217 @@ async fn uncertain_landing_records_stable_github_refs_without_claiming_success()
     );
     server.abort();
 }
+
+async fn benchmark_latest(
+    State(state): State<ServerState>,
+    Path(run): Path<u64>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let mut result = benchmark_run_value(run, if run == 100 { 2 } else { 1 }, mode);
+    if mode == 209 && state.permissions.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+        result.0["conclusion"] = json!("failure");
+    }
+    result
+}
+async fn benchmark_attempt(
+    State(state): State<ServerState>,
+    Path((run, attempt)): Path<(u64, u32)>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    benchmark_run_value(run, attempt, state.mode.load(Ordering::SeqCst))
+}
+fn benchmark_run_value(run: u64, attempt: u32, mode: u8) -> Json<Value> {
+    Json(
+        json!({"id":run,"run_attempt":attempt,"workflow_id":17,"head_sha":"a".repeat(40),
+        "head_branch":"main","path":".github/workflows/ci.yml@refs/heads/main","event":"push",
+        "status":if mode == 202 {"in_progress"} else {"completed"},"conclusion":"success",
+        "repository":{"id":7},"head_repository":{"id":7}}),
+    )
+}
+async fn benchmark_jobs(
+    State(state): State<ServerState>,
+    Path((run, attempt)): Path<(u64, u32)>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query.get("page").map(String::as_str), Some("1"));
+    let mode = state.mode.load(Ordering::SeqCst);
+    let day = if run == 100 { "01" } else { "02" };
+    let hour = if attempt == 1 { "01" } else { "02" };
+    let start = if mode == 205 && run == 100 && attempt == 1 {
+        "2025-12-31T23:59:00Z".to_owned()
+    } else {
+        format!("2026-01-{day}T{hour}:00:00Z")
+    };
+    let runner: Option<u64> = if mode == 206 && run == 100 && attempt == 1 {
+        None
+    } else {
+        Some(1)
+    };
+    Json(
+        json!({"total_count":1,"jobs":[{"id":run*10+u64::from(attempt),"run_id":run,
+        "head_sha":if mode == 208 {"b".repeat(40)} else {"a".repeat(40)},"name":"test",
+        "status":"completed","conclusion":"success","started_at":start,
+        "completed_at":format!("2026-01-{day}T{hour}:01:00Z"),"runner_id":runner}]}),
+    )
+}
+async fn benchmark_pull(
+    State(state): State<ServerState>,
+    Path(number): Path<u64>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let read = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let day = if number == 19 { "01" } else { "02" };
+    Json(
+        json!({"number":number,"state":"closed","merged":mode != 203,
+        "merged_at":format!("2026-01-{day}T03:{}:00Z", if mode == 207 && read % 2 == 1 {"01"} else {"00"}),
+        "base":{"ref":"main","repo":{"id":if mode == 204 {8} else {7}}}}),
+    )
+}
+
+#[tokio::test]
+async fn benchmark_collection_fetches_attempts_and_merges_without_claiming_completeness() {
+    let (key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let run_reads = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route(
+            "/repos/owner/repo/actions/runs/{run}",
+            get(benchmark_latest),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/{run}/attempts/{attempt}",
+            get(benchmark_attempt),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/{run}/attempts/{attempt}/jobs",
+            get(benchmark_jobs),
+        )
+        .route("/repos/owner/repo/pulls/{number}", get(benchmark_pull))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: reads.clone(),
+            permissions: run_reads.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
+    let policy = sluss::config::Config::load(&config).unwrap().policy();
+    let request_json = json!({"version":1,"repository_id":7,
+        "baseline":{"start":"2026-01-01T00:00:00Z","end":"2026-01-02T00:00:00Z","run_ids":[100],"pull_numbers":[19]},
+        "sluss":{"start":"2026-01-02T00:00:00Z","end":"2026-01-03T00:00:00Z","run_ids":[200],"pull_numbers":[20]}});
+    let request: sluss::benchmark::CollectionRequest =
+        serde_json::from_value(request_json.clone()).unwrap();
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let token = app.read_token(42, 7).await.unwrap();
+    let (input, notes) = app
+        .collect_benchmark(&token, &policy, &request)
+        .await
+        .unwrap();
+    assert_eq!(input.baseline.jobs.len(), 2);
+    assert_eq!(input.baseline.jobs[1].attempt, 2);
+    assert_eq!(input.baseline.deliveries.len(), 1);
+    assert_eq!(input.sluss.deliveries.len(), 1);
+    assert_eq!(notes.jobs_without_timing, 0);
+    assert!(!input.baseline.jobs_complete && !input.sluss.deliveries_complete);
+    assert!(input.baseline.deliveries[0].ready_at.is_none());
+    assert!(input.baseline.deliveries[0].run_id.is_none());
+    assert_eq!(input.report().unwrap().runner_time_change_percent, None);
+    for bad in [202, 203, 204, 207, 208, 209] {
+        mode.store(bad, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        run_reads.store(0, Ordering::SeqCst);
+        assert!(
+            app.collect_benchmark(&token, &policy, &request)
+                .await
+                .is_err(),
+            "mode {bad}"
+        );
+    }
+    mode.store(205, Ordering::SeqCst);
+    let (partial, notes) = app
+        .collect_benchmark(&token, &policy, &request)
+        .await
+        .unwrap();
+    assert_eq!(notes.boundary_crossing_jobs, 1);
+    assert_eq!(notes.excluded_jobs[0].job_id, 1001);
+    assert_eq!(notes.excluded_jobs[0].reason, "crosses-boundary");
+    assert_eq!(partial.baseline.jobs.len(), 1);
+    mode.store(206, Ordering::SeqCst);
+    let (partial, notes) = app
+        .collect_benchmark(&token, &policy, &request)
+        .await
+        .unwrap();
+    assert_eq!(notes.jobs_without_timing, 1);
+    assert_eq!(notes.excluded_jobs[0].reason, "missing-runner-or-timing");
+    assert_eq!(partial.baseline.jobs.len(), 1);
+    mode.store(0, Ordering::SeqCst);
+    let request_path = dir.path().join("selection.json");
+    std::fs::write(&request_path, serde_json::to_vec(&request_json).unwrap()).unwrap();
+    let db_path = dir.path().join("must-not-exist.sqlite");
+    let db_arg = db_path.clone();
+    let key_path = key_dir.path().join("test-key.pem");
+    let request_arg = request_path.clone();
+    let config_arg = config.clone();
+    let key_arg = key_path.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db_arg)
+            .args(["collect-benchmark", "--request"])
+            .arg(request_arg)
+            .arg("--config")
+            .arg(config_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.baseline.jobs.len(), 2);
+    mode.store(205, Ordering::SeqCst);
+    let db_arg = db_path.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db_arg)
+            .args(["collect-benchmark", "--request"])
+            .arg(request_path)
+            .arg("--config")
+            .arg(config)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_path)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("excluded job 1001 in run 100 attempt 1: crosses-boundary")
+    );
+    let partial: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(partial.baseline.jobs.len(), 1);
+    assert!(!db_path.exists());
+    server.abort();
+}

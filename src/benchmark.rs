@@ -1,5 +1,5 @@
 //! Compare explicitly collected historical observations; this is not attestation.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -20,7 +20,7 @@ pub enum BenchmarkError {
     Overflow,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
     pub version: u32,
@@ -28,7 +28,7 @@ pub struct Input {
     pub baseline: Cohort,
     pub sluss: Cohort,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cohort {
     pub start: String,
@@ -40,7 +40,7 @@ pub struct Cohort {
     pub jobs: Vec<Job>,
     pub deliveries: Vec<Delivery>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub job_id: u64,
@@ -50,7 +50,7 @@ pub struct Job {
     pub started_at: String,
     pub completed_at: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Delivery {
     pub pr: u64,
@@ -59,6 +59,74 @@ pub struct Delivery {
     /// Optional operator-supplied run association, not proof of verification.
     pub run_id: Option<u64>,
     pub attempt: Option<u32>,
+}
+
+/// Explicit provider IDs to collect. The selection itself is not complete
+/// evidence of all relevant jobs or deliveries.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionRequest {
+    pub version: u32,
+    pub repository_id: u64,
+    pub baseline: CollectionCohort,
+    pub sluss: CollectionCohort,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionCohort {
+    pub start: String,
+    pub end: String,
+    pub run_ids: Vec<u64>,
+    pub pull_numbers: Vec<u64>,
+}
+impl CollectionRequest {
+    pub fn load(path: &Path) -> Result<Self, BenchmarkError> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|_| BenchmarkError::Read)?
+            .take(65_537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| BenchmarkError::Read)?;
+        if bytes.len() > 65_536 {
+            return Err(BenchmarkError::TooLarge);
+        }
+        let request: Self = serde_json::from_slice(&bytes)?;
+        request.validate()?;
+        Ok(request)
+    }
+    pub fn validate(&self) -> Result<(), BenchmarkError> {
+        if self.version != 1 || self.repository_id == 0 {
+            return Err(BenchmarkError::Invalid("collection version or repository"));
+        }
+        let a = (instant(&self.baseline.start)?, instant(&self.baseline.end)?);
+        let b = (instant(&self.sluss.start)?, instant(&self.sluss.end)?);
+        if a.0 >= a.1 || b.0 >= b.1 || a.1 > b.0 {
+            return Err(BenchmarkError::Invalid(
+                "collection intervals must be ordered and non-overlapping",
+            ));
+        }
+        let mut runs = BTreeSet::new();
+        let mut pulls = BTreeSet::new();
+        for cohort in [&self.baseline, &self.sluss] {
+            if cohort.run_ids.len() > 100
+                || cohort.pull_numbers.len() > 100
+                || cohort
+                    .run_ids
+                    .iter()
+                    .any(|id| *id == 0 || !runs.insert(*id))
+                || cohort
+                    .pull_numbers
+                    .iter()
+                    .any(|id| *id == 0 || !pulls.insert(*id))
+            {
+                return Err(BenchmarkError::Invalid(
+                    "duplicate, zero or excessive collection IDs",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, PartialEq)]
 pub struct CohortReport {

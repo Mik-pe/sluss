@@ -404,6 +404,15 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Collect explicitly selected GitHub jobs and merged PRs for a benchmark.
+    CollectBenchmark {
+        /// JSON intervals and explicit run and PR IDs for each cohort.
+        #[arg(long)]
+        request: PathBuf,
+        /// GitHub App installation and repository configuration.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Show reconciled PR observations.
     Queue,
     /// Persist a pause for future scheduler implementations.
@@ -612,6 +621,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "Operator-supplied observations and completeness assertions are not independently verified. This comparison does not establish causation, CI trust, or merge authorization."
         );
+        return Ok(());
+    }
+    if let Command::CollectBenchmark { request, config } = &cli.command {
+        let request = sluss::benchmark::CollectionRequest::load(request)?;
+        let config = sluss::config::Config::load(config)?;
+        let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let app = sluss::github::App::new(
+            config.github.app_client_id.clone(),
+            &std::fs::read(key_path)?,
+            &config.github.api,
+        )?;
+        let token = app
+            .read_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let (input, notes) = app
+            .collect_benchmark(&token, &config.policy(), &request)
+            .await?;
+        println!("{}", serde_json::to_string_pretty(&input)?);
+        eprintln!(
+            "Selected GitHub observations only: {} jobs lack timing, {} are outside their cohort, {} cross its boundary. Both completeness flags are false; no run-to-PR associations or ready times were inferred.",
+            notes.jobs_without_timing, notes.jobs_outside_interval, notes.boundary_crossing_jobs
+        );
+        for job in notes.excluded_jobs {
+            eprintln!(
+                "excluded job {} in run {} attempt {}: {}; started {:?}, completed {:?}",
+                job.job_id, job.run_id, job.attempt, job.reason, job.started_at, job.completed_at
+            );
+        }
         return Ok(());
     }
     if let Command::Serve {
@@ -2015,6 +2056,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Benchmark { .. } => {
             unreachable!("benchmark is handled before opening the database")
+        }
+        Command::CollectBenchmark { .. } => {
+            unreachable!("collection is handled before opening the database")
         }
         Command::InspectCiPolicy { .. } => {
             unreachable!("policy inspection is handled before opening the database")
