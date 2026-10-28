@@ -46,6 +46,8 @@ pub enum LandingError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
     #[error("invalid frozen landing plan")]
     Invalid,
     #[error("operation identifier is already bound to a different plan")]
@@ -58,6 +60,10 @@ pub enum LandingError {
     Uncertain,
     #[error("stored landing intent is corrupt")]
     Corrupt,
+    #[error("batch or its recorded observation has changed or is incomplete")]
+    StaleBatch,
+    #[error("this intent must use its batch-bound claim path")]
+    BatchBound,
 }
 
 fn hex(value: &str, size: usize) -> bool {
@@ -150,7 +156,8 @@ impl LandingJournal {
             receipt_digest TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS landing_one_unresolved_target_v1
-        ON landing_intents_v1(repository_id,target_ref) WHERE state IN ('prepared','sending');",
+        ON landing_intents_v1(repository_id,target_ref) WHERE state IN ('prepared','sending');
+        CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);",
         )?;
         Ok(Self { conn })
     }
@@ -211,6 +218,14 @@ impl LandingJournal {
             tx.commit()?;
             return Ok(None);
         };
+        let bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM landing_batch_bindings_v1 WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if bound {
+            return Err(LandingError::BatchBound);
+        }
         let (plan, state) = decode_row(id, row)?;
         if state != IntentState::Prepared {
             tx.commit()?;
@@ -219,6 +234,92 @@ impl LandingJournal {
         if tx.execute(
             "UPDATE landing_intents_v1 SET state='sending' WHERE id=?1 AND state='prepared'",
             [id],
+        )? != 1
+        {
+            return Err(LandingError::Transition);
+        }
+        tx.commit()?;
+        Ok(Some(plan))
+    }
+
+    /// Freeze a local, already recorded CI observation and current admission
+    /// snapshot with the intent in one transaction. The caller must separately
+    /// verify the repository node ID and all provider trust assumptions.
+    /// This path does not establish trusted attestation or authorize sending.
+    pub fn prepare_observed_batch(
+        &mut self,
+        operation_id: &str,
+        batch_id: &str,
+        repository_node_id: &str,
+    ) -> Result<LandingPlan, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let plan = observed_plan(&tx, operation_id, batch_id, repository_node_id)?;
+        let body = serde_json::to_string(&plan)?;
+        let existing: Option<(String, String, i64, String)> = tx
+            .query_row(
+                "SELECT plan,state,repository_id,target_ref FROM landing_intents_v1 WHERE id=?1",
+                [operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some(row) = existing {
+            let (old, state) = decode_row(operation_id, row)?;
+            let bound: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM landing_batch_bindings_v1 WHERE id=?1)",
+                [operation_id],
+                |r| r.get(0),
+            )?;
+            if !bound || old != plan {
+                return Err(LandingError::IdConflict);
+            }
+            if state != IntentState::Prepared {
+                return Err(LandingError::Transition);
+            }
+        } else {
+            let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM landing_intents_v1 WHERE repository_id=?1 AND target_ref=?2 AND state IN ('prepared','sending'))", params![plan.repository_id,plan.target_ref], |r| r.get(0))?;
+            if busy {
+                return Err(LandingError::TargetBusy);
+            }
+            tx.execute("INSERT INTO landing_intents_v1(id,repository_id,target_ref,plan,state) VALUES(?1,?2,?3,?4,'prepared')", params![operation_id,plan.repository_id,plan.target_ref,body])?;
+            tx.execute(
+                "INSERT INTO landing_batch_bindings_v1(id) VALUES(?1)",
+                [operation_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(plan)
+    }
+
+    /// Recheck the local frozen inputs while claiming. Provider changes after
+    /// this transaction and trusted CI policy still need independent guards.
+    pub fn claim_observed_batch(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<Option<LandingPlan>, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,i64,String)> = tx.query_row(
+            "SELECT i.plan,i.state,i.repository_id,i.target_ref FROM landing_intents_v1 i JOIN landing_batch_bindings_v1 b ON b.id=i.id WHERE i.id=?1", [operation_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        let Some(row) = row else {
+            return Err(LandingError::BatchBound);
+        };
+        let (plan, state) = decode_row(operation_id, row)?;
+        if state != IntentState::Prepared {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
+        if now != plan {
+            return Err(LandingError::StaleBatch);
+        }
+        if tx.execute(
+            "UPDATE landing_intents_v1 SET state='sending' WHERE id=?1 AND state='prepared'",
+            [operation_id],
         )? != 1
         {
             return Err(LandingError::Transition);
@@ -283,6 +384,140 @@ impl LandingJournal {
         Ok(())
     }
 }
+
+// These are local scheduling observations, not a proof that the provider or
+// workflow is trustworthy. Every read is inside the caller's write transaction.
+fn observed_plan(
+    tx: &rusqlite::Transaction<'_>,
+    operation_id: &str,
+    batch_id: &str,
+    repository_node_id: &str,
+) -> Result<LandingPlan, LandingError> {
+    use crate::batch::State;
+    use crate::verification::CiObservation;
+    let (batch, _) = crate::store::checked_batch(tx, batch_id)?;
+    let integration = match &batch.state {
+        State::Testing { integration_sha } => integration_sha,
+        _ => return Err(LandingError::StaleBatch),
+    };
+    let binding: (i64, i64, String) = tx.query_row(
+        "SELECT installation,repository,policy_digest FROM repository_binding WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let base: Option<String> = tx
+        .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+        .optional()?;
+    let target: Option<String> = tx
+        .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let target = target.ok_or(LandingError::StaleBatch)?;
+    if base.as_deref() != Some(batch.base_sha.as_str()) {
+        return Err(LandingError::StaleBatch);
+    }
+    let policy: Option<String> = tx
+        .query_row(
+            "SELECT digest FROM batch_policy WHERE batch_id=?1",
+            [batch_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let row: Option<(String,String,Option<String>,String,String,String)> = tx.query_row(
+        "SELECT c.body,d.plan,d.run_id,w.path,s.source,d.state FROM ci_observations c JOIN dispatch_batches b ON b.id=c.id AND b.batch_id=?1 JOIN dispatch_intents d ON d.id=c.id JOIN dispatch_workflows w ON w.id=c.id JOIN dispatch_receipt_sources s ON s.id=c.id WHERE c.id=?1", [batch_id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+    ).optional()?;
+    let (ci_body, dispatch_body, run_id, workflow, source, state) =
+        row.ok_or(LandingError::StaleBatch)?;
+    let conflicted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+        [batch_id],
+        |r| r.get(0),
+    )?;
+    let record: crate::scheduler::CiObservationRecord = serde_json::from_str(&ci_body)?;
+    let dispatch: crate::scheduler::DispatchPlan = serde_json::from_str(&dispatch_body)?;
+    let snapshot = record.snapshot.as_ref().ok_or(LandingError::StaleBatch)?;
+    let runner = record.runner_id.ok_or(LandingError::StaleBatch)?;
+    let paths: Option<String> = tx
+        .query_row(
+            "SELECT paths FROM batch_policy_paths WHERE batch_id=?1",
+            [batch_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let paths: Vec<String> = serde_json::from_str(&paths.ok_or(LandingError::StaleBatch)?)?;
+    let selection: Option<String> = tx
+        .query_row(
+            "SELECT body FROM batch_selection WHERE batch_id=?1",
+            [batch_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(digest) = &dispatch.selection_policy_digest {
+        let selected: crate::selective::FrozenSelection =
+            serde_json::from_str(selection.as_deref().ok_or(LandingError::StaleBatch)?)?;
+        if &selected.policy_digest != digest
+            || selected.base_sha != batch.base_sha
+            || selected.integration_sha != *integration
+            || selected.selection.suites() != &dispatch.suites
+        {
+            return Err(LandingError::StaleBatch);
+        }
+    } else if selection.is_some() || dispatch.suites.len() != 1 || !dispatch.suites.contains("full")
+    {
+        return Err(LandingError::StaleBatch);
+    }
+    if conflicted
+        || source != "direct"
+        || state != "observed"
+        || record.plan != dispatch
+        || i64::try_from(dispatch.installation_id).ok() != Some(binding.0)
+        || i64::try_from(dispatch.repository_id).ok() != Some(binding.1)
+        || dispatch.integration_sha != *integration
+        || dispatch.staging_ref != format!("refs/heads/sluss/{batch_id}")
+        || policy.as_deref() != Some(dispatch.policy_digest.as_str())
+        || record.workflow_path.as_deref() != Some(workflow.as_str())
+        || !paths.contains(&workflow)
+        || !crate::github::workflow_path_matches(&workflow, &snapshot.run.path)
+        || run_id.as_deref().and_then(|v| v.parse::<u64>().ok()) != Some(record.run_id)
+        || !snapshot.jobs.iter().any(|j| j.runner_id == Some(runner))
+        || record.observation != CiObservation::Successful
+        || crate::verification::observe_ci(&dispatch, record.run_id, snapshot).ok()
+            != Some(CiObservation::Successful)
+    {
+        return Err(LandingError::StaleBatch);
+    }
+    let mut admission = Vec::new();
+    for candidate in &batch.candidates {
+        let digest: String = tx.query_row(
+            "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+            params![batch_id, candidate.number as i64],
+            |r| r.get(0),
+        )?;
+        admission.push((candidate.number, candidate.head_sha.clone(), digest));
+    }
+    let admission_body = serde_json::to_vec(&(binding.2, &target, &batch.base_sha, admission))?;
+    let ci_digest_body =
+        serde_json::to_vec(&(ci_body, dispatch_body, workflow, source, selection, paths))?;
+    let plan = LandingPlan {
+        operation_id: operation_id.into(),
+        batch_id: batch_id.into(),
+        installation_id: binding.0,
+        repository_id: binding.1,
+        repository_node_id: repository_node_id.into(),
+        target_ref: format!("refs/heads/{target}"),
+        staging_ref: dispatch.staging_ref,
+        base_sha: batch.base_sha,
+        staged_sha: integration.clone(),
+        policy_digest: dispatch.policy_digest,
+        admission_digest: hex::encode(Sha256::digest(admission_body)),
+        ci_evidence_digest: hex::encode(Sha256::digest(ci_digest_body)),
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
 fn decode_row(
     id: &str,
     (body, state, repository, target): (String, String, i64, String),
