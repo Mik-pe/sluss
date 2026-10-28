@@ -1319,6 +1319,21 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .plan_batch(id, &"b".repeat(40), 1, 1)
         .unwrap()
         .unwrap();
+    assert!(matches!(
+        sluss::coordinator::prepare_github_from_provider(
+            &db,
+            &fixture_app,
+            &fixture_policy,
+            id,
+            &[".github/workflows/ci.yml".into()],
+        )
+        .await,
+        Err(sluss::coordinator::ProviderPrepareError::UnsupportedProvider)
+    ));
+    assert_eq!(
+        store.batch(id).unwrap().unwrap().0.state,
+        sluss::batch::State::Planned
+    );
     store.start_integration(id).unwrap();
     store
         .finish_integration(id, &"a".repeat(40), &"e".repeat(64))

@@ -82,6 +82,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS planning_config (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -1028,6 +1029,50 @@ impl Store {
                 "INSERT INTO batch_selection(batch_id,body) VALUES(?1,?2)",
                 params![id, serde_json::to_string(selection)?],
             )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Freeze the operator's complete declared CI policy file set. Different
+    /// workers must not prepare batches under different assumptions.
+    pub fn bind_policy_paths(
+        &mut self,
+        batch_id: &str,
+        paths: &[String],
+    ) -> Result<(), StoreError> {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        if paths.is_empty()
+            || paths.len() > 128
+            || paths.windows(2).any(|w| w[0] == w[1])
+            || paths
+                .iter()
+                .any(|path| !crate::integration::valid_policy_path(path))
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let encoded = serde_json::to_string(&paths)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (batch, _) = checked_batch(&tx, batch_id)?;
+        if !matches!(
+            batch.state,
+            State::Planned | State::Building | State::Testing { .. }
+        ) {
+            return Err(StoreError::StaleBatch);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO staging_config(id,paths) VALUES(1,?1)",
+            [&encoded],
+        )?;
+        let existing: String =
+            tx.query_row("SELECT paths FROM staging_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if existing != encoded {
+            return Err(StoreError::PolicyMismatch);
         }
         tx.commit()?;
         Ok(())

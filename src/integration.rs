@@ -306,6 +306,8 @@ impl Integration {
             "protocol.file.allow=always",
             "-c",
             "credential.helper=",
+            "-c",
+            "http.followRedirects=false",
             "push",
             "--no-verify",
             &lease,
@@ -372,6 +374,8 @@ fn remote_ref(
         "protocol.file.allow=always",
         "-c",
         "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
         "ls-remote",
         "--refs",
         "--",
@@ -511,7 +515,7 @@ impl Integration {
         })
     }
 }
-fn valid_policy_path(path: &str) -> bool {
+pub(crate) fn valid_policy_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 512
         && path
@@ -554,4 +558,178 @@ fn policy_entry(repo: &Path, commit: &str, path: &str) -> Result<(String, String
         return Err(PolicyError::Changed);
     }
     Ok((mode.into(), object.into()))
+}
+
+/// A disposable, isolated repository containing provider-observed input refs.
+/// No Git credentials are stored in this repository.
+pub struct FetchedInputs {
+    workspace: TempDir,
+}
+impl FetchedInputs {
+    pub fn repository(&self) -> PathBuf {
+        self.workspace.path().join("inputs.git")
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FetchError {
+    #[error("invalid repository, ref, or frozen input")]
+    Invalid,
+    #[error("provider refs no longer match the frozen batch")]
+    Stale,
+    #[error("fetch failed or could not be verified")]
+    Fetch,
+    #[error(transparent)]
+    Git(#[from] StageError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Read frozen refs from a local bare remote, for local deployments and tests.
+pub fn fetch_local(
+    remote: &Path,
+    target: &str,
+    batch: &crate::batch::Batch,
+) -> Result<FetchedInputs, FetchError> {
+    let remote = remote.canonicalize().map_err(|_| FetchError::Invalid)?;
+    if !remote.is_dir() {
+        return Err(FetchError::Invalid);
+    }
+    fetch_inputs(remote.as_os_str(), target, batch, None)
+}
+
+/// The GitHub remote is fixed to github.com, and secrets are supplied only to
+/// a short-lived Git process through its environment and a temporary askpass.
+#[cfg(unix)]
+pub(crate) fn fetch_github(
+    owner: &str,
+    repository: &str,
+    target: &str,
+    batch: &crate::batch::Batch,
+    token: &str,
+) -> Result<FetchedInputs, FetchError> {
+    if !crate::github::valid_name(owner)
+        || !crate::github::valid_name(repository)
+        || token.is_empty()
+        || token.len() > 4096
+        || !token.bytes().all(|b| (33..=126).contains(&b))
+    {
+        return Err(FetchError::Invalid);
+    }
+    let remote = format!("https://github.com/{owner}/{repository}.git");
+    fetch_inputs(std::ffi::OsStr::new(&remote), target, batch, Some(token))
+}
+#[cfg(not(unix))]
+pub(crate) fn fetch_github(
+    _owner: &str,
+    _repository: &str,
+    _target: &str,
+    _batch: &crate::batch::Batch,
+    _token: &str,
+) -> Result<FetchedInputs, FetchError> {
+    Err(FetchError::Git(StageError::Unsupported))
+}
+
+fn fetch_inputs(
+    remote: &std::ffi::OsStr,
+    target: &str,
+    batch: &crate::batch::Batch,
+    token: Option<&str>,
+) -> Result<FetchedInputs, FetchError> {
+    use std::collections::BTreeSet;
+    if !valid_sha(&batch.base_sha)
+        || batch.candidates.is_empty()
+        || batch.candidates.len() > 100
+        || batch
+            .candidates
+            .iter()
+            .any(|c| c.number == 0 || !valid_sha(&c.head_sha))
+        || batch
+            .candidates
+            .iter()
+            .map(|c| c.number)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != batch.candidates.len()
+        || target.is_empty()
+        || target.len() > 255
+    {
+        return Err(FetchError::Invalid);
+    }
+    let workspace = tempfile::Builder::new().prefix("sluss-inputs-").tempdir()?;
+    let repo = workspace.path().join("inputs.git");
+    let template = workspace.path().join("empty-template");
+    std::fs::create_dir(&template)?;
+    let mut init = command(workspace.path());
+    init.arg("init")
+        .arg("--bare")
+        .arg("--template")
+        .arg(&template)
+        .arg(&repo);
+    if !run_git(init, false)?.status.success() {
+        return Err(FetchError::Fetch);
+    }
+    let branch = format!("refs/heads/{target}");
+    let mut check = git(&repo);
+    check.args(["check-ref-format", &branch]);
+    if !run_git(check, false)?.status.success() {
+        return Err(FetchError::Invalid);
+    }
+    let helper = auth_helper(workspace.path(), token)?;
+    let mut fetch = git(&repo);
+    fetch
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.followRedirects=false",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--",
+        ])
+        .arg(remote)
+        .arg(format!("{branch}:refs/sluss/inputs/base"));
+    for candidate in &batch.candidates {
+        fetch.arg(format!(
+            "refs/pull/{}/head:refs/sluss/inputs/pr-{}",
+            candidate.number, candidate.number
+        ));
+    }
+    add_auth(&mut fetch, token, helper.as_ref().map(|file| file.path()));
+    if !run_git(fetch, false)?.status.success() {
+        return Err(FetchError::Fetch);
+    }
+    let verify = |reference: &str, expected: &str| -> Result<(), FetchError> {
+        let mut read = git(&repo);
+        read.args(["rev-parse", "--verify", reference]);
+        let output = run_git(read, true)?;
+        if !output.status.success() {
+            return Err(FetchError::Fetch);
+        }
+        let sha = std::str::from_utf8(&output.stdout)
+            .map_err(|_| FetchError::Fetch)?
+            .trim();
+        if sha != expected {
+            return Err(FetchError::Stale);
+        }
+        let mut kind = git(&repo);
+        kind.args(["cat-file", "-t", sha]);
+        let output = run_git(kind, true)?;
+        if !output.status.success() || output.stdout != b"commit\n" {
+            return Err(FetchError::Invalid);
+        }
+        Ok(())
+    };
+    verify("refs/sluss/inputs/base", &batch.base_sha)?;
+    for candidate in &batch.candidates {
+        verify(
+            &format!("refs/sluss/inputs/pr-{}", candidate.number),
+            &candidate.head_sha,
+        )?;
+    }
+    Ok(FetchedInputs { workspace })
 }

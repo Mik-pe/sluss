@@ -29,6 +29,12 @@ enum Command {
         /// Automatically freeze batches from reconciled queue observations.
         #[arg(long, requires = "config")]
         auto_plan: bool,
+        /// Automatically fetch and stage planned batches on GitHub.com.
+        #[arg(long, requires_all = ["config", "policy_file"])]
+        auto_stage: bool,
+        /// Complete operator-selected list of tracked CI policy files; repeat as needed.
+        #[arg(long, requires = "auto_stage")]
+        policy_file: Vec<String>,
         /// Cancel known runs when their batch is invalidated.
         #[arg(long, requires_all = ["config", "capacity"])]
         cancel_stale: bool,
@@ -206,6 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen,
         config,
         auto_plan,
+        auto_stage,
+        policy_file,
         cancel_stale,
         observe_dispatches,
         capacity,
@@ -247,6 +255,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.db.clone(),
                     policy.clone(),
                     planning,
+                    poll,
+                ));
+            }
+            if auto_stage {
+                eprintln!(
+                    "automatic staging enabled; CI dispatch remains manual and landing is disabled"
+                );
+                tokio::spawn(sluss::worker::supervise_preparation(
+                    app.clone(),
+                    cli.db.clone(),
+                    policy.clone(),
+                    policy_file,
                     poll,
                 ));
             }

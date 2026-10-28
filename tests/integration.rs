@@ -310,7 +310,7 @@ fn policy_snapshot_detects_policy_changes_and_rejects_missing_or_invalid_paths()
 fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
     use sluss::{
         batch::{Candidate, State},
-        coordinator::prepare_local,
+        coordinator::{prepare_local, prepare_local_from_remote},
         scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError},
         store::{AdmissionCandidate, Store},
         webhook::Inbox,
@@ -342,7 +342,12 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
     git(remote.path(), &["init", "--bare"]);
     git(
         source.path(),
-        &["push", remote.path().to_str().unwrap(), "main:main"],
+        &[
+            "push",
+            remote.path().to_str().unwrap(),
+            "main:main",
+            "feature:refs/pull/1/head",
+        ],
     );
     let data = tempfile::tempdir().unwrap();
     let db = data.path().join("queue.sqlite");
@@ -413,6 +418,14 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
     drop(store);
     let mut store = Store::open(&db).unwrap();
     let paths = vec![".github/workflows/ci.yml".into()];
+    let recovered =
+        prepare_local_from_remote(&mut store, id, remote.path(), "main", &paths).unwrap();
+    assert_eq!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Testing {
+            integration_sha: recovered.sha.clone()
+        }
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
         .arg("--db")
         .arg(&db)
@@ -612,4 +625,62 @@ fn integration_conflicts_fail_the_batch_without_creating_staging_refs() {
         ""
     );
     assert_eq!(git(source.path(), &["rev-parse", "main"]), base);
+}
+
+#[test]
+fn fetches_frozen_provider_refs_and_rejects_moved_inputs() {
+    use sluss::{
+        batch::{Batch, Candidate},
+        integration::{FetchError, fetch_local},
+    };
+    let (source, base, one, two) = fixture();
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        source.path(),
+        &[
+            "push",
+            remote.path().to_str().unwrap(),
+            "main:refs/heads/main",
+            "one:refs/pull/1/head",
+            "two:refs/pull/2/head",
+        ],
+    );
+    let batch = Batch::new(
+        "batch-0123456789abcdef".into(),
+        base.clone(),
+        vec![
+            Candidate {
+                number: 1,
+                head_sha: one.clone(),
+            },
+            Candidate {
+                number: 2,
+                head_sha: two.clone(),
+            },
+        ],
+    )
+    .unwrap();
+    let fetched = fetch_local(remote.path(), "main", &batch).unwrap();
+    let repo = fetched.repository();
+    let integration = build(&repo, &base, &[one.clone(), two.clone()]).unwrap();
+    let direct = build(source.path(), &base, &[one.clone(), two.clone()]).unwrap();
+    assert_eq!(integration.sha(), direct.sha());
+    assert!(matches!(
+        fetch_local(remote.path(), "../other", &batch),
+        Err(FetchError::Invalid)
+    ));
+    git(remote.path(), &["update-ref", "refs/pull/1/head", &two]);
+    assert!(matches!(
+        fetch_local(remote.path(), "main", &batch),
+        Err(FetchError::Stale)
+    ));
+    git(remote.path(), &["update-ref", "refs/pull/1/head", &one]);
+    git(remote.path(), &["update-ref", "refs/heads/main", &two]);
+    assert!(matches!(
+        fetch_local(remote.path(), "main", &batch),
+        Err(FetchError::Stale)
+    ));
+    drop(fetched);
+    assert!(!repo.exists());
 }

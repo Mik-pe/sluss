@@ -88,6 +88,9 @@ struct TokenResponse {
 }
 
 impl App {
+    pub fn supports_github_git(&self) -> bool {
+        self.api.as_str() == "https://api.github.com/"
+    }
     pub(crate) fn scope(&self) -> (&str, &str) {
         (&self.client_id, self.api.as_str())
     }
@@ -962,6 +965,55 @@ impl App {
         }
         scheduler.observe_dispatch(id, run_id)?;
         Ok(snapshot)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum InputFetchError {
+    #[error("GitHub input fetch is not authorized for this token or repository")]
+    InvalidScope,
+    #[error("GitHub input-fetch worker stopped unexpectedly")]
+    Worker,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Fetch(#[from] crate::integration::FetchError),
+}
+impl App {
+    /// Fetch provider refs only from GitHub.com with the scoped installation token.
+    pub async fn fetch_batch_inputs(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        target: &str,
+        batch: &crate::batch::Batch,
+    ) -> Result<crate::integration::FetchedInputs, InputFetchError> {
+        if token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+            || self.api.as_str() != "https://api.github.com/"
+            || !valid_name(owner)
+            || !valid_name(repository)
+        {
+            return Err(InputFetchError::InvalidScope);
+        }
+        let repo: Repository = self
+            .get_json(token, &format!("repos/{owner}/{repository}"), None)
+            .await?;
+        if repo.id != token.repository_id {
+            return Err(InputFetchError::InvalidScope);
+        }
+        let owner = owner.to_owned();
+        let repository = repository.to_owned();
+        let target = target.to_owned();
+        let batch = batch.clone();
+        let secret = token.secret().to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::integration::fetch_github(&owner, &repository, &target, &batch, &secret)
+        })
+        .await
+        .map_err(|_| InputFetchError::Worker)?
+        .map_err(InputFetchError::Fetch)
     }
 }
 

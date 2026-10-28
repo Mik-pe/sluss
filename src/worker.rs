@@ -340,3 +340,59 @@ pub async fn supervise_planning(
         sleep(delay).await;
     }
 }
+
+/// Process one planned or interrupted integration. Provider and Git failures
+/// leave the batch available for a later pass; classified merge conflicts use
+/// the durable bisection path.
+pub async fn prepare_once(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+    policy_paths: &[String],
+) -> Result<Option<crate::coordinator::PreparedIntegration>, String> {
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    let batch = store
+        .active_batches()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|batch| {
+            matches!(
+                batch.state,
+                crate::batch::State::Planned | crate::batch::State::Building
+            )
+        });
+    let Some(batch) = batch else {
+        return Ok(None);
+    };
+    crate::coordinator::prepare_github_from_provider(db, app, policy, &batch.id, policy_paths)
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+pub async fn supervise_preparation(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    policy_paths: Vec<String>,
+    poll: Duration,
+) {
+    let mut delay = poll;
+    loop {
+        match prepare_once(&app, &db, &policy, &policy_paths).await {
+            Ok(Some(batch)) => {
+                eprintln!(
+                    "prepared staging ref {} for batch {}",
+                    batch.reference, batch.batch_id
+                );
+                delay = poll;
+            }
+            Ok(None) => delay = poll,
+            Err(error) => {
+                eprintln!("automatic staging failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}

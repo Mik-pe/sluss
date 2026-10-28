@@ -40,6 +40,7 @@ pub fn prepare_local(
     staging_remote: &Path,
     policy_paths: &[String],
 ) -> Result<PreparedIntegration, PrepareError> {
+    store.bind_policy_paths(batch_id, policy_paths)?;
     let batch = store.start_integration(batch_id)?;
     let heads: Vec<String> = batch
         .candidates
@@ -71,6 +72,30 @@ pub fn prepare_local(
     })
 }
 
+#[derive(Debug, Error)]
+pub enum LocalPrepareError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Fetch(#[from] crate::integration::FetchError),
+    #[error(transparent)]
+    Prepare(#[from] PrepareError),
+}
+
+/// Exercise the same frozen-ref fetching and crash recovery against a local remote.
+pub fn prepare_local_from_remote(
+    store: &mut Store,
+    batch_id: &str,
+    remote: &Path,
+    target: &str,
+    policy_paths: &[String],
+) -> Result<PreparedIntegration, LocalPrepareError> {
+    store.bind_policy_paths(batch_id, policy_paths)?;
+    let batch = store.start_integration(batch_id)?;
+    let inputs = crate::integration::fetch_local(remote, target, &batch)?;
+    prepare_local(store, batch_id, &inputs.repository(), remote, policy_paths).map_err(Into::into)
+}
+
 pub struct GitHubRepository<'a> {
     pub owner: &'a str,
     pub repository: &'a str,
@@ -91,6 +116,7 @@ pub async fn prepare_github(
     if store.repository_scope()? != (App::installation_id(token), App::repository_id(token)) {
         return Err(StoreError::RepositoryMismatch.into());
     }
+    store.bind_policy_paths(batch_id, policy_paths)?;
     let batch = store.start_integration(batch_id)?;
     let heads: Vec<String> = batch
         .candidates
@@ -137,4 +163,96 @@ pub async fn prepare_github(
         reference: staged.reference,
         policy_digest: policy.digest,
     })
+}
+
+#[derive(Debug, Error)]
+pub enum ProviderPrepareError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Inbox(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Reconcile(#[from] crate::reconcile::ReconcileError),
+    #[error(transparent)]
+    GitHub(#[from] crate::github::GitHubError),
+    #[error(transparent)]
+    Fetch(#[from] crate::github::InputFetchError),
+    #[error(transparent)]
+    Prepare(#[from] PrepareError),
+    #[error("reconciliation was consumed concurrently; retry preparation")]
+    ReconciliationRace,
+    #[error("automatic Git staging requires the GitHub.com API")]
+    UnsupportedProvider,
+    #[error("no usable policy files configured")]
+    MissingPolicy,
+}
+
+/// Refresh admission, fetch exact input refs into a disposable repository,
+/// then build and publish an isolated staging ref. This does not start CI or
+/// authorize landing. Ambiguous failures are reconciled by the existing
+/// deterministic integration and staging-ref readback on the next pass.
+pub async fn prepare_github_from_provider(
+    db: &Path,
+    app: &App,
+    policy: &crate::reconcile::RepositoryPolicy,
+    batch_id: &str,
+    policy_paths: &[String],
+) -> Result<PreparedIntegration, ProviderPrepareError> {
+    if policy_paths.is_empty() {
+        return Err(ProviderPrepareError::MissingPolicy);
+    }
+    if !app.supports_github_git() {
+        return Err(ProviderPrepareError::UnsupportedProvider);
+    }
+    let mut store = Store::open(db)?;
+    if store.repository_scope()? != (policy.installation as u64, policy.repository as u64) {
+        return Err(StoreError::RepositoryMismatch.into());
+    }
+    let mut inbox = crate::webhook::Inbox::open(db)?;
+    inbox.schedule_if_idle(policy.installation, policy.repository)?;
+    let job = inbox
+        .pending_for(policy.installation, policy.repository)?
+        .ok_or(ProviderPrepareError::ReconciliationRace)?;
+    let read_token = app
+        .read_token(policy.installation as u64, policy.repository as u64)
+        .await?;
+    crate::reconcile::reconcile_once(app, &read_token, &mut store, &job, policy).await?;
+    store.bind_policy_paths(batch_id, policy_paths)?;
+    let batch = store.start_integration(batch_id)?;
+    let inputs = match app
+        .fetch_batch_inputs(
+            &read_token,
+            &policy.owner,
+            &policy.name,
+            &policy.target_branch,
+            &batch,
+        )
+        .await
+    {
+        Ok(inputs) => inputs,
+        Err(
+            error @ crate::github::InputFetchError::Fetch(crate::integration::FetchError::Stale),
+        ) => {
+            inbox.schedule_if_idle(policy.installation, policy.repository)?;
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let write_token = app
+        .staging_token(policy.installation as u64, policy.repository as u64)
+        .await?;
+    prepare_github(
+        &mut store,
+        app,
+        &write_token,
+        GitHubRepository {
+            owner: &policy.owner,
+            repository: &policy.name,
+        },
+        batch_id,
+        &inputs.repository(),
+        policy_paths,
+    )
+    .await
+    .map_err(Into::into)
 }
