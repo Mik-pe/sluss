@@ -77,6 +77,29 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Scope fixed by successful repository reconciliation.
+    pub fn repository_scope(&self) -> Result<(u64, u64), StoreError> {
+        let binding: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT installation,repository FROM repository_binding WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (installation, repository) = binding.ok_or(StoreError::Unbound)?;
+        Ok((
+            u64::try_from(installation)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(StoreError::RepositoryMismatch)?,
+            u64::try_from(repository)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(StoreError::RepositoryMismatch)?,
+        ))
+    }
+
     pub fn paused(&self) -> Result<bool, StoreError> {
         Ok(self
             .conn

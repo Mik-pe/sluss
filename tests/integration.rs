@@ -363,6 +363,29 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
         .apply_admission_reconciliation(&event, &"e".repeat(64), &[admission])
         .unwrap();
     let id = "batch-0123456789abcdef";
+    let wrong_scope = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["prepare-github", "--batch-id", id, "--source"])
+        .arg(source.path())
+        .args([
+            "--owner",
+            "owner",
+            "--repository",
+            "repo",
+            "--app-client-id",
+            "app",
+            "--installation-id",
+            "999",
+            "--repository-id",
+            "2",
+            "--policy-file",
+            ".github/workflows/ci.yml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_scope.status.success());
+    assert!(String::from_utf8_lossy(&wrong_scope.stderr).contains("repository does not match"));
     let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
         .arg("--db")
         .arg(&db)

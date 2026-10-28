@@ -187,7 +187,10 @@ async fn token(
     assert_eq!(id, 42);
     assert_eq!(body["repository_ids"], json!([7]));
     let write = body["permissions"]["actions"] == "write";
-    if write {
+    let staging = body["permissions"]["contents"] == "write";
+    if staging {
+        assert_eq!(body["permissions"], json!({"contents":"write"}));
+    } else if write {
         assert_eq!(
             body["permissions"],
             json!({"actions":"write","contents":"read"})
@@ -244,8 +247,14 @@ async fn token(
             ("metadata", "read"),
         ]);
     }
+    if staging {
+        permissions = BTreeMap::from([("contents", "write"), ("metadata", "read")]);
+    }
     if mode == 3 {
         permissions.insert("contents", "write");
+    }
+    if mode == 27 {
+        permissions.insert("actions", "write");
     }
     let repo = if mode == 4 { 8 } else { 7 };
     (
@@ -903,5 +912,124 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         DispatchState::Prepared
     );
     assert_eq!(posts.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn staging_tokens_are_scoped_and_never_sent_from_a_non_github_origin() {
+    use sluss::github::StagingError;
+    let (_key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let stage_token = client.staging_token(42, 7).await.unwrap();
+    assert!(!format!("{stage_token:?}").contains(stage_token.secret()));
+    mode.store(27, Ordering::SeqCst);
+    assert!(matches!(
+        client.staging_token(42, 7).await,
+        Err(GitHubError::InvalidResponse)
+    ));
+    mode.store(0, Ordering::SeqCst);
+    let source = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(source.path())
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    };
+    git(&["init", "-b", "main"]);
+    std::fs::write(source.path().join("base"), "base").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    std::fs::write(source.path().join("next"), "next").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "next"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let integration =
+        sluss::integration::build(source.path(), &base, std::slice::from_ref(&head)).unwrap();
+    assert!(matches!(
+        client
+            .stage_integration(
+                &stage_token,
+                "owner",
+                "repo",
+                integration,
+                "batch-0123456789abcdef"
+            )
+            .await,
+        Err(StagingError::InvalidScope)
+    ));
+    let data = tempfile::tempdir().unwrap();
+    let db = data.path().join("queue.sqlite");
+    let mut inbox = sluss::webhook::Inbox::open(&db).unwrap();
+    let mut store = sluss::store::Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let admitted = sluss::store::AdmissionCandidate {
+        candidate: sluss::batch::Candidate {
+            number: 1,
+            head_sha: head,
+        },
+        evidence_digest: "f".repeat(64),
+    };
+    store
+        .apply_admission_reconciliation(&event, &"e".repeat(64), &[admitted])
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store.plan_batch(id, &base, 1, 1).unwrap().unwrap();
+    assert!(matches!(
+        sluss::coordinator::prepare_github(
+            &mut store,
+            &client,
+            &stage_token,
+            sluss::coordinator::GitHubRepository {
+                owner: "owner",
+                repository: "repo"
+            },
+            id,
+            source.path(),
+            &["base".into()]
+        )
+        .await,
+        Err(sluss::coordinator::PrepareError::GitHubStage(
+            StagingError::InvalidScope
+        ))
+    ));
+    assert_eq!(
+        store.batch(id).unwrap().unwrap().0.state,
+        sluss::batch::State::Building
+    );
     server.abort();
 }

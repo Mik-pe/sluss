@@ -55,6 +55,25 @@ enum Command {
         #[arg(long, required = true)]
         policy_file: Vec<String>,
     },
+    /// Publish an experimental staging ref to a GitHub repository.
+    PrepareGithub {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        app_client_id: String,
+        #[arg(long)]
+        installation_id: u64,
+        #[arg(long)]
+        repository_id: u64,
+        #[arg(long, required = true)]
+        policy_file: Vec<String>,
+    },
     /// Show local queue state and implementation status.
     Status,
     /// Show reconciled PR observations.
@@ -213,6 +232,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &staging_remote,
                 &policy_file,
             )?;
+            println!(
+                "staged {} at {} (policy {})",
+                result.sha, result.reference, result.policy_digest
+            );
+            println!("CI and landing are not authorized by this result");
+        }
+        Command::PrepareGithub {
+            batch_id,
+            source,
+            owner,
+            repository,
+            app_client_id,
+            installation_id,
+            repository_id,
+            policy_file,
+        } => {
+            let mut store = store;
+            if store.repository_scope()? != (installation_id, repository_id) {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app = sluss::github::App::new(app_client_id, &key, "https://api.github.com/")?;
+            let token = app.staging_token(installation_id, repository_id).await?;
+            let result = sluss::coordinator::prepare_github(
+                &mut store,
+                &app,
+                &token,
+                sluss::coordinator::GitHubRepository {
+                    owner: &owner,
+                    repository: &repository,
+                },
+                &batch_id,
+                &source,
+                &policy_file,
+            )
+            .await?;
             println!(
                 "staged {} at {} (policy {})",
                 result.sha, result.reference, result.policy_digest

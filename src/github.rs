@@ -39,6 +39,7 @@ pub struct InstallationToken {
     repository_id: u64,
     installation_id: u64,
     actions_write: bool,
+    contents_write: bool,
     app_client_id: String,
     api_origin: String,
 }
@@ -54,6 +55,12 @@ impl fmt::Debug for InstallationToken {
             .field("expires_at", &self.expires_at)
             .finish()
     }
+}
+#[derive(Clone, Copy)]
+enum TokenPurpose {
+    Read,
+    Dispatch,
+    Staging,
 }
 #[derive(Serialize)]
 struct Claims<'a> {
@@ -132,7 +139,8 @@ impl App {
         installation_id: u64,
         repository_id: u64,
     ) -> Result<InstallationToken, GitHubError> {
-        self.mint_token(installation_id, repository_id, false).await
+        self.mint_token(installation_id, repository_id, TokenPurpose::Read)
+            .await
     }
     /// Separate, repository-scoped credential for explicit workflow dispatch.
     pub async fn dispatch_token(
@@ -140,13 +148,24 @@ impl App {
         installation_id: u64,
         repository_id: u64,
     ) -> Result<InstallationToken, GitHubError> {
-        self.mint_token(installation_id, repository_id, true).await
+        self.mint_token(installation_id, repository_id, TokenPurpose::Dispatch)
+            .await
+    }
+    /// Explicit write credential scoped to staging one repository. Repository
+    /// rules must independently prevent writes to protected target branches.
+    pub async fn staging_token(
+        &self,
+        installation_id: u64,
+        repository_id: u64,
+    ) -> Result<InstallationToken, GitHubError> {
+        self.mint_token(installation_id, repository_id, TokenPurpose::Staging)
+            .await
     }
     async fn mint_token(
         &self,
         installation_id: u64,
         repository_id: u64,
-        actions_write: bool,
+        purpose: TokenPurpose,
     ) -> Result<InstallationToken, GitHubError> {
         if installation_id == 0 || repository_id == 0 {
             return Err(GitHubError::InvalidConfiguration);
@@ -156,15 +175,15 @@ impl App {
             .map_err(|_| GitHubError::Clock)?
             .as_secs();
         let jwt = self.jwt(now)?;
-        let permissions = if actions_write {
-            BTreeMap::from([("actions", "write"), ("contents", "read")])
-        } else {
-            BTreeMap::from([
+        let permissions = match purpose {
+            TokenPurpose::Dispatch => BTreeMap::from([("actions", "write"), ("contents", "read")]),
+            TokenPurpose::Staging => BTreeMap::from([("contents", "write")]),
+            TokenPurpose::Read => BTreeMap::from([
                 ("actions", "read"),
                 ("checks", "read"),
                 ("contents", "read"),
                 ("pull_requests", "read"),
-            ])
+            ]),
         };
         let body = RequestBody {
             repository_ids: [repository_id],
@@ -211,10 +230,9 @@ impl App {
             || response.expires_at.is_empty()
             || response.repositories.len() != 1
             || response.repositories[0].id != repository_id
-            || response
-                .permissions
-                .iter()
-                .any(|(k, v)| v != "read" && !(actions_write && k == "actions" && v == "write"))
+            || response.permissions.iter().any(|(k, v)| {
+                v != "read" && body.permissions.get(k.as_str()).copied() != Some(v.as_str())
+            })
             || body.permissions.iter().any(|(k, expected)| {
                 response.permissions.get(*k).map(String::as_str) != Some(*expected)
             })
@@ -226,7 +244,8 @@ impl App {
             expires_at: response.expires_at,
             repository_id,
             installation_id,
-            actions_write,
+            actions_write: matches!(purpose, TokenPurpose::Dispatch),
+            contents_write: matches!(purpose, TokenPurpose::Staging),
             app_client_id: self.client_id.clone(),
             api_origin: self.api.as_str().to_owned(),
         })
@@ -872,5 +891,57 @@ impl App {
         }
         scheduler.observe_dispatch(id, run_id)?;
         Ok(snapshot)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum StagingError {
+    #[error("staging token or GitHub origin is not authorized for this operation")]
+    InvalidScope,
+    #[error("staging worker stopped; publication outcome may be uncertain")]
+    Worker,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Git(#[from] crate::integration::StageError),
+}
+impl App {
+    /// Publish with a repository-scoped Contents-write App token after checking
+    /// repository identity. Only GitHub.com is supported because the Git remote
+    /// constructed by the integration builder is fixed to github.com.
+    /// Branch rules must deny this token permission to change the target branch.
+    pub async fn stage_integration(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        integration: crate::integration::Integration,
+        id: &str,
+    ) -> Result<crate::integration::Staged, StagingError> {
+        if !token.contents_write
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+            || self.api.as_str() != "https://api.github.com/"
+            || !valid_name(owner)
+            || !valid_name(repository)
+        {
+            return Err(StagingError::InvalidScope);
+        }
+        let observed: Repository = self
+            .get_json(token, &format!("repos/{owner}/{repository}"), None)
+            .await?;
+        if observed.id != token.repository_id {
+            return Err(StagingError::InvalidScope);
+        }
+        let owner = owner.to_owned();
+        let repository = repository.to_owned();
+        let id = id.to_owned();
+        let secret = token.secret().to_owned();
+        tokio::task::spawn_blocking(move || {
+            integration.stage_github(&owner, &repository, &secret, &id)
+        })
+        .await
+        .map_err(|_| StagingError::Worker)?
+        .map_err(StagingError::Git)
     }
 }
