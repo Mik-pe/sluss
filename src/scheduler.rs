@@ -1656,6 +1656,22 @@ impl Scheduler {
         Ok(run)
     }
 
+    /// Return the frozen installation, repository and run for accounting reads.
+    pub fn rerun_metric_scope(&self, id: &str) -> Result<(u64, u64, u64), SchedulerError> {
+        let (plan, run, _) = direct_metric_identity(&self.conn, id)?;
+        Ok((plan.installation_id, plan.repository_id, run))
+    }
+
+    /// Recheck a provider run against the frozen direct receipt and workflow.
+    pub fn validate_rerun_metric_run(
+        &self,
+        id: &str,
+        run: &crate::github::ActionsRun,
+    ) -> Result<(), SchedulerError> {
+        let (plan, expected, workflow) = direct_metric_identity(&self.conn, id)?;
+        validate_metric_run(&plan, expected, &workflow, run)
+    }
+
     /// Record a completed rerun only when the first attempt anchored a host.
     /// Callers must obtain an authenticated, consistent provider snapshot.
     /// This is accounting only and cannot change CI evidence or capacity.
@@ -1680,26 +1696,10 @@ impl Scheduler {
         }
         let (plan, expected_run, workflow) = direct_metric_identity(&tx, id)?;
         let run = &snapshot.run;
-        let branch = plan
-            .staging_ref
-            .strip_prefix("refs/heads/")
-            .ok_or(SchedulerError::Invalid)?;
-        if run.id != expected_run
-            || !(2..=100).contains(&run.run_attempt)
-            || run.workflow_id != plan.workflow_id
-            || run.repository.id != plan.repository_id
-            || run.head_repository.as_ref().map(|r| r.id) != Some(plan.repository_id)
-            || run.head_sha != plan.integration_sha
-            || run.head_branch.as_deref() != Some(branch)
-            || run.event != "workflow_dispatch"
+        validate_metric_run(&plan, expected_run, &workflow, run)?;
+        if run.run_attempt < 2
             || run.status != "completed"
             || run.conclusion.as_deref().is_none_or(str::is_empty)
-            || !crate::github::workflow_path_matches(
-                &workflow,
-                &run.path,
-                &plan.staging_ref,
-                &plan.integration_sha,
-            )
         {
             return Err(SchedulerError::DispatchTransition);
         }
@@ -1919,6 +1919,37 @@ impl Scheduler {
         tx.commit()?;
         Ok(inserted)
     }
+}
+
+fn validate_metric_run(
+    plan: &DispatchPlan,
+    expected_run: u64,
+    workflow: &str,
+    run: &crate::github::ActionsRun,
+) -> Result<(), SchedulerError> {
+    let branch = plan
+        .staging_ref
+        .strip_prefix("refs/heads/")
+        .ok_or(SchedulerError::Invalid)?;
+    if run.id != expected_run
+        || !(1..=100).contains(&run.run_attempt)
+        || run.workflow_id != plan.workflow_id
+        || run.repository.id != plan.repository_id
+        || run.head_repository.as_ref().map(|r| r.id) != Some(plan.repository_id)
+        || run.head_sha != plan.integration_sha
+        || run.head_branch.as_deref() != Some(branch)
+        || run.event != "workflow_dispatch"
+        || run.status.is_empty()
+        || !crate::github::workflow_path_matches(
+            workflow,
+            &run.path,
+            &plan.staging_ref,
+            &plan.integration_sha,
+        )
+    {
+        return Err(SchedulerError::DispatchTransition);
+    }
+    Ok(())
 }
 
 fn direct_metric_identity(

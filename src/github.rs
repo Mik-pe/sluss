@@ -1258,6 +1258,27 @@ pub struct ActionsSnapshot {
     pub run: ActionsRun,
     pub jobs: Vec<ActionsJob>,
 }
+/// Partial accounting of explicitly observed rerun attempts, not CI evidence.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RerunMetricsReport {
+    pub run_id: u64,
+    pub latest_attempt: Option<u32>,
+    pub completed_attempts: usize,
+    pub pending_attempts: usize,
+    pub new_jobs: usize,
+}
+#[derive(Debug, Error)]
+pub enum RerunMetricsError {
+    #[error("attempt must be between 2 and 100")]
+    InvalidAttempt,
+    #[error("rerun collection exceeds 10000 observed jobs")]
+    Limit,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Scheduler(#[from] crate::scheduler::SchedulerError),
+}
+
 #[derive(Deserialize)]
 struct ActionsJobsPage {
     total_count: usize,
@@ -1391,6 +1412,100 @@ impl App {
             }
         }
         Err(GitHubError::UnstableObservation)
+    }
+
+    /// Collect one attempt or discover all observed attempts on a direct run.
+    /// Each completed attempt is committed separately and is safe to re-read.
+    pub async fn collect_rerun_metrics(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        attempt: Option<u32>,
+    ) -> Result<RerunMetricsReport, RerunMetricsError> {
+        let (installation, repository_id, run_id) = scheduler.rerun_metric_scope(id)?;
+        if token.installation_id != installation || token.repository_id != repository_id {
+            return Err(GitHubError::InvalidConfiguration.into());
+        }
+        let mut result = RerunMetricsReport {
+            run_id,
+            latest_attempt: None,
+            completed_attempts: 0,
+            pending_attempts: 0,
+            new_jobs: 0,
+        };
+        if let Some(attempt) = attempt {
+            if !(2..=100).contains(&attempt) {
+                return Err(RerunMetricsError::InvalidAttempt);
+            }
+            let snapshot = self
+                .observe_actions_attempt(token, owner, repository, run_id, attempt)
+                .await?;
+            result.new_jobs = scheduler.record_rerun_metrics(id, &snapshot)?;
+            result.completed_attempts = 1;
+            return Ok(result);
+        }
+        let first = self
+            .observe_latest_actions_run(token, owner, repository, run_id)
+            .await?;
+        scheduler.validate_rerun_metric_run(id, &first)?;
+        result.latest_attempt = Some(first.run_attempt);
+        let mut seen_jobs = 0usize;
+        for attempt in 2..=first.run_attempt {
+            let snapshot = self
+                .observe_actions_attempt(token, owner, repository, run_id, attempt)
+                .await?;
+            scheduler.validate_rerun_metric_run(id, &snapshot.run)?;
+            seen_jobs = seen_jobs
+                .checked_add(snapshot.jobs.len())
+                .ok_or(RerunMetricsError::Limit)?;
+            if seen_jobs > 10_000 {
+                return Err(RerunMetricsError::Limit);
+            }
+            match snapshot.run.status.as_str() {
+                "completed" => {}
+                "queued" | "in_progress" | "waiting" | "requested" | "pending" => {
+                    result.pending_attempts += 1;
+                    continue;
+                }
+                _ => return Err(GitHubError::UnstableObservation.into()),
+            }
+            result.new_jobs += scheduler.record_rerun_metrics(id, &snapshot)?;
+            result.completed_attempts += 1;
+        }
+        let last = self
+            .observe_latest_actions_run(token, owner, repository, run_id)
+            .await?;
+        if first != last {
+            return Err(GitHubError::UnstableObservation.into());
+        }
+        scheduler.validate_rerun_metric_run(id, &last)?;
+        Ok(result)
+    }
+
+    async fn observe_latest_actions_run(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        run_id: u64,
+    ) -> Result<ActionsRun, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) || run_id == 0 {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let path = format!("repos/{owner}/{repository}/actions/runs/{run_id}");
+        let first: ActionsRun = self.get_json(token, &path, None).await?;
+        let last: ActionsRun = self.get_json(token, &path, None).await?;
+        if first != last
+            || first.id != run_id
+            || first.repository.id != token.repository_id
+            || !(1..=100).contains(&first.run_attempt)
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(first)
     }
 
     /// Obtain two matching snapshots of one exact attempt, with bounded and

@@ -238,10 +238,11 @@ async fn actions_jobs(
     let jobs: Vec<Value> = (0..count).map(|n| json!({"id":if separate_host { 124 } else { (page-1)*100+n+1 },"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103 | 129) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":if separate_host { 2 } else { 1 }})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
-async fn rerun_run(headers: HeaderMap) -> Json<Value> {
+async fn rerun_run(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let running = state.mode.load(Ordering::SeqCst) == 250;
     Json(
-        json!({"id":123,"run_attempt":2,"workflow_id":17,"head_sha":"a".repeat(40),"head_branch":"sluss/batch-0123456789abcdef","path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":"workflow_dispatch","status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":7}}),
+        json!({"id":123,"run_attempt":2,"workflow_id":17,"head_sha":"a".repeat(40),"head_branch":"sluss/batch-0123456789abcdef","path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":"workflow_dispatch","status":if running {"in_progress"} else {"completed"},"conclusion":if running {None} else {Some("success")},"repository":{"id":7},"head_repository":{"id":7}}),
     )
 }
 async fn rerun_jobs(
@@ -334,7 +335,9 @@ async fn dispatched_run(
     } else {
         "workflow_dispatch"
     };
-    let attempt = if latest && (mode == 21 || (mode == 42 && count >= 6)) {
+    let attempt = if latest
+        && (mode == 21 || mode == 250 || (mode == 251 && count >= 2) || (mode == 42 && count >= 6))
+    {
         2
     } else {
         1
@@ -354,12 +357,12 @@ async fn dispatched_run(
         ".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef"
     };
     let sha = if mode == 22 && count >= 3 { "b" } else { "a" };
-    let status = if matches!(mode, 31 | 32) {
+    let status = if matches!(mode, 31 | 32 | 250) {
         "in_progress"
     } else {
         "completed"
     };
-    let conclusion = if matches!(mode, 31 | 32) {
+    let conclusion = if matches!(mode, 31 | 32 | 250) {
         None
     } else if matches!(mode, 40 | 95..=100 | 103 | 129) {
         Some("failure")
@@ -4206,6 +4209,67 @@ async fn cli_dispatches_fixture() {
     assert_eq!(
         (rerun_totals.rerun_jobs, rerun_totals.rerun_milliseconds),
         (1, 120_000)
+    );
+    for (case, expected, succeeds) in [
+        (
+            21,
+            "1 completed reruns, 0 unfinished reruns, 0 new job measurements",
+            true,
+        ),
+        (
+            250,
+            "0 completed reruns, 1 unfinished reruns, 0 new job measurements",
+            true,
+        ),
+        (251, "", false),
+    ] {
+        mode.store(case, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        let result = {
+            let hidden_db = hidden_db.clone();
+            let config = config.clone();
+            let capacity = capacity.clone();
+            let key = key_dir.path().join("test-key.pem");
+            tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_sluss"))
+                    .arg("--db")
+                    .arg(hidden_db)
+                    .args([
+                        "collect-rerun-metrics",
+                        "--batch-id",
+                        id,
+                        "--all-attempts",
+                        "--config",
+                    ])
+                    .arg(config)
+                    .arg("--capacity")
+                    .arg(capacity)
+                    .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            result.status.success(),
+            succeeds,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if succeeds {
+            assert!(String::from_utf8_lossy(&result.stdout).contains(expected));
+        }
+    }
+    mode.store(67, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        Store::open(&hidden_db)
+            .unwrap()
+            .metrics()
+            .unwrap()
+            .rerun_jobs,
+        1
     );
     let mut hidden_journal = sluss::landing::LandingJournal::open(&hidden_db).unwrap();
     assert!(matches!(

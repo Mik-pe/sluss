@@ -368,12 +368,19 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
-    /// Record measured jobs from a specific completed rerun of a known dispatch.
+    /// Record measured jobs from one or all observed reruns of a known dispatch.
     CollectRerunMetrics {
         #[arg(long)]
         batch_id: String,
-        #[arg(long)]
-        attempt: u32,
+        #[arg(
+            long,
+            required_unless_present = "all_attempts",
+            conflicts_with = "all_attempts"
+        )]
+        attempt: Option<u32>,
+        /// Discover all attempts through GitHub; unfinished attempts are skipped.
+        #[arg(long, required_unless_present = "attempt")]
+        all_attempts: bool,
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -2177,10 +2184,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::CollectRerunMetrics {
             batch_id,
             attempt,
+            all_attempts: _,
             config,
             capacity,
         } => {
-            if !(2..=100).contains(&attempt) {
+            if attempt.is_some_and(|attempt| !(2..=100).contains(&attempt)) {
                 return Err("attempt must be between 2 and 100".into());
             }
             let config = sluss::config::Config::load(&config)?;
@@ -2194,7 +2202,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let mut scheduler =
                 sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
-            let run_id = scheduler.rerun_metric_run(&batch_id)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let app = new_cli_app(
@@ -2208,19 +2215,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     config.github.repository_id as u64,
                 )
                 .await?;
-            let snapshot = app
-                .observe_actions_attempt(
+            let report = app
+                .collect_rerun_metrics(
+                    &mut scheduler,
                     &token,
                     &config.github.owner,
                     &config.github.repository,
-                    run_id,
+                    &batch_id,
                     attempt,
                 )
                 .await?;
-            let recorded = scheduler.record_rerun_metrics(&batch_id, &snapshot)?;
-            println!(
-                "recorded {recorded} new completed job measurements for run {run_id} attempt {attempt}"
-            );
+            if let Some(attempt) = attempt {
+                println!(
+                    "recorded {} new completed job measurements for run {} attempt {attempt}",
+                    report.new_jobs, report.run_id
+                );
+            } else {
+                println!(
+                    "run {}: latest attempt {}; {} completed reruns, {} unfinished reruns, {} new job measurements",
+                    report.run_id,
+                    report.latest_attempt.ok_or("missing attempt observation")?,
+                    report.completed_attempts,
+                    report.pending_attempts,
+                    report.new_jobs
+                );
+            }
             println!(
                 "Accounting only: this does not attest CI, authorize landing or release capacity."
             );
