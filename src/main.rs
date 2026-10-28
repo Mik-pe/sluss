@@ -107,6 +107,8 @@ enum Command {
     },
     /// Show local queue state and implementation status.
     Status,
+    /// Show runner time for completed jobs observed by Sluss.
+    Metrics,
     /// Show reconciled PR observations.
     Queue,
     /// Persist a pause for future scheduler implementations.
@@ -441,9 +443,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             let placement = sluss::verification::check_host_placement(&snapshot, runners)?;
+            let recorded = scheduler.record_job_metrics(&batch_id, &snapshot)?;
             println!(
-                "run {}: status {}, conclusion {:?}, placement {:?}",
-                snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement
+                "run {}: status {}, conclusion {:?}, placement {:?}; {} new completed job measurements",
+                snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement, recorded
             );
             println!("observation does not authorize landing or release reserved capacity");
         }
@@ -463,6 +466,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.paused()?,
             store.candidates()?.len()
         ),
+        Command::Metrics => {
+            let metrics = store.metrics()?;
+            println!(
+                "observed completed jobs: {}\nobserved runner-minutes: {:.2}\nOnly completed jobs recorded by Sluss are included; PR delivery and reruns are not yet measured.",
+                metrics.completed_jobs,
+                metrics.runner_milliseconds as f64 / 60_000.0
+            );
+        }
         Command::Queue => {
             let failed: std::collections::BTreeMap<_, _> = store
                 .failed_candidates()?

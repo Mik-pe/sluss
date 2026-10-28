@@ -12,6 +12,8 @@ pub enum StoreError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Metrics(#[from] crate::metrics::MetricsError),
     #[error("batch already exists or was changed by another worker")]
     Conflict,
     #[error("invalid PR number or empty head SHA")]
@@ -74,7 +76,13 @@ impl Store {
                 id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
             );",
         )?;
+        crate::metrics::ensure_schema(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Summarize completed jobs observed by Sluss, not all repository CI.
+    pub fn metrics(&self) -> Result<crate::metrics::Summary, StoreError> {
+        Ok(crate::metrics::summarize(&self.conn)?)
     }
 
     /// Scope fixed by successful repository reconciliation.

@@ -12,6 +12,7 @@ The current code contains a durable SQLite queue of PR **observations**, a batch
 cargo test
 cargo run -- status
 cargo run -- queue
+cargo run -- metrics
 cargo run -- pause
 cargo run -- resume
 cargo run -- doctor
@@ -33,6 +34,8 @@ sluss --db sluss.sqlite prepare-local --batch-id batch-0123456789abcdef --source
 The operator must independently obtain the target base SHA and list every policy file; the source must contain the frozen commit objects. Preparing a batch does not start CI or grant merge permission. The local staging remote must be trusted and must not trigger unintended workloads. This path is for development and has not been validated against a live GitHub App.
 
 A prepared GitHub staging batch can be dispatched explicitly with `sluss dispatch-github --batch-id <id> --config /path/to/sluss.toml --capacity /path/to/capacity.toml --pool rust=1 --workflow-id <id>`. The capacity file describes global pool limits and physical machines; see [the example](examples/capacity.toml). The selected host's unique `sluss-host-*` label is passed as the workflow input in [this single-job example](examples/github-actions/sluss-ci.yml). `sluss observe-dispatch --help` describes how to compare the reported runner against the host's configured runner IDs; `sluss cancel-dispatch` only releases a reservation that has not been claimed. This path has been exercised with a local GitHub stub, not GitHub or real runners. Before dispatch, Sluss reads the repository runner register using a separate Administration-read App token and compares it with the configured IDs and labels. Organization and enterprise runners are not covered, and physical placement remains operator-supplied. Correct host labels, trusted workflow contents, isolated runners and rerun restrictions remain operator prerequisites; observation does not release capacity or authorize landing.
+
+`sluss metrics` sums actual start-to-finish time for completed, host-checked jobs observed by Sluss. Repeated reads of the same job do not double count it. This is a partial observation set: it excludes jobs Sluss has not observed, unverified placement and rerun attempts, and does not yet report delivered PRs or per-PR savings.
 
 The database defaults to `sluss.sqlite` in the current directory; use `--db PATH` to select another. The pause flag and observations survive restarts; pause also stops the experimental batch planner. Queue entries must eventually be reconciled against GitHub; an observation is never an approval.
 

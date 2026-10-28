@@ -9,6 +9,7 @@ pub mod config;
 pub mod coordinator;
 pub mod github;
 pub mod integration;
+pub mod metrics;
 pub mod reconcile;
 pub mod scheduler;
 pub mod store;

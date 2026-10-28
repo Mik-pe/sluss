@@ -242,3 +242,82 @@ fn only_one_worker_claims_a_dispatch_after_restart() {
         1
     );
 }
+
+#[test]
+fn completed_job_metrics_are_idempotent_and_reject_conflicting_or_invalid_evidence() {
+    use sluss::{
+        github::{ActionsJob, ActionsRepository, ActionsRun, ActionsSnapshot},
+        metrics::MetricsError,
+        store::Store,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("metrics.sqlite");
+    let mut configured = capacity();
+    configured
+        .hosts
+        .get_mut("mac")
+        .unwrap()
+        .runner_ids
+        .insert(41);
+    let mut scheduler = Scheduler::open(&db, configured).unwrap();
+    let plan = dispatch_plan();
+    scheduler
+        .reserve_dispatch("job", &request(&[("macos", 1)]), &plan)
+        .unwrap()
+        .unwrap();
+    scheduler.claim_dispatch("job").unwrap();
+    scheduler.record_receipt("job", 50).unwrap();
+    scheduler.observe_dispatch("job", 50).unwrap();
+    let mut snapshot = ActionsSnapshot {
+        run: ActionsRun {
+            id: 50,
+            run_attempt: 1,
+            workflow_id: 3,
+            head_sha: "a".repeat(40),
+            head_branch: Some("sluss/batch-0123456789abcdef".into()),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 99,
+            run_id: 50,
+            head_sha: "a".repeat(40),
+            name: "tests".into(),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            started_at: Some("2026-01-01T00:00:30Z".into()),
+            completed_at: Some("2026-01-01T00:02:00Z".into()),
+            runner_id: Some(41),
+        }],
+    };
+    assert_eq!(scheduler.record_job_metrics("job", &snapshot).unwrap(), 1);
+    assert_eq!(scheduler.record_job_metrics("job", &snapshot).unwrap(), 0);
+    snapshot.jobs[0].completed_at = Some("2026-01-01T00:03:00Z".into());
+    assert!(matches!(
+        scheduler.record_job_metrics("job", &snapshot),
+        Err(SchedulerError::Metrics(MetricsError::ConflictingJob))
+    ));
+    snapshot.jobs[0].id = 100;
+    snapshot.jobs[0].completed_at = Some("2026-01-01T00:00:00Z".into());
+    assert!(matches!(
+        scheduler.record_job_metrics("job", &snapshot),
+        Err(SchedulerError::Metrics(MetricsError::InvalidJob))
+    ));
+    snapshot.jobs[0].completed_at = Some("bad timestamp".into());
+    assert!(matches!(
+        scheduler.record_job_metrics("job", &snapshot),
+        Err(SchedulerError::Metrics(MetricsError::InvalidJob))
+    ));
+    snapshot.jobs[0].runner_id = Some(42);
+    assert!(matches!(
+        scheduler.record_job_metrics("job", &snapshot),
+        Err(SchedulerError::Metrics(MetricsError::InvalidJob))
+    ));
+    let totals = Store::open(&db).unwrap().metrics().unwrap();
+    assert_eq!(totals.completed_jobs, 1);
+    assert_eq!(totals.runner_milliseconds, 90_000);
+}

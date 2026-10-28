@@ -1236,6 +1236,29 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Confirmed { runner_id: 1 }"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 new completed job measurements"));
+    let again = launch(vec![
+        "observe-dispatch".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(String::from_utf8_lossy(&again.stdout).contains("0 new completed job measurements"));
+    let metrics = launch(vec!["metrics".into()]).await.unwrap();
+    assert!(metrics.status.success());
+    let metrics_text = String::from_utf8_lossy(&metrics.stdout);
+    assert!(metrics_text.contains("observed completed jobs: 1"));
+    assert!(metrics_text.contains("observed runner-minutes: 1.00"));
     let output = launch(vec![
         "cancel-dispatch".into(),
         "--batch-id".into(),

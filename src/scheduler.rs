@@ -40,6 +40,8 @@ pub enum SchedulerError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Metrics(#[from] crate::metrics::MetricsError),
     #[error("capacity configuration or request is invalid")]
     Invalid,
     #[error("a different capacity configuration is active while reservations exist")]
@@ -77,6 +79,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);")?;
+        crate::metrics::ensure_schema(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<String> = tx
             .query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
@@ -705,4 +708,110 @@ fn validate_batch_dispatch(
         }
     }
     Ok(())
+}
+
+impl Scheduler {
+    /// Record completed, host-checked job timings from a provider observation.
+    /// This is accounting data only, not CI attestation or permission to land.
+    pub fn record_job_metrics(
+        &mut self,
+        id: &str,
+        snapshot: &crate::github::ActionsSnapshot,
+    ) -> Result<usize, SchedulerError> {
+        use crate::{
+            metrics::{JobMeasurement, MetricsError},
+            verification::{Placement, check_host_placement},
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if config != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let row: Option<(String,String,Option<String>,String)> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,r.host FROM dispatch_intents d JOIN capacity_reservations r ON r.id=d.id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+        ).optional()?;
+        let (body, state, run_id, host) = row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&body)?;
+        let run = &snapshot.run;
+        let branch = plan
+            .staging_ref
+            .strip_prefix("refs/heads/")
+            .ok_or(SchedulerError::Invalid)?;
+        if state != "observed"
+            || run_id.as_deref() != Some(&run.id.to_string())
+            || run.id == 0
+            || run.run_attempt != 1
+            || run.workflow_id != plan.workflow_id
+            || run.repository.id != plan.repository_id
+            || run.head_repository.as_ref().map(|r| r.id) != Some(plan.repository_id)
+            || run.head_sha != plan.integration_sha
+            || run.head_branch.as_deref() != Some(branch)
+            || run.event != "workflow_dispatch"
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let host_config = self
+            .capacity
+            .hosts
+            .get(&host)
+            .ok_or(SchedulerError::Corrupt)?;
+        let placement = check_host_placement(snapshot, &host_config.runner_ids)
+            .map_err(|_| MetricsError::InvalidJob)?;
+        let runner_id = match placement {
+            Placement::Waiting => return Ok(0),
+            Placement::Confirmed { runner_id } => runner_id,
+        };
+        let mut inserted = 0;
+        for job in &snapshot.jobs {
+            if job.status != "completed" || job.conclusion.as_deref() == Some("skipped") {
+                continue;
+            }
+            if job.id == 0
+                || job.run_id != run.id
+                || job.head_sha != run.head_sha
+                || job.name.is_empty()
+                || job.runner_id != Some(runner_id)
+            {
+                return Err(MetricsError::InvalidJob.into());
+            }
+            let start = crate::metrics::timestamp_ms(
+                job.started_at.as_deref().ok_or(MetricsError::InvalidJob)?,
+            )?;
+            let end = crate::metrics::timestamp_ms(
+                job.completed_at
+                    .as_deref()
+                    .ok_or(MetricsError::InvalidJob)?,
+            )?;
+            if end < start {
+                return Err(MetricsError::InvalidJob.into());
+            }
+            let conclusion = job
+                .conclusion
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .ok_or(MetricsError::InvalidJob)?;
+            let measurement = JobMeasurement {
+                repository_id: plan.repository_id,
+                job_id: job.id,
+                run_id: run.id,
+                attempt: run.run_attempt,
+                batch_id: id.into(),
+                head_sha: run.head_sha.clone(),
+                name: job.name.clone(),
+                host: host.clone(),
+                runner_id,
+                started_ms: start,
+                completed_ms: end,
+                conclusion: conclusion.clone(),
+            };
+            inserted += usize::from(crate::metrics::insert(&tx, &measurement)?);
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
 }
