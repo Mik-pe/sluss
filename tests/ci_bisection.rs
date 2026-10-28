@@ -412,6 +412,25 @@ fn lane_completion_scenario(second_conclusion: &str, expected_conclusion: &str) 
     assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
     scheduler.release_completed_lane(&second.id, 91).unwrap();
     assert!(scheduler.pending_dispatches().unwrap().is_empty());
+    drop(scheduler);
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        dir.path().join("queue.sqlite"),
+        Capacity {
+            pools: pools.clone(),
+            hosts: [(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [7].into(),
+                    pools,
+                },
+            )]
+            .into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(scheduler.lane_batch_ids().unwrap(), vec![batch.id.clone()]);
     assert!(scheduler.complete_lanes_ci_only(&batch.id).unwrap());
     assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
     assert!(matches!(store.batch(&batch.id).unwrap().unwrap().0.state,
