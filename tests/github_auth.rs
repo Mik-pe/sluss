@@ -2101,9 +2101,25 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     sluss::worker::observe_dispatches_once(&fixture_app, &foreign_db, &one_host, &fixture_policy)
         .await
         .unwrap();
+    let trust = sluss::landing::TrustedCiPolicy {
+        version: 1,
+        installation_id: 42,
+        repository_id: 7,
+        repository_node_id: "R_repo".into(),
+        target_ref: "refs/heads/main".into(),
+        repository_policy_digest: sluss::reconcile::policy_digest(&fixture_app, &fixture_policy)
+            .unwrap(),
+        policy_digest: "e".repeat(64),
+        workflow_id: 17,
+        workflow_path: ".github/workflows/ci.yml".into(),
+        required_jobs: ["job-1-0".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+        runner_ids: [1].into(),
+    };
     let mut foreign_journal = sluss::landing::LandingJournal::open(&foreign_db).unwrap();
     foreign_journal
-        .prepare_observed_batch("foreign-land", id, "R_repo")
+        .prepare_trusted_batch("foreign-land", id, &trust)
         .unwrap();
     assert!(matches!(
         fixture_app
@@ -2112,6 +2128,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 &fixture_token,
                 &security_token,
                 &fixture_policy,
+                &trust,
                 "foreign-land"
             )
             .await,
@@ -2895,9 +2912,33 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     // A fresh provider read must match the frozen run, including the latest
     // attempt and repository node identity, before this experimental claim.
     let mut landing = sluss::landing::LandingJournal::open(&db).unwrap();
+    let mut selected_trust = trust.clone();
+    selected_trust.suites = ["api-tests".into(), "ui-tests".into()].into();
+    selected_trust.selection_policy_digest = Some(Policy::load(&policy).unwrap().digest().unwrap());
     let frozen_landing = landing
-        .prepare_observed_batch("land-refresh", id, "R_repo")
+        .prepare_trusted_batch("land-refresh", id, &selected_trust)
         .unwrap();
+    let mut wider_trust = selected_trust.clone();
+    wider_trust.runner_ids.insert(2);
+    assert!(matches!(
+        observer_app
+            .refresh_and_claim_observed_landing(
+                &mut landing,
+                &fixture_token,
+                &security_token,
+                &observer_policy,
+                &wider_trust,
+                "land-refresh"
+            )
+            .await,
+        Err(sluss::github::LandingRefreshError::Journal(
+            sluss::landing::LandingError::TrustPolicy
+        ))
+    ));
+    assert_eq!(
+        landing.get("land-refresh").unwrap().unwrap().1,
+        sluss::landing::IntentState::Prepared
+    );
     for invalid in [
         5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77, 80, 81, 82, 104,
         105, 106, 108, 109, 110, 111, 112, 113, 114, 115, 117, 119, 120,
@@ -2912,6 +2953,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                     &fixture_token,
                     &security_token,
                     &observer_policy,
+                    &selected_trust,
                     "land-refresh"
                 )
                 .await
@@ -2933,6 +2975,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 &fixture_token,
                 &security_token,
                 &changed_policy,
+                &selected_trust,
                 "land-refresh"
             )
             .await,
@@ -2945,6 +2988,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 &fixture_token,
                 &security_token,
                 &observer_policy,
+                &selected_trust,
                 "land-refresh"
             )
             .await

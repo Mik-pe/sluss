@@ -384,3 +384,140 @@ fn hidden_or_incomplete_protection_is_not_a_complete_snapshot() {
     }
     assert!(incomplete.digest().is_err());
 }
+
+fn trusted_policy() -> sluss::landing::TrustedCiPolicy {
+    sluss::landing::TrustedCiPolicy {
+        version: 1,
+        installation_id: 1,
+        repository_id: 2,
+        repository_node_id: "R_repo".into(),
+        target_ref: "refs/heads/main".into(),
+        repository_policy_digest: "f".repeat(64),
+        policy_digest: "c".repeat(64),
+        workflow_id: 3,
+        workflow_path: ".github/workflows/ci.yml".into(),
+        required_jobs: BTreeSet::from(["test".into()]),
+        suites: BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
+        runner_ids: BTreeSet::from([7]),
+    }
+}
+#[test]
+fn operator_trust_is_bound_to_the_observed_workflow_and_cannot_be_replaced() {
+    let mut f = setup();
+    let trusted = trusted_policy();
+    let mut variants = Vec::new();
+    let mut v = trusted.clone();
+    v.repository_policy_digest = "a".repeat(64);
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.policy_digest = "a".repeat(64);
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.workflow_id = 4;
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.workflow_path = ".github/workflows/other.yml".into();
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.required_jobs = BTreeSet::from(["other".into()]);
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.suites = BTreeSet::from(["other".into()]);
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.selection_policy_digest = Some("a".repeat(64));
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.runner_ids = BTreeSet::from([8]);
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.repository_id = 3;
+    variants.push(v);
+    let mut v = trusted.clone();
+    v.target_ref = "refs/heads/other".into();
+    variants.push(v);
+    for variant in &variants {
+        assert!(matches!(
+            f.journal
+                .prepare_trusted_batch("land-trusted", BATCH, variant),
+            Err(LandingError::TrustPolicy)
+        ));
+        assert!(f.journal.get("land-trusted").unwrap().is_none());
+    }
+    let plan = f
+        .journal
+        .prepare_trusted_batch("land-trusted", BATCH, &trusted)
+        .unwrap();
+    f.journal = LandingJournal::open(&f.db).unwrap();
+    assert_eq!(
+        f.journal
+            .prepare_trusted_batch("land-trusted", BATCH, &trusted)
+            .unwrap(),
+        plan
+    );
+    let mut changed_allowlist = trusted.clone();
+    changed_allowlist.runner_ids.insert(8);
+    assert!(matches!(
+        f.journal
+            .prepare_trusted_batch("land-trusted", BATCH, &changed_allowlist),
+        Err(LandingError::TrustPolicy)
+    ));
+    assert!(matches!(
+        f.journal.claim_observed_batch("land-trusted"),
+        Err(LandingError::TrustPolicy)
+    ));
+    assert!(matches!(
+        f.journal
+            .prepare_observed_batch("land-trusted", BATCH, "R_repo"),
+        Err(LandingError::TrustPolicy)
+    ));
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute(
+        "UPDATE landing_trust_bindings_v1 SET digest=?1 WHERE id='land-trusted'",
+        ["a".repeat(64)],
+    )
+    .unwrap();
+    assert!(matches!(
+        f.journal
+            .prepare_trusted_batch("land-trusted", BATCH, &trusted),
+        Err(LandingError::TrustPolicy)
+    ));
+    assert_eq!(
+        f.journal.get("land-trusted").unwrap().unwrap().1,
+        IntentState::Prepared
+    );
+}
+
+#[test]
+fn concurrent_operators_cannot_freeze_different_trust_policies_for_one_intent() {
+    use std::sync::{Arc, Barrier};
+    let fixture = setup();
+    let mut second = trusted_policy();
+    second.runner_ids.insert(8);
+    let barrier = Arc::new(Barrier::new(2));
+    let workers: Vec<_> = [trusted_policy(), second]
+        .into_iter()
+        .map(|policy| {
+            let path = fixture.db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut journal = LandingJournal::open(path).unwrap();
+                barrier.wait();
+                journal.prepare_trusted_batch("race-trusted", BATCH, &policy)
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(LandingError::TrustPolicy)))
+            .count(),
+        1
+    );
+}

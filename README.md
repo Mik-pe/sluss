@@ -16,6 +16,8 @@ An independent experimental landing journal can freeze a prospective GitHub ref 
 
 Its batch-bound claim also requires repeated, matching `APPROVED` review decisions from GitHub for each frozen PR. This is an additional transient rejection check, not proof of branch policy or CODEOWNERS compliance; the App-token path has only been tested against a local stub.
 
+The App claim additionally requires an operator-supplied `TrustedCiPolicy` frozen with the batch, covering the workflow and policy digest, required jobs, suites and allowed runner IDs. This library-only prerequisite does not validate the policy's completeness or enable attestation and landing. See the [protocol](docs/protocol.md).
+
 ```sh
 cargo test
 cargo run -- status

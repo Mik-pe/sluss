@@ -1382,6 +1382,7 @@ impl App {
         token: &InstallationToken,
         security_token: &InstallationToken,
         policy: &crate::reconcile::RepositoryPolicy,
+        trusted_ci: &crate::landing::TrustedCiPolicy,
         operation_id: &str,
     ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
         #[derive(Deserialize, PartialEq, Eq)]
@@ -1403,7 +1404,7 @@ impl App {
         {
             return Err(LandingRefreshError::Scope);
         }
-        let target = journal.refresh_target(operation_id)?;
+        let target = journal.refresh_target(operation_id, trusted_ci)?;
         let plan = &target.plan;
         let app_identity = self.observe_app_identity().await?;
         if i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
@@ -1553,7 +1554,7 @@ impl App {
             return Err(LandingRefreshError::Changed);
         }
         journal
-            .claim_with_fresh_snapshot(operation_id, &snapshot)
+            .claim_with_fresh_snapshot(operation_id, &snapshot, trusted_ci)
             .map_err(Into::into)
     }
 }

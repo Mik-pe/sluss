@@ -5,7 +5,7 @@
 //! It is not connected to the service or CLI. All callers and stored inputs
 //! must be trusted. In particular, a GraphQL clientMutationId is correlation,
 //! not an idempotency key or proof that a provider performed an operation.
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,64 @@ pub enum LandingError {
     StaleBatch,
     #[error("this intent must use its batch-bound claim path")]
     BatchBound,
+    #[error("operator CI trust policy is missing, changed or inconsistent with the recorded run")]
+    TrustPolicy,
+}
+
+/// An operator-reviewed allowlist. Matching it is necessary but does not prove
+/// isolation, complete dependencies or trustworthy workflow semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedCiPolicy {
+    pub version: u32,
+    pub installation_id: u64,
+    pub repository_id: u64,
+    pub repository_node_id: String,
+    pub target_ref: String,
+    pub repository_policy_digest: String,
+    pub policy_digest: String,
+    pub workflow_id: u64,
+    pub workflow_path: String,
+    pub required_jobs: BTreeSet<String>,
+    pub suites: BTreeSet<String>,
+    pub selection_policy_digest: Option<String>,
+    pub runner_ids: BTreeSet<u64>,
+}
+impl TrustedCiPolicy {
+    pub fn digest(&self) -> Result<String, LandingError> {
+        if self.version != 1
+            || self.installation_id == 0
+            || self.repository_id == 0
+            || !node_id(&self.repository_node_id)
+            || !reference(&self.target_ref)
+            || !hex(&self.repository_policy_digest, 64)
+            || !hex(&self.policy_digest, 64)
+            || self.workflow_id == 0
+            || !crate::integration::valid_policy_path(&self.workflow_path)
+            || self.required_jobs.is_empty()
+            || self.required_jobs.len() > 100
+            || self
+                .required_jobs
+                .iter()
+                .any(|j| j.is_empty() || j.len() > 256)
+            || self.suites.is_empty()
+            || self.suites.len() > 100
+            || self.suites.iter().any(|s| s.is_empty() || s.len() > 128)
+            || self
+                .selection_policy_digest
+                .as_deref()
+                .is_some_and(|s| !hex(s, 64))
+            || self.runner_ids.is_empty()
+            || self.runner_ids.len() > 100
+            || self.runner_ids.contains(&0)
+        {
+            return Err(LandingError::TrustPolicy);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"sluss-trusted-ci-policy-v1\0");
+        hash.update(serde_json::to_vec(self)?);
+        Ok(hex::encode(hash.finalize()))
+    }
 }
 
 fn hex(value: &str, size: usize) -> bool {
@@ -177,7 +235,8 @@ impl LandingJournal {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS landing_one_unresolved_target_v1
         ON landing_intents_v1(repository_id,target_ref) WHERE state IN ('prepared','sending');
-        CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);",
+        CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
+        CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);",
         )?;
         Ok(Self { conn })
     }
@@ -272,10 +331,37 @@ impl LandingJournal {
         batch_id: &str,
         repository_node_id: &str,
     ) -> Result<LandingPlan, LandingError> {
+        self.prepare_observed_batch_inner(operation_id, batch_id, repository_node_id, None)
+    }
+    /// Bind an independently supplied operator policy atomically with the
+    /// observed batch. This is a trust prerequisite, not merge authorization.
+    pub fn prepare_trusted_batch(
+        &mut self,
+        operation_id: &str,
+        batch_id: &str,
+        policy: &TrustedCiPolicy,
+    ) -> Result<LandingPlan, LandingError> {
+        self.prepare_observed_batch_inner(
+            operation_id,
+            batch_id,
+            &policy.repository_node_id,
+            Some(policy),
+        )
+    }
+    fn prepare_observed_batch_inner(
+        &mut self,
+        operation_id: &str,
+        batch_id: &str,
+        repository_node_id: &str,
+        policy: Option<&TrustedCiPolicy>,
+    ) -> Result<LandingPlan, LandingError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let plan = observed_plan(&tx, operation_id, batch_id, repository_node_id)?;
+        if let Some(policy) = policy {
+            verify_trusted_policy(&tx, &plan, policy)?;
+        }
         let body = serde_json::to_string(&plan)?;
         let existing: Option<(String, String, i64, String)> = tx
             .query_row(
@@ -297,6 +383,7 @@ impl LandingJournal {
             if state != IntentState::Prepared {
                 return Err(LandingError::Transition);
             }
+            verify_trust_binding(&tx, operation_id, policy)?;
         } else {
             let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM landing_intents_v1 WHERE repository_id=?1 AND target_ref=?2 AND state IN ('prepared','sending'))", params![plan.repository_id,plan.target_ref], |r| r.get(0))?;
             if busy {
@@ -307,6 +394,16 @@ impl LandingJournal {
                 "INSERT INTO landing_batch_bindings_v1(id) VALUES(?1)",
                 [operation_id],
             )?;
+            if let Some(policy) = policy {
+                tx.execute(
+                    "INSERT INTO landing_trust_bindings_v1(id,body,digest) VALUES(?1,?2,?3)",
+                    params![
+                        operation_id,
+                        serde_json::to_string(policy)?,
+                        policy.digest()?
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(plan)
@@ -319,21 +416,23 @@ impl LandingJournal {
         &mut self,
         operation_id: &str,
     ) -> Result<Option<LandingPlan>, LandingError> {
-        self.claim_observed_batch_inner(operation_id, None)
+        self.claim_observed_batch_inner(operation_id, None, None)
     }
 
     pub(crate) fn claim_with_fresh_snapshot(
         &mut self,
         operation_id: &str,
         snapshot: &crate::github::ActionsSnapshot,
+        policy: &TrustedCiPolicy,
     ) -> Result<Option<LandingPlan>, LandingError> {
-        self.claim_observed_batch_inner(operation_id, Some(snapshot))
+        self.claim_observed_batch_inner(operation_id, Some(snapshot), Some(policy))
     }
 
     fn claim_observed_batch_inner(
         &mut self,
         operation_id: &str,
         snapshot: Option<&crate::github::ActionsSnapshot>,
+        policy: Option<&TrustedCiPolicy>,
     ) -> Result<Option<LandingPlan>, LandingError> {
         let tx = self
             .conn
@@ -353,6 +452,10 @@ impl LandingJournal {
         let now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
         if now != plan {
             return Err(LandingError::StaleBatch);
+        }
+        verify_trust_binding(&tx, operation_id, policy)?;
+        if let Some(policy) = policy {
+            verify_trusted_policy(&tx, &plan, policy)?;
         }
         if let Some(snapshot) = snapshot {
             let body: String = tx.query_row(
@@ -381,6 +484,7 @@ impl LandingJournal {
     pub(crate) fn refresh_target(
         &mut self,
         operation_id: &str,
+        policy: &TrustedCiPolicy,
     ) -> Result<RefreshTarget, LandingError> {
         let tx = self
             .conn
@@ -396,6 +500,8 @@ impl LandingJournal {
         if observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)? != plan {
             return Err(LandingError::StaleBatch);
         }
+        verify_trust_binding(&tx, operation_id, Some(policy))?;
+        verify_trusted_policy(&tx, &plan, policy)?;
         let body: String = tx.query_row(
             "SELECT body FROM ci_observations WHERE id=?1",
             [&plan.batch_id],
@@ -484,6 +590,70 @@ impl LandingJournal {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn verify_trust_binding(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    policy: Option<&TrustedCiPolicy>,
+) -> Result<(), LandingError> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT body,digest FROM landing_trust_bindings_v1 WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match (row, policy) {
+        (None, None) => Ok(()),
+        (Some((body, digest)), Some(policy)) => {
+            let saved: TrustedCiPolicy =
+                serde_json::from_str(&body).map_err(|_| LandingError::TrustPolicy)?;
+            if saved != *policy || saved.digest()? != digest || policy.digest()? != digest {
+                return Err(LandingError::TrustPolicy);
+            }
+            Ok(())
+        }
+        _ => Err(LandingError::TrustPolicy),
+    }
+}
+fn verify_trusted_policy(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &LandingPlan,
+    policy: &TrustedCiPolicy,
+) -> Result<(), LandingError> {
+    policy.digest()?;
+    let repo_policy: String = tx.query_row(
+        "SELECT policy_digest FROM repository_binding WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let body: String = tx.query_row(
+        "SELECT body FROM ci_observations WHERE id=?1",
+        [&plan.batch_id],
+        |r| r.get(0),
+    )?;
+    let record: crate::scheduler::CiObservationRecord = serde_json::from_str(&body)?;
+    let snapshot = record.snapshot.as_ref().ok_or(LandingError::TrustPolicy)?;
+    let placement = crate::verification::check_host_placement(snapshot, &policy.runner_ids);
+    if i64::try_from(policy.installation_id).ok() != Some(plan.installation_id)
+        || i64::try_from(policy.repository_id).ok() != Some(plan.repository_id)
+        || policy.repository_node_id != plan.repository_node_id
+        || policy.target_ref != plan.target_ref
+        || policy.repository_policy_digest != repo_policy
+        || policy.policy_digest != plan.policy_digest
+        || record.plan.installation_id != policy.installation_id
+        || record.plan.repository_id != policy.repository_id
+        || record.plan.workflow_id != policy.workflow_id
+        || record.workflow_path.as_deref() != Some(policy.workflow_path.as_str())
+        || record.plan.required_jobs != policy.required_jobs
+        || record.plan.suites != policy.suites
+        || record.plan.selection_policy_digest != policy.selection_policy_digest
+        || !matches!(placement, Ok(crate::verification::Placement::Confirmed { runner_id }) if Some(runner_id) == record.runner_id)
+    {
+        return Err(LandingError::TrustPolicy);
+    }
+    Ok(())
 }
 
 // These are local scheduling observations, not a proof that the provider or
