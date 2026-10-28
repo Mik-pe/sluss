@@ -25,6 +25,7 @@ pub struct Capacity {
     pub hosts: BTreeMap<String, Host>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub pools: Budgets,
 }
@@ -234,8 +235,31 @@ impl Scheduler {
             let batch_state = batch
                 .map(|body| -> Result<_, SchedulerError> {
                     let batch: crate::batch::Batch = serde_json::from_str(&body)?;
-                    if batch_id.as_deref() != Some(batch.id.as_str()) || batch.id != id {
+                    if batch_id.as_deref() != Some(batch.id.as_str()) {
                         return Err(SchedulerError::Corrupt);
+                    }
+                    if batch.id != id {
+                        let name = id
+                            .strip_prefix(&format!("{}:lane:", batch.id))
+                            .ok_or(SchedulerError::Corrupt)?;
+                        let saved: Option<String> = tx
+                            .query_row(
+                                "SELECT body FROM lane_batch_plans WHERE batch_id=?1",
+                                [&batch.id],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        let frozen: crate::lanes::LanePlan =
+                            serde_json::from_str(&saved.ok_or(SchedulerError::Corrupt)?)?;
+                        let (expected, _) = frozen.dispatch(name).ok_or(SchedulerError::Corrupt)?;
+                        let body: String = tx.query_row(
+                            "SELECT plan FROM dispatch_intents WHERE id=?1",
+                            [&id],
+                            |r| r.get(0),
+                        )?;
+                        if serde_json::from_str::<DispatchPlan>(&body)? != expected {
+                            return Err(SchedulerError::Corrupt);
+                        }
                     }
                     Ok(batch.state)
                 })
@@ -469,6 +493,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS dispatch_unique_run ON dispatch_intents(run_id) WHERE run_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS lane_batch_plans (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, capacity TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS lane_dispatch_hosts (id TEXT PRIMARY KEY NOT NULL, host TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_branch_rules (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_branch_security (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
@@ -516,7 +542,17 @@ impl Scheduler {
                 tx.query_row("SELECT COUNT(*) FROM capacity_reservations", [], |r| {
                     r.get(0)
                 })?;
-            if count != 0 {
+            let has_batches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='batches')",
+                [],
+                |r| r.get(0),
+            )?;
+            let frozen_lane_batch: bool = if has_batches {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM lane_batch_plans p JOIN batches b ON b.id=p.batch_id WHERE json_type(b.body,'$.state.Testing') IS NOT NULL)", [], |r| r.get(0))?
+            } else {
+                false
+            };
+            if count != 0 || frozen_lane_batch {
                 return Err(SchedulerError::ConfigBusy);
             }
         }
@@ -591,6 +627,101 @@ impl Scheduler {
             Some(eligible_hosts),
         )
     }
+    /// Freeze a complete multi-lane plan before any batch dispatch is created.
+    /// This is a durable scheduling declaration, not permission to run CI.
+    pub fn freeze_lane_plan(
+        &mut self,
+        batch_id: &str,
+        plan: &crate::lanes::LanePlan,
+    ) -> Result<bool, SchedulerError> {
+        if !plan.validate(&self.capacity)
+            || plan.batch.staging_ref != format!("refs/heads/sluss/{batch_id}")
+        {
+            return Err(SchedulerError::Invalid);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        validate_batch_dispatch(&tx, batch_id, &plan.batch)?;
+        let old: Option<(String, String)> = tx
+            .query_row(
+                "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+                [batch_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((body, capacity)) = old {
+            if serde_json::from_str::<crate::lanes::LanePlan>(&body)? != *plan
+                || capacity != self.encoded
+            {
+                return Err(SchedulerError::IdConflict);
+            }
+            return Ok(false);
+        }
+        let dispatched: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_batches WHERE batch_id=?1)",
+            [batch_id],
+            |r| r.get(0),
+        )?;
+        if dispatched {
+            return Err(SchedulerError::IdConflict);
+        }
+        tx.execute(
+            "INSERT INTO lane_batch_plans(batch_id,body,capacity) VALUES(?1,?2,?3)",
+            params![batch_id, serde_json::to_string(plan)?, self.encoded],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn lane_plan(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<crate::lanes::LanePlan>, SchedulerError> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM lane_batch_plans WHERE batch_id=?1",
+                [batch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        body.map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+    /// Reserve one lane independently. The frozen plan and batch are checked
+    /// again in the same transaction as the physical capacity reservation.
+    pub fn reserve_lane_dispatch_on(
+        &mut self,
+        batch_id: &str,
+        lane: &str,
+        eligible_hosts: &std::collections::BTreeSet<String>,
+    ) -> Result<Option<Reservation>, SchedulerError> {
+        if eligible_hosts
+            .iter()
+            .any(|name| !self.capacity.hosts.contains_key(name))
+        {
+            return Err(SchedulerError::Invalid);
+        }
+        let frozen = self
+            .lane_plan(batch_id)?
+            .ok_or(SchedulerError::StaleBatch)?;
+        let (plan, request) = frozen.dispatch(lane).ok_or(SchedulerError::Invalid)?;
+        self.reserve_inner(
+            &crate::lanes::LanePlan::dispatch_id(batch_id, lane),
+            &request,
+            Some(&plan),
+            Some(batch_id),
+            Some(eligible_hosts),
+        )
+    }
     fn reserve_inner(
         &mut self,
         id: &str,
@@ -631,8 +762,11 @@ impl Scheduler {
         if active_config != self.encoded {
             return Err(SchedulerError::ConfigChanged);
         }
-        if let (Some(batch_id), Some(plan)) = (batch_id, plan) {
-            validate_batch_dispatch(&tx, batch_id, plan)?;
+        if let (Some(batch_id), Some(plan)) = (batch_id, plan)
+            && let Some(expected) = validate_dispatch_binding(&tx, id, batch_id, plan)?
+            && expected != *request
+        {
+            return Err(SchedulerError::IdConflict);
         }
         let finished: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM capacity_finished WHERE id=?1)",
@@ -676,14 +810,14 @@ impl Scheduler {
                 return Err(SchedulerError::IdConflict);
             }
             if eligible_hosts.is_some_and(|hosts| !hosts.contains(&host)) {
-                if let Some(batch_id) = batch_id {
-                    crate::metrics::begin_capacity_wait(&tx, batch_id, request)?;
+                if batch_id.is_some() {
+                    crate::metrics::begin_capacity_wait(&tx, id, request)?;
                     tx.commit()?;
                 }
                 return Ok(None);
             }
-            if let Some(batch_id) = batch_id {
-                crate::metrics::end_capacity_wait(&tx, batch_id, request)?;
+            if batch_id.is_some() {
+                crate::metrics::end_capacity_wait(&tx, id, request)?;
                 tx.commit()?;
             }
             return Ok(Some(Reservation {
@@ -725,8 +859,8 @@ impl Scheduler {
             global.get(name).copied().unwrap_or(0) + u64::from(*amount)
                 > u64::from(self.capacity.pools[name])
         }) {
-            if let Some(batch_id) = batch_id {
-                crate::metrics::begin_capacity_wait(&tx, batch_id, request)?;
+            if batch_id.is_some() {
+                crate::metrics::begin_capacity_wait(&tx, id, request)?;
                 tx.commit()?;
             }
             return Ok(None);
@@ -777,8 +911,8 @@ impl Scheduler {
             })
             .map(|(name, _)| name.clone());
         let Some(host) = selected else {
-            if let Some(batch_id) = batch_id {
-                crate::metrics::begin_capacity_wait(&tx, batch_id, request)?;
+            if batch_id.is_some() {
+                crate::metrics::begin_capacity_wait(&tx, id, request)?;
                 tx.commit()?;
             }
             return Ok(None);
@@ -798,9 +932,15 @@ impl Scheduler {
                 "INSERT INTO dispatch_batches(id,batch_id) VALUES(?1,?2)",
                 params![id, batch_id],
             )?;
+            if id != batch_id {
+                tx.execute(
+                    "INSERT INTO lane_dispatch_hosts(id,host) VALUES(?1,?2)",
+                    params![id, host],
+                )?;
+            }
         }
-        if let Some(batch_id) = batch_id {
-            crate::metrics::end_capacity_wait(&tx, batch_id, request)?;
+        if batch_id.is_some() {
+            crate::metrics::end_capacity_wait(&tx, id, request)?;
         }
         tx.commit()?;
         Ok(Some(Reservation {
@@ -911,7 +1051,7 @@ pub struct DispatchPlan {
     pub selection_policy_digest: Option<String>,
 }
 impl DispatchPlan {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         fn hex(value: &str, len: usize) -> bool {
             value.len() == len
                 && value
@@ -994,6 +1134,7 @@ impl Scheduler {
             Option<String>,
             i64,
             i64,
+            String,
         );
         let has_workflows: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_workflows')", [], |r| r.get(0))?;
         let workflow = if has_workflows {
@@ -1002,7 +1143,7 @@ impl Scheduler {
             "NULL"
         };
         let query = format!(
-            "SELECT d.plan,d.state,d.run_id,r.host,r.request,{workflow},binding.installation,binding.repository FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id AND b.batch_id=d.id JOIN capacity_reservations r ON r.id=d.id JOIN repository_binding binding ON binding.id=1 WHERE d.id=?1"
+            "SELECT d.plan,d.state,d.run_id,r.host,r.request,{workflow},binding.installation,binding.repository,b.batch_id FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN capacity_reservations r ON r.id=d.id JOIN repository_binding binding ON binding.id=1 WHERE d.id=?1"
         );
         let row: Option<Row> = conn
             .query_row(&query, [id], |r| {
@@ -1015,10 +1156,11 @@ impl Scheduler {
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
                 ))
             })
             .optional()?;
-        let (body, state, run, host, request, workflow, installation, repository) =
+        let (body, state, run, host, request, workflow, installation, repository, batch_id) =
             row.ok_or(SchedulerError::DispatchTransition)?;
         let plan: DispatchPlan = serde_json::from_str(&body)?;
         if !plan.valid()
@@ -1026,12 +1168,40 @@ impl Scheduler {
             || run.is_some()
             || i64::try_from(plan.installation_id).ok() != Some(installation)
             || i64::try_from(plan.repository_id).ok() != Some(repository)
-            || plan.staging_ref != format!("refs/heads/sluss/{id}")
+            || plan.staging_ref != format!("refs/heads/sluss/{batch_id}")
             || workflow
                 .as_deref()
                 .is_some_and(|p| !crate::integration::valid_policy_path(p))
         {
             return Err(SchedulerError::DispatchTransition);
+        }
+        if id != batch_id {
+            let (body, capacity): (String, String) = conn.query_row(
+                "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+                [&batch_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let frozen: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+            let capacity: Capacity = serde_json::from_str(&capacity)?;
+            let name = id
+                .strip_prefix(&format!("{batch_id}:lane:"))
+                .ok_or(SchedulerError::DispatchTransition)?;
+            let (expected, expected_request) = frozen
+                .dispatch(name)
+                .ok_or(SchedulerError::DispatchTransition)?;
+            if !frozen.validate(&capacity)
+                || expected != plan
+                || request
+                    .as_deref()
+                    .map(serde_json::from_str::<Request>)
+                    .transpose()?
+                    != Some(expected_request)
+                || host
+                    .as_ref()
+                    .is_none_or(|name| !capacity.hosts.contains_key(name))
+            {
+                return Err(SchedulerError::DispatchTransition);
+            }
         }
         Ok(UncertainDispatch {
             pending: PendingDispatch {
@@ -1065,7 +1235,7 @@ impl Scheduler {
             (None, None) => {}
             (Some((batch_id, body)), Some((target, base))) => {
                 let plan: DispatchPlan = serde_json::from_str(&body)?;
-                validate_batch_dispatch(&tx, &batch_id, &plan)?;
+                validate_dispatch_binding(&tx, id, &batch_id, &plan)?;
                 let batch_body: String =
                     tx.query_row("SELECT body FROM batches WHERE id=?1", [&batch_id], |r| {
                         r.get(0)
@@ -1096,6 +1266,29 @@ impl Scheduler {
             .conn
             .query_row(
                 "SELECT path FROM dispatch_workflows WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Resolve a dispatch to its batch; unbound dispatches have no batch.
+    pub fn dispatch_batch_id(&self, id: &str) -> Result<Option<String>, SchedulerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn dispatch_status(&self, id: &str) -> Result<Option<String>, SchedulerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT state FROM dispatch_intents WHERE id=?1",
                 [id],
                 |r| r.get(0),
             )
@@ -1156,7 +1349,7 @@ impl Scheduler {
             return Ok(false);
         }
         let plan: DispatchPlan = serde_json::from_str(&body)?;
-        validate_batch_dispatch(&tx, &batch, &plan)?;
+        validate_dispatch_binding(&tx, id, &batch, &plan)?;
         if let Some(rules) = rules {
             let target: Option<String> = tx
                 .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
@@ -1268,6 +1461,29 @@ impl Scheduler {
             return Err(SchedulerError::Corrupt);
         }
         tx.execute("INSERT INTO capacity_finished(id) VALUES(?1)", [id])?;
+        let binding: Option<String> = tx
+            .query_row(
+                "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(batch_id) = binding.filter(|batch_id| batch_id != id) {
+            let body: String =
+                tx.query_row("SELECT body FROM batches WHERE id=?1", [&batch_id], |r| {
+                    r.get(0)
+                })?;
+            let mut batch: crate::batch::Batch = serde_json::from_str(&body)?;
+            if batch
+                .invalidate("a CI lane was cancelled before dispatch".into())
+                .is_ok()
+            {
+                tx.execute(
+                    "UPDATE batches SET body=?1,version=version+1 WHERE id=?2",
+                    params![serde_json::to_string(&batch)?, batch_id],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -1560,6 +1776,51 @@ impl Scheduler {
     }
 }
 
+/// Validate the batch's full frozen selection even when an individual lane
+/// contains only part of that selection. Lane identities and requests are
+/// derived exclusively from the frozen declaration.
+fn validate_dispatch_binding(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    batch_id: &str,
+    plan: &DispatchPlan,
+) -> Result<Option<Request>, SchedulerError> {
+    let saved: Option<(String, String)> = tx
+        .query_row(
+            "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+            [batch_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if id == batch_id {
+        if saved.is_some() {
+            return Err(SchedulerError::IdConflict);
+        }
+        validate_batch_dispatch(tx, batch_id, plan)?;
+        return Ok(None);
+    }
+    let (body, capacity) = saved.ok_or(SchedulerError::StaleBatch)?;
+    let active: String = tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+        r.get(0)
+    })?;
+    if active != capacity {
+        return Err(SchedulerError::ConfigChanged);
+    }
+    let frozen: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+    let capacity: Capacity = serde_json::from_str(&capacity)?;
+    if !frozen.validate(&capacity) {
+        return Err(SchedulerError::Corrupt);
+    }
+    let prefix = format!("{batch_id}:lane:");
+    let name = id.strip_prefix(&prefix).ok_or(SchedulerError::IdConflict)?;
+    let (expected, request) = frozen.dispatch(name).ok_or(SchedulerError::IdConflict)?;
+    if *plan != expected {
+        return Err(SchedulerError::IdConflict);
+    }
+    validate_batch_dispatch(tx, batch_id, &frozen.batch)?;
+    Ok(Some(request))
+}
+
 fn validate_batch_dispatch(
     tx: &rusqlite::Transaction<'_>,
     batch_id: &str,
@@ -1690,9 +1951,17 @@ fn mark_ci_conflict(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), Sche
         "INSERT OR IGNORE INTO ci_observation_conflicts(id) VALUES(?1)",
         [id],
     )?;
+    let batch_id: String = tx
+        .query_row(
+            "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| id.to_owned());
     let affected: Vec<String> = {
         let mut stmt = tx.prepare("WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM split_tasks t JOIN ancestors a ON t.child_id=a.id WHERE t.child_id IS NOT NULL), descendants(id) AS (SELECT ?1 UNION SELECT i.batch_id FROM ci_investigations i JOIN ancestors a ON i.batch_id=a.id UNION SELECT t.child_id FROM split_tasks t JOIN descendants d ON t.parent_id=d.id WHERE t.child_id IS NOT NULL) SELECT id FROM descendants")?;
-        let rows = stmt.query_map([id], |r| r.get(0))?;
+        let rows = stmt.query_map([&batch_id], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
     for batch_id in affected {
@@ -2683,7 +2952,7 @@ impl Scheduler {
         if state != "observed" || !plan.valid() {
             return Err(SchedulerError::DispatchTransition);
         }
-        validate_batch_dispatch(&tx, &batch_id, &plan)?;
+        validate_dispatch_binding(&tx, id, &batch_id, &plan)?;
         let conflicted: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
             [id],
@@ -3033,6 +3302,11 @@ impl Scheduler {
         ).optional()?;
         let (plan_body, state, run, batch_id, batch_body, version, observation_body) =
             row.ok_or(SchedulerError::DispatchTransition)?;
+        // A lane cannot complete the batch by itself, even if it is the only
+        // lane. Multi-lane completion must aggregate every frozen lane.
+        if batch_id != id {
+            return Err(SchedulerError::DispatchTransition);
+        }
         let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
         let observation: CiObservationRecord = serde_json::from_str(&observation_body)?;
         let conflicted: bool = tx.query_row(
@@ -3370,6 +3644,240 @@ fn investigate_ci_batch(
 }
 
 impl Scheduler {
+    /// Complete a CI-only batch once every frozen lane has a directly observed
+    /// terminal result and its reservation has been safely released.
+    pub fn complete_lanes_ci_only(&mut self, batch_id: &str) -> Result<bool, SchedulerError> {
+        use crate::batch::{Batch, LaneResult, State};
+        use crate::verification::{CiObservation, Placement, check_host_placement, observe_ci};
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let saved: Option<(String, String)> = tx
+            .query_row(
+                "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+                [batch_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (body, capacity) = saved.ok_or(SchedulerError::DispatchTransition)?;
+        if capacity != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let frozen: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+        if !frozen.validate(&self.capacity) {
+            return Err(SchedulerError::Corrupt);
+        }
+        let (batch_body, version): (String, i64) = tx.query_row(
+            "SELECT body,version FROM batches WHERE id=?1",
+            [batch_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut batch: Batch = serde_json::from_str(&batch_body)?;
+        if matches!(batch.state, State::CiCompleteLanes { .. }) {
+            return Ok(false);
+        }
+        validate_batch_dispatch(&tx, batch_id, &frozen.batch)?;
+        let mut results = std::collections::BTreeMap::new();
+        for name in frozen.lanes.keys() {
+            let id = crate::lanes::LanePlan::dispatch_id(batch_id, name);
+            type LaneRow = (
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+                String,
+            );
+            let row: Option<LaneRow> = tx.query_row(
+                "SELECT d.plan,d.state,d.run_id,c.body,s.source,w.path,h.host FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id AND b.batch_id=?2 JOIN ci_observations c ON c.id=d.id JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id JOIN lane_dispatch_hosts h ON h.id=d.id WHERE d.id=?1",
+                params![id, batch_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+            ).optional()?;
+            let Some((body, state, run, observation, source, workflow, host)) = row else {
+                return Ok(false);
+            };
+            if state != "finished" {
+                return Ok(false);
+            }
+            let plan: DispatchPlan = serde_json::from_str(&body)?;
+            validate_dispatch_binding(&tx, &id, batch_id, &plan)?;
+            let record: CiObservationRecord = serde_json::from_str(&observation)?;
+            let run_id = run
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .ok_or(SchedulerError::DispatchTransition)?;
+            let conflicted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1 UNION ALL SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+                [&id], |r| r.get(0),
+            )?;
+            let snapshot = record
+                .snapshot
+                .as_ref()
+                .ok_or(SchedulerError::DispatchTransition)?;
+            let runners = &self
+                .capacity
+                .hosts
+                .get(&host)
+                .ok_or(SchedulerError::Corrupt)?
+                .runner_ids;
+            if conflicted
+                || source != "direct"
+                || record.run_id != run_id
+                || record.plan != plan
+                || record.workflow_path.as_deref() != Some(workflow.as_str())
+                || !crate::github::workflow_path_matches(
+                    &workflow,
+                    &snapshot.run.path,
+                    &plan.staging_ref,
+                    &plan.integration_sha,
+                )
+                || observe_ci(&plan, run_id, snapshot).ok().as_ref() != Some(&record.observation)
+                || !matches!(check_host_placement(snapshot, runners), Ok(Placement::Confirmed { runner_id }) if Some(runner_id) == record.runner_id)
+            {
+                return Err(SchedulerError::DispatchTransition);
+            }
+            let conclusion = match &record.observation {
+                CiObservation::Successful => "success".to_owned(),
+                CiObservation::Failed { conclusion } if !conclusion.is_empty() => {
+                    conclusion.clone()
+                }
+                _ => return Err(SchedulerError::DispatchTransition),
+            };
+            results.insert(name.clone(), LaneResult { run_id, conclusion });
+        }
+        let conclusion = if results
+            .values()
+            .all(|result| result.conclusion == "success")
+        {
+            "success".to_owned()
+        } else if results
+            .values()
+            .any(|result| result.conclusion == "failure")
+        {
+            "failure".to_owned()
+        } else {
+            "inconclusive".to_owned()
+        };
+        for candidate in &batch.candidates {
+            let number = i64::try_from(candidate.number).map_err(|_| SchedulerError::StaleBatch)?;
+            let digest: String = tx.query_row(
+                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                params![batch_id, number],
+                |r| r.get(0),
+            )?;
+            tx.execute("INSERT INTO ci_candidate_completions(number,head_sha,digest,base_sha,batch_id,conclusion) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,digest=excluded.digest,base_sha=excluded.base_sha,batch_id=excluded.batch_id,conclusion=excluded.conclusion", params![number,candidate.head_sha,digest,batch.base_sha,batch_id,conclusion])?;
+        }
+        batch.state = State::CiCompleteLanes {
+            integration_sha: frozen.batch.integration_sha,
+            lanes: results,
+            conclusion,
+        };
+        if tx.execute(
+            "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
+            params![serde_json::to_string(&batch)?, batch_id, version],
+        )? != 1
+        {
+            return Err(SchedulerError::StaleBatch);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn lane_batch_ids(&self) -> Result<Vec<String>, SchedulerError> {
+        let mut statement = self.conn.prepare("SELECT p.batch_id FROM lane_batch_plans p JOIN batches b ON b.id=p.batch_id WHERE json_type(b.body,'$.state.Testing') IS NOT NULL ORDER BY p.batch_id")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Release a finished lane while the rest of its batch remains in CI.
+    /// The caller must recheck provider termination and host idleness first.
+    pub fn release_completed_lane(&mut self, id: &str, run_id: u64) -> Result<(), SchedulerError> {
+        use crate::verification::{CiObservation, Placement, check_host_placement, observe_ci};
+        crate::verification::check_release_topology(&self.capacity)
+            .map_err(|_| SchedulerError::Invalid)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        type LaneReleaseRow = (
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            String,
+        );
+        let row: Option<LaneReleaseRow> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,b.batch_id,c.body,s.source,w.path,r.host FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN ci_observations c ON c.id=d.id JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id JOIN capacity_reservations r ON r.id=d.id WHERE d.id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+        ).optional()?;
+        let (body, state, run, batch_id, observation, source, workflow, host) =
+            row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&body)?;
+        let record: CiObservationRecord = serde_json::from_str(&observation)?;
+        if id == batch_id
+            || run_id == 0
+            || state != "observed"
+            || source != "direct"
+            || run.as_deref() != Some(&run_id.to_string())
+            || record.run_id != run_id
+            || record.plan != plan
+            || record.workflow_path.as_deref() != Some(workflow.as_str())
+            || !matches!(
+                record.observation,
+                CiObservation::Successful | CiObservation::Failed { .. }
+            )
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        validate_dispatch_binding(&tx, id, &batch_id, &plan)?;
+        let conflicted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1 UNION ALL SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [id], |r| r.get(0),
+        )?;
+        if conflicted {
+            return Err(SchedulerError::CiConflict);
+        }
+        let snapshot = record
+            .snapshot
+            .as_ref()
+            .ok_or(SchedulerError::DispatchTransition)?;
+        let runners = &self
+            .capacity
+            .hosts
+            .get(&host)
+            .ok_or(SchedulerError::Corrupt)?
+            .runner_ids;
+        if !crate::github::workflow_path_matches(
+            &workflow,
+            &snapshot.run.path,
+            &plan.staging_ref,
+            &plan.integration_sha,
+        ) || observe_ci(&plan, run_id, snapshot).ok().as_ref() != Some(&record.observation)
+            || !matches!(check_host_placement(snapshot, runners), Ok(Placement::Confirmed { runner_id }) if Some(runner_id) == record.runner_id)
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        finish_bounded_reservation(&tx, id, &self.encoded)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Free a completed CI-only reservation after provider revalidation. The
     /// caller must establish runner isolation and the release topology contract.
     pub fn release_completed_ci_only(
@@ -3460,12 +3968,12 @@ impl Scheduler {
         if active != self.encoded {
             return Err(SchedulerError::ConfigChanged);
         }
-        type StaleReleaseRow = (String, String, Option<String>, String, String);
+        type StaleReleaseRow = (String, String, Option<String>, String, String, String);
         let row: Option<StaleReleaseRow> = tx.query_row(
-            "SELECT d.plan,d.state,d.run_id,q.body,s.source FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN batches q ON q.id=b.batch_id JOIN dispatch_receipt_sources s ON s.id=d.id WHERE d.id=?1",
-            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+            "SELECT d.plan,d.state,d.run_id,q.body,s.source,b.batch_id FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN batches q ON q.id=b.batch_id JOIN dispatch_receipt_sources s ON s.id=d.id WHERE d.id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
         ).optional()?;
-        let (plan_body, state, saved_run, batch_body, source) =
+        let (plan_body, state, saved_run, batch_body, source, batch_id) =
             row.ok_or(SchedulerError::DispatchTransition)?;
         let conflicted: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
@@ -3481,10 +3989,33 @@ impl Scheduler {
             || saved_run.as_deref() != Some(&run_id.to_string())
             || source != "direct"
             || !plan.valid()
-            || batch.id != id
+            || batch.id != batch_id
+            || plan.staging_ref != format!("refs/heads/sluss/{batch_id}")
             || !matches!(batch.state, State::Invalidated { .. })
         {
             return Err(SchedulerError::DispatchTransition);
+        }
+        if id != batch_id {
+            let frozen: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+                    [&batch_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (body, capacity) = frozen.ok_or(SchedulerError::DispatchTransition)?;
+            let frozen: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+            let name = id
+                .strip_prefix(&format!("{batch_id}:lane:"))
+                .ok_or(SchedulerError::DispatchTransition)?;
+            if capacity != self.encoded
+                || !frozen.validate(&self.capacity)
+                || frozen
+                    .dispatch(name)
+                    .is_none_or(|(expected, _)| expected != plan)
+            {
+                return Err(SchedulerError::DispatchTransition);
+            }
         }
         if state == "finished" {
             return Ok(());
@@ -3553,8 +4084,33 @@ fn read_conflict_release(conn: &Connection, id: &str) -> Result<bool, SchedulerE
         [&topology],
         |r| r.get(0),
     )?;
-    if batch.id != id || !matches!(batch.state, crate::batch::State::Invalidated { .. }) || !known {
+    if !matches!(batch.state, crate::batch::State::Invalidated { .. }) || !known {
         return Err(SchedulerError::Corrupt);
+    }
+    if batch.id != id {
+        let name = id
+            .strip_prefix(&format!("{}:lane:", batch.id))
+            .ok_or(SchedulerError::Corrupt)?;
+        let (body, saved_capacity): (String, String) = conn.query_row(
+            "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+            [&batch.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let frozen: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+        let host: String = conn.query_row(
+            "SELECT host FROM lane_dispatch_hosts WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if saved_capacity != topology
+            || !frozen.validate(&evidence.capacity)
+            || frozen
+                .dispatch(name)
+                .is_none_or(|(expected, _)| expected != evidence.plan)
+            || host != evidence.host
+        {
+            return Err(SchedulerError::Corrupt);
+        }
     }
     let finished: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM capacity_finished WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM capacity_reservations WHERE id=?1)", [id], |r| r.get(0))?;
     if evidence.id != id

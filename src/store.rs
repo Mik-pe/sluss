@@ -333,6 +333,31 @@ impl Store {
         }))
     }
 
+    /// List the immutable lane dispatch identifiers belonging to a batch.
+    pub fn lane_dispatch_ids(&self, batch_id: &str) -> Result<Vec<String>, StoreError> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lane_batch_plans')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM lane_batch_plans WHERE batch_id=?1",
+                [batch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(Vec::new());
+        };
+        let plan: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+        Ok(plan
+            .lanes
+            .keys()
+            .map(|name| crate::lanes::LanePlan::dispatch_id(batch_id, name))
+            .collect())
+    }
+
     /// Admission configuration bound by successful repository reconciliation.
     pub fn repository_policy_digest(&self) -> Result<Option<String>, StoreError> {
         Ok(self
@@ -1047,7 +1072,10 @@ impl Store {
             })
             .optional()?;
         let batch: Batch = serde_json::from_str(&body.ok_or(StoreError::InvalidBatch)?)?;
-        if !matches!(batch.state, State::CiComplete { .. }) {
+        if !matches!(
+            batch.state,
+            State::CiComplete { .. } | State::CiCompleteLanes { .. }
+        ) {
             return Err(StoreError::InvalidBatch);
         }
         let removed = tx.execute(

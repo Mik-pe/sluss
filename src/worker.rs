@@ -416,7 +416,11 @@ async fn observe_dispatches_inner(
             continue;
         }
         let id = &dispatch.reservation.id;
-        let Some((batch, _)) = store.batch(id).map_err(|e| e.to_string())? else {
+        let Some(batch_id) = scheduler.dispatch_batch_id(id).map_err(|e| e.to_string())? else {
+            failed = true;
+            continue;
+        };
+        let Some((batch, _)) = store.batch(&batch_id).map_err(|e| e.to_string())? else {
             failed = true;
             continue;
         };
@@ -461,6 +465,7 @@ async fn observe_dispatches_inner(
                 .record_ci_observation(id, &snapshot)
                 .map_err(|e| e.to_string())?;
             if complete_ci_only
+                && *id == batch_id
                 && !matches!(observation, crate::verification::CiObservation::Pending)
                 && scheduler
                     .receipt_source(id)
@@ -476,6 +481,14 @@ async fn observe_dispatches_inner(
         if let Err(error) = result {
             eprintln!("dispatch observation failed for {id}: {error}");
             failed = true;
+        }
+    }
+    if complete_ci_only {
+        for batch_id in scheduler.lane_batch_ids().map_err(|e| e.to_string())? {
+            if let Err(error) = scheduler.complete_lanes_ci_only(&batch_id) {
+                eprintln!("lane completion failed for {batch_id}: {error}");
+                failed = true;
+            }
         }
     }
     if failed {
@@ -1068,6 +1081,69 @@ pub async fn dispatch_once(
     Ok(no_capacity.then_some(crate::dispatch::Outcome::NoCapacity))
 }
 
+pub async fn dispatch_lanes_once(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+    capacity: &crate::scheduler::Capacity,
+    settings: &crate::dispatch::LaneSettings,
+) -> Result<Option<crate::dispatch::Outcome>, String> {
+    use crate::batch::State;
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    if store.paused().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let inbox = Inbox::open(db).map_err(|e| e.to_string())?;
+    if inbox
+        .pending_for(policy.installation, policy.repository)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let mut no_capacity = false;
+    for batch in store.active_batches().map_err(|e| e.to_string())? {
+        if !matches!(batch.state, State::Testing { .. }) {
+            continue;
+        }
+        match crate::dispatch::batch_lanes(db, app, policy, capacity, settings, &batch.id).await {
+            Ok(sent @ crate::dispatch::Outcome::Sent { .. }) => return Ok(Some(sent)),
+            Ok(crate::dispatch::Outcome::NoCapacity) => no_capacity = true,
+            Ok(crate::dispatch::Outcome::AlreadyStarted) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(no_capacity.then_some(crate::dispatch::Outcome::NoCapacity))
+}
+
+pub async fn supervise_lane_dispatch_with_wakeup(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    capacity: crate::scheduler::Capacity,
+    settings: crate::dispatch::LaneSettings,
+    poll: Duration,
+    ci_wakeup: Arc<tokio::sync::Notify>,
+) {
+    let minimum = poll.max(Duration::from_secs(10));
+    let mut delay = minimum;
+    loop {
+        match dispatch_lanes_once(&app, &db, &policy, &capacity, &settings).await {
+            Ok(Some(crate::dispatch::Outcome::Sent { run, host })) => {
+                eprintln!("dispatched lane run {run} to reserved host {host}");
+                ci_wakeup.notify_one();
+                delay = minimum;
+            }
+            Ok(_) => delay = minimum,
+            Err(error) => {
+                eprintln!("automatic lane dispatch failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
 /// Automatic dispatch remains explicit opt-in and never authorizes landing.
 pub async fn supervise_dispatch(
     app: Arc<App>,
@@ -1143,18 +1219,24 @@ pub async fn release_ci_only_once(
             DispatchState::Accepted { run_id } | DispatchState::Observed { run_id } => run_id,
             _ => continue,
         };
-        let Some((batch, _)) = store
-            .batch(&pending.reservation.id)
+        let Some(batch_id) = scheduler
+            .dispatch_batch_id(&pending.reservation.id)
             .map_err(|e| e.to_string())?
         else {
             continue;
         };
-        let expected_conclusion = match &batch.state {
+        let is_lane = pending.reservation.id != batch_id;
+        let Some((batch, _)) = store.batch(&batch_id).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        let active_lane = is_lane && matches!(batch.state, State::Testing { .. });
+        let mut expected_conclusion = match &batch.state {
             State::CiComplete {
                 run_id: completed_run,
                 conclusion,
                 ..
-            } if *completed_run == run_id => Some(conclusion.as_str()),
+            } if !is_lane && *completed_run == run_id => Some(conclusion.clone()),
+            State::Testing { .. } if active_lane => None,
             State::Invalidated { .. } => None,
             _ => continue,
         };
@@ -1164,7 +1246,7 @@ pub async fn release_ci_only_once(
             .as_deref()
             == Some("conflict")
         {
-            if expected_conclusion.is_some() {
+            if expected_conclusion.is_some() || active_lane {
                 continue;
             }
             let read = app
@@ -1218,6 +1300,18 @@ pub async fn release_ci_only_once(
             )
             .await
             .map_err(|e| e.to_string())?;
+        if active_lane {
+            expected_conclusion = Some(
+                match scheduler
+                    .record_ci_observation(&pending.reservation.id, &first)
+                    .map_err(|e| e.to_string())?
+                {
+                    crate::verification::CiObservation::Successful => "success".to_owned(),
+                    crate::verification::CiObservation::Failed { conclusion } => conclusion,
+                    crate::verification::CiObservation::Pending => continue,
+                },
+            );
+        }
         let conclusion = first
             .run
             .conclusion
@@ -1233,7 +1327,9 @@ pub async fn release_ci_only_once(
                 }));
         if first.run.status != "completed"
             || conclusion.is_none()
-            || expected_conclusion.is_some_and(|expected| conclusion != Some(expected))
+            || expected_conclusion
+                .as_deref()
+                .is_some_and(|expected| conclusion != Some(expected))
             || !placement_valid
         {
             return Err("completed run or runner placement changed".into());
@@ -1278,7 +1374,14 @@ pub async fn release_ci_only_once(
         if first != last {
             return Err("run changed during capacity revalidation".into());
         }
-        if expected_conclusion.is_some() {
+        if active_lane {
+            scheduler
+                .release_completed_lane(&pending.reservation.id, run_id)
+                .map_err(|e| e.to_string())?;
+            scheduler
+                .complete_lanes_ci_only(&batch_id)
+                .map_err(|e| e.to_string())?;
+        } else if expected_conclusion.is_some() {
             scheduler
                 .release_completed_ci_only(&pending.reservation.id, run_id)
                 .map_err(|e| e.to_string())?;

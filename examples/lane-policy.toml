@@ -1,0 +1,17 @@
+# Replace the workflow IDs and required job names with your own. This example
+# covers every suite in verification.toml and the hosts in capacity.toml.
+version = 1
+
+[lanes.linux]
+workflow_id = 101
+suites = ["core-tests", "api-tests"]
+required_jobs = ["linux-tests"]
+[lanes.linux.request.pools]
+rust = 1
+
+[lanes.macos]
+workflow_id = 102
+suites = ["ui-tests"]
+required_jobs = ["macos-tests"]
+[lanes.macos.request.pools]
+macos = 1

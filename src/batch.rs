@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,6 +32,12 @@ pub enum State {
         run_id: u64,
         conclusion: String,
     },
+    /// Aggregate scheduling result for all lanes; never a merge approval.
+    CiCompleteLanes {
+        integration_sha: String,
+        lanes: BTreeMap<String, LaneResult>,
+        conclusion: String,
+    },
     /// This is a state-machine result, not an authorization to update a ref.
     Verified {
         integration_sha: String,
@@ -42,6 +48,12 @@ pub enum State {
     Invalidated {
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LaneResult {
+    pub run_id: u64,
+    pub conclusion: String,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]

@@ -189,6 +189,15 @@ async fn jobs(
 
 #[tokio::test]
 async fn real_staging_commit_survives_dispatch_observation_and_restart() {
+    scenario(false).await;
+}
+
+#[tokio::test]
+async fn lane_dispatch_survives_observation_release_and_restart() {
+    scenario(true).await;
+}
+
+async fn scenario(lane_mode: bool) {
     use sluss::{
         batch::State as BatchState,
         coordinator::prepare_local_from_remote,
@@ -303,6 +312,12 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
         },
         verification_policy: None,
     };
+    let lane_policy = data.path().join("lanes.toml");
+    std::fs::write(&lane_policy, "version=1\n[lanes.full]\nworkflow_id=17\nsuites=['full']\nrequired_jobs=['job-1-0']\n[lanes.full.request.pools]\nrust=1\n").unwrap();
+    let lane_settings = sluss::dispatch::LaneSettings {
+        policy: lane_policy,
+        verification_policy: None,
+    };
     let planning_db = data.path().join("planning.sqlite");
     let planner = tokio::spawn(sluss::worker::supervise_planning(
         app.clone(),
@@ -399,15 +414,27 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     drop(store);
     drop(inbox);
     mode.store(31, Ordering::SeqCst); // The provider reports an in-progress run.
-    let dispatcher = tokio::spawn(sluss::worker::supervise_dispatch_with_wakeup(
-        app.clone(),
-        db.clone(),
-        policy.clone(),
-        capacity.clone(),
-        settings.clone(),
-        std::time::Duration::from_millis(10),
-        first_ci_wake,
-    ));
+    let dispatcher = if lane_mode {
+        tokio::spawn(sluss::worker::supervise_lane_dispatch_with_wakeup(
+            app.clone(),
+            db.clone(),
+            policy.clone(),
+            capacity.clone(),
+            lane_settings.clone(),
+            std::time::Duration::from_millis(10),
+            first_ci_wake,
+        ))
+    } else {
+        tokio::spawn(sluss::worker::supervise_dispatch_with_wakeup(
+            app.clone(),
+            db.clone(),
+            policy.clone(),
+            capacity.clone(),
+            settings.clone(),
+            std::time::Duration::from_millis(10),
+            first_ci_wake,
+        ))
+    };
     tokio::time::timeout(std::time::Duration::from_secs(12), async {
         loop {
             let scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
@@ -434,8 +461,13 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     let pending = scheduler.pending_dispatches().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].plan.integration_sha, prepared.sha);
+    let dispatch_id = if lane_mode {
+        format!("{id}:lane:full")
+    } else {
+        id.to_owned()
+    };
     assert_eq!(
-        scheduler.receipt_source(id).unwrap().as_deref(),
+        scheduler.receipt_source(&dispatch_id).unwrap().as_deref(),
         Some("direct")
     );
     drop(scheduler);
@@ -443,12 +475,12 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     // Reconstruct the application as well as the database handles after dispatch.
     let app =
         Arc::new(App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap());
-    assert_eq!(
-        sluss::dispatch::batch(&db, &app, &policy, &capacity, &settings, id)
-            .await
-            .unwrap(),
-        sluss::dispatch::Outcome::AlreadyStarted
-    );
+    let outcome = if lane_mode {
+        sluss::dispatch::batch_lanes(&db, &app, &policy, &capacity, &lane_settings, id).await
+    } else {
+        sluss::dispatch::batch(&db, &app, &policy, &capacity, &settings, id).await
+    };
+    assert_eq!(outcome.unwrap(), sluss::dispatch::Outcome::AlreadyStarted);
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     let wake = Arc::new(tokio::sync::Notify::new());
     let release_wake = Arc::new(tokio::sync::Notify::new());
@@ -526,15 +558,16 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     );
     tokio::time::timeout(std::time::Duration::from_secs(12), async {
         loop {
+            let state = Store::open(&db)
+                .unwrap()
+                .batch(id)
+                .unwrap()
+                .unwrap()
+                .0
+                .state;
             if matches!(
-                Store::open(&db)
-                    .unwrap()
-                    .batch(id)
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .state,
-                BatchState::CiComplete { run_id: 123, .. }
+                state,
+                BatchState::CiComplete { run_id: 123, .. } | BatchState::CiCompleteLanes { .. }
             ) {
                 break;
             }
@@ -561,14 +594,27 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     observer.abort();
     releaser.abort();
     let reopened = Store::open(&db).unwrap();
-    assert_eq!(
-        reopened.batch(id).unwrap().unwrap().0.state,
+    let expected = if lane_mode {
+        BatchState::CiCompleteLanes {
+            integration_sha: prepared.sha,
+            lanes: [(
+                "full".into(),
+                sluss::batch::LaneResult {
+                    run_id: 123,
+                    conclusion: "success".into(),
+                },
+            )]
+            .into(),
+            conclusion: "success".into(),
+        }
+    } else {
         BatchState::CiComplete {
             integration_sha: prepared.sha,
             run_id: 123,
-            conclusion: "success".into()
+            conclusion: "success".into(),
         }
-    );
+    };
+    assert_eq!(reopened.batch(id).unwrap().unwrap().0.state, expected);
     let metrics = reopened.metrics().unwrap();
     assert_eq!(metrics.completed_jobs, 1);
     assert_eq!(metrics.runner_milliseconds, 60_000);

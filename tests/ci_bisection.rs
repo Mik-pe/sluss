@@ -68,6 +68,438 @@ fn numbers(batch: &sluss::batch::Batch) -> Vec<u64> {
 }
 
 #[test]
+fn lane_plan_is_bound_to_batch_and_excludes_single_run_dispatch() {
+    use sluss::lanes::{Lane, LanePlan};
+    use sluss::scheduler::SchedulerError;
+    let (dir, mut store, mut inbox, mut scheduler) = setup();
+    let batch = plan(&mut store, 1).unwrap();
+    store
+        .bind_policy_paths(&batch.id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(&batch.id).unwrap();
+    store
+        .finish_integration(&batch.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{}", batch.id),
+        policy_digest: "c".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    let request = Request {
+        pools: [("rust".into(), 1)].into(),
+    };
+    let lanes = LanePlan {
+        batch: plan.clone(),
+        lanes: [(
+            "rust".into(),
+            Lane {
+                workflow_id: 3,
+                suites: ["full".into()].into(),
+                required_jobs: ["test".into()].into(),
+                request: request.clone(),
+            },
+        )]
+        .into(),
+    };
+    assert!(scheduler.freeze_lane_plan(&batch.id, &lanes).unwrap());
+    assert!(!scheduler.freeze_lane_plan(&batch.id, &lanes).unwrap());
+    assert_eq!(scheduler.lane_plan(&batch.id).unwrap(), Some(lanes.clone()));
+    assert!(matches!(
+        scheduler.reserve_batch_dispatch(&batch.id, &request, &plan),
+        Err(SchedulerError::IdConflict)
+    ));
+    let mut changed = lanes.clone();
+    changed.lanes.get_mut("rust").unwrap().workflow_id = 4;
+    assert!(matches!(
+        scheduler.freeze_lane_plan(&batch.id, &changed),
+        Err(SchedulerError::IdConflict)
+    ));
+    let larger = Capacity {
+        pools: [("rust".into(), 2)].into(),
+        hosts: [(
+            "sluss-host-test".into(),
+            Host {
+                slots: 1,
+                runner_ids: [7].into(),
+                pools: [("rust".into(), 2)].into(),
+            },
+        )]
+        .into(),
+    };
+    assert!(matches!(
+        Scheduler::open(dir.path().join("queue.sqlite"), larger),
+        Err(SchedulerError::ConfigBusy)
+    ));
+    drop(scheduler);
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        dir.path().join("queue.sqlite"),
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: BTreeSet::from([7]),
+                    pools,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    assert_eq!(scheduler.lane_plan(&batch.id).unwrap(), Some(lanes));
+    let eligible = BTreeSet::from(["sluss-host-test".into()]);
+    let lane = scheduler
+        .reserve_lane_dispatch_on(&batch.id, "rust", &eligible)
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduler
+            .claim_batch_dispatch(&lane.id, ".github/workflows/ci.yml")
+            .unwrap()
+    );
+    scheduler.record_receipt(&lane.id, 42).unwrap();
+    scheduler.observe_dispatch(&lane.id, 42).unwrap();
+    inbox
+        .record("base-changed-lanes", "push", &[5; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates: Vec<_> = store
+        .candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| AdmissionCandidate {
+            evidence_digest: format!("{:064x}", candidate.number),
+            candidate,
+        })
+        .collect();
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &candidates,
+            &"e".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.batch(&batch.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert_eq!(scheduler.stale_dispatches().unwrap(), vec![lane.id.clone()]);
+    assert!(scheduler.complete_lanes_ci_only(&batch.id).is_err());
+    scheduler.release_invalidated_ci_only(&lane.id, 42).unwrap();
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+}
+
+#[test]
+fn lanes_reserve_independently_without_overbooking_shared_host() {
+    lane_completion_scenario("success", "success");
+    lane_completion_scenario("failure", "failure");
+    lane_completion_scenario("cancelled", "inconclusive");
+}
+
+fn lane_completion_scenario(second_conclusion: &str, expected_conclusion: &str) {
+    use sluss::lanes::{Lane, LanePlan};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let batch = plan(&mut store, 1).unwrap();
+    store
+        .bind_policy_paths(&batch.id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(&batch.id).unwrap();
+    store
+        .finish_integration(&batch.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    store
+        .record_selection(
+            &batch.id,
+            &sluss::selective::FrozenSelection {
+                base_sha: batch.base_sha.clone(),
+                integration_sha: "b".repeat(40),
+                policy_digest: "d".repeat(64),
+                selection: sluss::selective::Selection::Selected {
+                    suites: ["compile".into(), "test".into()].into(),
+                    components: ["component".into()].into(),
+                },
+            },
+        )
+        .unwrap();
+    let request = Request {
+        pools: [("rust".into(), 1)].into(),
+    };
+    let mut lanes = BTreeMap::new();
+    for name in ["compile", "test"] {
+        lanes.insert(
+            name.into(),
+            Lane {
+                workflow_id: 3,
+                suites: [name.into()].into(),
+                required_jobs: [format!("{name}-job")].into(),
+                request: request.clone(),
+            },
+        );
+    }
+    let plan = LanePlan {
+        batch: DispatchPlan {
+            installation_id: 1,
+            repository_id: 2,
+            workflow_id: 3,
+            integration_sha: "b".repeat(40),
+            staging_ref: format!("refs/heads/sluss/{}", batch.id),
+            policy_digest: "c".repeat(64),
+            required_jobs: ["compile-job".into(), "test-job".into()].into(),
+            suites: ["compile".into(), "test".into()].into(),
+            selection_policy_digest: Some("d".repeat(64)),
+        },
+        lanes,
+    };
+    scheduler.freeze_lane_plan(&batch.id, &plan).unwrap();
+    let eligible = BTreeSet::from(["sluss-host-test".into()]);
+    let first = scheduler
+        .reserve_lane_dispatch_on(&batch.id, "compile", &eligible)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        scheduler
+            .reserve_lane_dispatch_on(&batch.id, "compile", &eligible)
+            .unwrap(),
+        Some(first.clone())
+    );
+    assert!(
+        scheduler
+            .reserve_lane_dispatch_on(&batch.id, "test", &eligible)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    assert!(
+        scheduler
+            .claim_batch_dispatch(&first.id, ".github/workflows/ci.yml")
+            .unwrap()
+    );
+    let uncertain =
+        Scheduler::inspect_uncertain_dispatch(dir.path().join("queue.sqlite"), &first.id).unwrap();
+    assert_eq!(uncertain.pending.reservation.id, first.id);
+    let overview = Scheduler::dispatch_overview(dir.path().join("queue.sqlite")).unwrap();
+    assert_eq!(overview[0].batch_id.as_deref(), Some(batch.id.as_str()));
+    assert_eq!(overview[0].id, first.id);
+    scheduler.record_receipt(&first.id, 90).unwrap();
+    scheduler.observe_dispatch(&first.id, 90).unwrap();
+    let first_snapshot = ActionsSnapshot {
+        run: ActionsRun {
+            id: 90,
+            run_attempt: 1,
+            workflow_id: 3,
+            head_sha: "b".repeat(40),
+            head_branch: Some(format!("sluss/{}", batch.id)),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 190,
+            run_id: 90,
+            head_sha: "b".repeat(40),
+            name: "compile-job".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            runner_id: Some(7),
+        }],
+    };
+    scheduler
+        .record_ci_observation(&first.id, &first_snapshot)
+        .unwrap();
+    assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    scheduler.release_completed_lane(&first.id, 90).unwrap();
+    drop(scheduler);
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        dir.path().join("queue.sqlite"),
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: BTreeSet::from([7]),
+                    pools,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    let second = scheduler
+        .reserve_lane_dispatch_on(&batch.id, "test", &eligible)
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduler
+            .reserve_lane_dispatch_on(&batch.id, "missing", &eligible)
+            .is_err()
+    );
+    scheduler
+        .validate_dispatch_target(&second.id, Some(("main", &batch.base_sha)))
+        .unwrap();
+    assert!(
+        scheduler
+            .claim_batch_dispatch(&second.id, ".github/workflows/ci.yml")
+            .unwrap()
+    );
+    scheduler.record_receipt(&second.id, 91).unwrap();
+    scheduler.observe_dispatch(&second.id, 91).unwrap();
+    let snapshot = ActionsSnapshot {
+        run: ActionsRun {
+            id: 91,
+            run_attempt: 1,
+            workflow_id: 3,
+            head_sha: "b".repeat(40),
+            head_branch: Some(format!("sluss/{}", batch.id)),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some(second_conclusion.into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 191,
+            run_id: 91,
+            head_sha: "b".repeat(40),
+            name: "test-job".into(),
+            status: "completed".into(),
+            conclusion: Some(second_conclusion.into()),
+            started_at: None,
+            completed_at: None,
+            runner_id: Some(7),
+        }],
+    };
+    scheduler
+        .record_ci_observation(&second.id, &snapshot)
+        .unwrap();
+    assert!(scheduler.complete_ci_only(&second.id).is_err());
+    assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    scheduler.release_completed_lane(&second.id, 91).unwrap();
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+    assert!(scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    assert!(matches!(store.batch(&batch.id).unwrap().unwrap().0.state,
+        State::CiCompleteLanes { lanes, conclusion, .. } if lanes.len() == 2 && conclusion == expected_conclusion));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args(["ci-evidence", "--batch-id", &batch.id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("job 190") && report.contains("job 191"));
+    assert_eq!(store.ci_only_completions().unwrap().len(), 4);
+    assert_eq!(store.retry_ci_only(&batch.id).unwrap(), 4);
+}
+
+#[test]
+fn distinct_lanes_can_hold_distinct_physical_hosts_at_once() {
+    use sluss::lanes::{Lane, LanePlan};
+    let (dir, mut store, _inbox, scheduler) = setup();
+    drop(scheduler);
+    let batch = plan(&mut store, 1).unwrap();
+    store.start_integration(&batch.id).unwrap();
+    store
+        .finish_integration(&batch.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    store
+        .record_selection(
+            &batch.id,
+            &sluss::selective::FrozenSelection {
+                base_sha: batch.base_sha.clone(),
+                integration_sha: "b".repeat(40),
+                policy_digest: "d".repeat(64),
+                selection: sluss::selective::Selection::Selected {
+                    suites: ["linux".into(), "macos".into()].into(),
+                    components: ["all".into()].into(),
+                },
+            },
+        )
+        .unwrap();
+    let capacity = Capacity {
+        pools: [("linux".into(), 1), ("macos".into(), 1)].into(),
+        hosts: ["linux", "macos"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, pool)| {
+                (
+                    format!("sluss-host-{pool}"),
+                    Host {
+                        slots: 1,
+                        runner_ids: [(n as u64 + 1)].into(),
+                        pools: [(pool.into(), 1)].into(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("queue.sqlite"), capacity.clone()).unwrap();
+    let lane = |name: &str| Lane {
+        workflow_id: 3,
+        suites: [name.into()].into(),
+        required_jobs: [format!("{name}-job")].into(),
+        request: Request {
+            pools: [(name.into(), 1)].into(),
+        },
+    };
+    let frozen = LanePlan {
+        batch: DispatchPlan {
+            installation_id: 1,
+            repository_id: 2,
+            workflow_id: 3,
+            integration_sha: "b".repeat(40),
+            staging_ref: format!("refs/heads/sluss/{}", batch.id),
+            policy_digest: "c".repeat(64),
+            required_jobs: ["linux-job".into(), "macos-job".into()].into(),
+            suites: ["linux".into(), "macos".into()].into(),
+            selection_policy_digest: Some("d".repeat(64)),
+        },
+        lanes: [
+            ("linux".into(), lane("linux")),
+            ("macos".into(), lane("macos")),
+        ]
+        .into(),
+    };
+    scheduler.freeze_lane_plan(&batch.id, &frozen).unwrap();
+    let eligible = capacity.hosts.keys().cloned().collect();
+    let linux = scheduler
+        .reserve_lane_dispatch_on(&batch.id, "linux", &eligible)
+        .unwrap()
+        .unwrap();
+    let macos = scheduler
+        .reserve_lane_dispatch_on(&batch.id, "macos", &eligible)
+        .unwrap()
+        .unwrap();
+    assert_eq!(linux.host, "sluss-host-linux");
+    assert_eq!(macos.host, "sluss-host-macos");
+    assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+    assert!(scheduler.cancel_prepared(&linux.id).unwrap());
+    assert!(matches!(
+        store.batch(&batch.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 1);
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+}
+
+#[test]
 fn ci_policy_file_migration_requires_drain_and_rejects_stale_revisions() {
     let (dir, mut store, _inbox, mut scheduler) = setup();
     let db = dir.path().join("queue.sqlite");

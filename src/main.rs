@@ -36,17 +36,20 @@ enum Command {
         #[arg(long, requires = "auto_stage")]
         policy_file: Vec<String>,
         /// Automatically dispatch staged batches to the configured workflow.
-        #[arg(long, requires_all = ["config", "capacity", "workflow_id", "required_job", "pool"])]
+        #[arg(long, requires_all = ["config", "capacity"])]
         auto_dispatch: bool,
         /// GitHub Actions workflow ID for automatic dispatch.
-        #[arg(long, requires = "auto_dispatch")]
+        #[arg(long, requires = "auto_dispatch", conflicts_with = "lane_policy")]
         workflow_id: Option<u64>,
         /// Required workflow job name; repeat as needed.
-        #[arg(long, requires = "auto_dispatch")]
+        #[arg(long, requires = "auto_dispatch", conflicts_with = "lane_policy")]
         required_job: Vec<String>,
         /// Resource request as pool=count; repeat as needed.
-        #[arg(long, requires = "auto_dispatch")]
+        #[arg(long, requires = "auto_dispatch", conflicts_with = "lane_policy")]
         pool: Vec<String>,
+        /// Operator-owned suite-to-workflow and physical-pool mapping.
+        #[arg(long, requires = "auto_dispatch", conflicts_with_all = ["workflow_id", "required_job", "pool"])]
+        lane_policy: Option<PathBuf>,
         /// Operator-owned selective policy for staging and dispatch.
         #[arg(long, requires = "config")]
         verification_policy: Option<PathBuf>,
@@ -1073,6 +1076,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workflow_id,
         required_job,
         pool,
+        lane_policy,
         verification_policy,
         cancel_stale,
         cancel_stale_checks,
@@ -1121,7 +1125,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-        let dispatch_settings = if auto_dispatch {
+        let lane_settings = if let Some(path) = lane_policy {
+            if !complete_ci_only || !release_ci_only || bisect_ci_failures || observe_reruns {
+                return Err("lane dispatch requires --complete-ci-only and --release-ci-only; lane bisection and rerun collection are not yet supported".into());
+            }
+            let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
+            let (suites, digest) = if let Some(path) = &verification_policy {
+                let policy = sluss::selective::Policy::load(path)?;
+                (
+                    policy.full_suites.into_iter().collect(),
+                    Some("0".repeat(64)),
+                )
+            } else {
+                (std::collections::BTreeSet::from(["full".into()]), None)
+            };
+            let template = sluss::scheduler::DispatchPlan {
+                installation_id: 1,
+                repository_id: 1,
+                workflow_id: 0,
+                integration_sha: "0".repeat(40),
+                staging_ref: "refs/heads/sluss/batch-0000000000000000".into(),
+                policy_digest: "0".repeat(64),
+                required_jobs: Default::default(),
+                suites: suites.clone(),
+                selection_policy_digest: digest,
+            };
+            sluss::lanes::Policy::load(&path)?.plan(template, &suites, capacity)?;
+            Some(sluss::dispatch::LaneSettings {
+                policy: path,
+                verification_policy: verification_policy.clone(),
+            })
+        } else {
+            None
+        };
+        let dispatch_settings = if auto_dispatch && lane_settings.is_none() {
             let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
             let workflow_id = workflow_id.ok_or("workflow ID is required")?;
             Some(build_dispatch_settings(
@@ -1137,6 +1174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
         let worker = if let Some(path) = config {
             let config = sluss::config::Config::load(&path)?;
+            if lane_settings.is_some() && config.queue.adaptive_batching {
+                return Err("adaptive batching is not yet supported with lane dispatch".into());
+            }
             if auto_plan && config.queue.adaptive_batching && !complete_ci_only {
                 return Err("adaptive batching with automatic planning requires --complete-ci-only and dispatch observation".into());
             }
@@ -1211,17 +1251,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .expect("preflight capacity")
                     .clone();
-                let settings = dispatch_settings.expect("preflight dispatch settings");
                 eprintln!("automatic dispatch enabled; landing remains disabled");
-                tokio::spawn(sluss::worker::supervise_dispatch_with_wakeup(
-                    app.clone(),
-                    cli.db.clone(),
-                    policy.clone(),
-                    capacity,
-                    settings,
-                    poll,
-                    ci_wakeup.clone(),
-                ));
+                if let Some(settings) = lane_settings {
+                    tokio::spawn(sluss::worker::supervise_lane_dispatch_with_wakeup(
+                        app.clone(),
+                        cli.db.clone(),
+                        policy.clone(),
+                        capacity,
+                        settings,
+                        poll,
+                        ci_wakeup.clone(),
+                    ));
+                } else {
+                    let settings = dispatch_settings.expect("preflight dispatch settings");
+                    tokio::spawn(sluss::worker::supervise_dispatch_with_wakeup(
+                        app.clone(),
+                        cli.db.clone(),
+                        policy.clone(),
+                        capacity,
+                        settings,
+                        poll,
+                        ci_wakeup.clone(),
+                    ));
+                }
             }
             if cancel_stale {
                 let capacity = capacity_config
@@ -2269,7 +2321,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             let placement = sluss::verification::check_host_placement(&snapshot, runners)?;
             let recorded = scheduler.record_job_metrics(&batch_id, &snapshot)?;
-            let batch = store.batch(&batch_id)?.ok_or("unknown batch")?.0;
+            let parent_id = scheduler
+                .dispatch_batch_id(&batch_id)?
+                .ok_or("dispatch is not bound to a batch")?;
+            let batch = store.batch(&parent_id)?.ok_or("unknown batch")?.0;
             if matches!(batch.state, sluss::batch::State::Invalidated { .. }) {
                 println!("batch is stale; no CI result is accepted");
             } else {
@@ -3078,52 +3133,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::CiEvidence { batch_id } => {
-            if let Some(evidence) = store.ci_evidence(&batch_id)? {
-                let record = evidence.record;
-                println!(
-                    "CI observation for batch {:?}: {:?}; conflict: {}",
-                    batch_id, record.observation, evidence.conflicted
-                );
-                println!(
-                    "repository: {}; run: {}; workflow ID: {}; commit: {}; policy digest: {}",
-                    record.plan.repository_id,
-                    record.run_id,
-                    record.plan.workflow_id,
-                    record.plan.integration_sha,
-                    record.plan.policy_digest
-                );
-                println!(
-                    "frozen workflow path: {:?}; observed runner: {:?}",
-                    record.workflow_path, record.runner_id
-                );
-                println!(
-                    "admission policy digest: {}; required jobs: {:?}; suites: {:?}; selection policy digest: {:?}",
-                    store
-                        .repository_policy_digest()?
-                        .as_deref()
-                        .unwrap_or("unbound"),
-                    record.plan.required_jobs,
-                    record.plan.suites,
-                    record.plan.selection_policy_digest
-                );
-                if let Some(snapshot) = record.snapshot {
+            let mut ids = vec![batch_id.clone()];
+            ids.extend(store.lane_dispatch_ids(&batch_id)?);
+            let mut found = false;
+            for id in ids {
+                if let Some(evidence) = store.ci_evidence(&id)? {
+                    found = true;
+                    let record = evidence.record;
                     println!(
-                        "attempt: {}; run status: {:?}; conclusion: {:?}",
-                        snapshot.run.run_attempt, snapshot.run.status, snapshot.run.conclusion
+                        "CI observation for dispatch {:?}: {:?}; conflict: {}",
+                        id, record.observation, evidence.conflicted
                     );
-                    for job in snapshot.jobs {
+                    println!(
+                        "repository: {}; run: {}; workflow ID: {}; commit: {}; policy digest: {}",
+                        record.plan.repository_id,
+                        record.run_id,
+                        record.plan.workflow_id,
+                        record.plan.integration_sha,
+                        record.plan.policy_digest
+                    );
+                    println!(
+                        "frozen workflow path: {:?}; observed runner: {:?}",
+                        record.workflow_path, record.runner_id
+                    );
+                    println!(
+                        "admission policy digest: {}; required jobs: {:?}; suites: {:?}; selection policy digest: {:?}",
+                        store
+                            .repository_policy_digest()?
+                            .as_deref()
+                            .unwrap_or("unbound"),
+                        record.plan.required_jobs,
+                        record.plan.suites,
+                        record.plan.selection_policy_digest
+                    );
+                    if let Some(snapshot) = record.snapshot {
                         println!(
-                            "job {} {:?}: status {:?}, conclusion {:?}, runner {:?}",
-                            job.id, job.name, job.status, job.conclusion, job.runner_id
+                            "attempt: {}; run status: {:?}; conclusion: {:?}",
+                            snapshot.run.run_attempt, snapshot.run.status, snapshot.run.conclusion
                         );
+                        for job in snapshot.jobs {
+                            println!(
+                                "job {} {:?}: status {:?}, conclusion {:?}, runner {:?}",
+                                job.id, job.name, job.status, job.conclusion, job.runner_id
+                            );
+                        }
+                    } else {
+                        println!("historical record has no original job snapshot");
                     }
-                } else {
-                    println!("historical record has no original job snapshot");
+                    println!(
+                        "This is a provider observation, not a trusted attestation or merge approval."
+                    );
                 }
-                println!(
-                    "This is a provider observation, not a trusted attestation or merge approval."
-                );
-            } else {
+            }
+            if !found {
                 println!("no completed CI observation for batch {:?}", batch_id);
             }
         }

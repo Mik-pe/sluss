@@ -15,6 +15,7 @@ pub mod dispatch;
 pub mod github;
 pub mod integration;
 pub mod landing;
+pub mod lanes;
 pub mod local_refs;
 pub mod metrics;
 pub mod reconcile;

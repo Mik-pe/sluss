@@ -69,6 +69,48 @@ fn example_capacity_has_valid_host_labels_and_can_open_scheduler() {
 }
 
 #[test]
+fn lane_worker_rejects_incomplete_or_unsupported_configuration_before_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("sluss.toml");
+    let db = dir.path().join("queue.sqlite");
+    std::fs::write(&config, VALID).unwrap();
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db)
+            .args(["serve", "--config"])
+            .arg(&config)
+            .args([
+                "--capacity",
+                examples.join("capacity.toml").to_str().unwrap(),
+                "--auto-dispatch",
+                "--lane-policy",
+                examples.join("lane-policy.toml").to_str().unwrap(),
+                "--verification-policy",
+                examples.join("verification.toml").to_str().unwrap(),
+            ])
+            .args(extra)
+            .env("SLUSS_WEBHOOK_SECRET", "test")
+            .output()
+            .unwrap()
+    };
+    let incomplete = run(&[]);
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("requires --complete-ci-only"));
+    assert!(!db.exists());
+    let reruns = run(&[
+        "--observe-dispatches",
+        "--complete-ci-only",
+        "--release-ci-only",
+        "--observe-reruns",
+    ]);
+    assert!(!reruns.status.success());
+    assert!(String::from_utf8_lossy(&reruns.stderr).contains("rerun collection"));
+    assert!(!db.exists());
+}
+
+#[test]
 fn adaptive_batching_requires_single_active_batch_and_ci_completion_worker() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("adaptive.toml");
