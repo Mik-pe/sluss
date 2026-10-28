@@ -18,6 +18,8 @@ Its batch-bound claim also requires repeated, matching `APPROVED` review decisio
 
 The App claim additionally requires an operator-supplied `TrustedCiPolicy` frozen with the batch, covering the workflow and policy digest, required jobs, suites and allowed runner IDs. This library-only prerequisite does not validate the policy's completeness or enable attestation and landing. See the [protocol](docs/protocol.md).
 
+To compare a policy locally, independently review a trusted commit and list every policy dependency. Run `sluss policy-digest --source /path/to/trusted/repo --commit <full-sha> --policy-file .github/workflows/sluss-ci.yml`, repeating `--policy-file` for every dependency. Fill in an operator-owned policy based on [the example](examples/trusted-ci-policy.toml), then run `sluss --db sluss.sqlite inspect-ci-policy --batch-id <id> --policy /path/to/trusted-ci-policy.toml`. `sluss ci-evidence --batch-id <id>` displays the recorded job, suite and policy values for comparison; observations are not recommendations. These commands cannot establish that the policy list is complete, that a commit or runner is trustworthy, or that the provider state is current. They do not create an intent, issue an attestation or authorize a merge.
+
 ```sh
 cargo test
 cargo run -- status

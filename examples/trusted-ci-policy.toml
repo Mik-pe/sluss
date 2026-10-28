@@ -1,0 +1,17 @@
+# EXAMPLE ONLY. Replace every value after independently reviewing and protecting
+# the complete workflow, dependencies, runner isolation, and admission policy.
+# Matching this file never authorizes a merge or publishes an attestation.
+version = 1
+installation_id = 42
+repository_id = 7
+repository_node_id = "R_example"
+target_ref = "refs/heads/main"
+repository_policy_digest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+policy_digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+workflow_id = 17
+workflow_path = ".github/workflows/sluss-ci.yml"
+required_jobs = ["test"]
+suites = ["full"]
+runner_ids = [1]
+# For selective verification only, set the independently reviewed digest:
+# selection_policy_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

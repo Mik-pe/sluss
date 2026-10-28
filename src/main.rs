@@ -244,6 +244,22 @@ enum Command {
         #[arg(long)]
         batch_id: String,
     },
+    /// Compare a local batch with an operator CI policy without creating an intent.
+    InspectCiPolicy {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Hash declared policy files from an explicitly selected local commit.
+    PolicyDigest {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        commit: String,
+        #[arg(long, required = true)]
+        policy_file: Vec<String>,
+    },
     /// Show runner time for completed jobs observed by Sluss.
     Metrics,
     /// Compare two operator-collected cohorts of jobs and delivered PRs.
@@ -293,6 +309,43 @@ struct ReconcileArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::InspectCiPolicy { batch_id, policy } = &cli.command {
+        let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
+        let plan =
+            sluss::landing::LandingJournal::inspect_trusted_batch(&cli.db, batch_id, &trust)?;
+        println!(
+            "local batch {batch_id} matches operator CI policy {}",
+            trust.digest()?
+        );
+        println!(
+            "repository {} / installation {}; target {}; base {}; staging {}",
+            plan.repository_id,
+            plan.installation_id,
+            plan.target_ref,
+            plan.base_sha,
+            plan.staged_sha
+        );
+        println!(
+            "This is a local comparison only: no provider refresh, policy validation, attestation, intent, or merge authorization was performed."
+        );
+        return Ok(());
+    }
+    if let Command::PolicyDigest {
+        source,
+        commit,
+        policy_file,
+    } = &cli.command
+    {
+        let snapshot = sluss::integration::policy_snapshot_at_commit(source, commit, policy_file)?;
+        println!("policy digest: {}", snapshot.digest);
+        for path in snapshot.paths {
+            println!("policy file: {path}");
+        }
+        println!(
+            "Commit identity, file completeness and workflow trust must be independently verified."
+        );
+        return Ok(());
+    }
     if let Command::Benchmark { input } = &cli.command {
         let report = sluss::benchmark::Input::load(input)?.report()?;
         for (label, cohort) in [("baseline", &report.baseline), ("sluss", &report.sluss)] {
@@ -1192,6 +1245,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "frozen workflow path: {:?}; observed runner: {:?}",
                     record.workflow_path, record.runner_id
                 );
+                println!(
+                    "admission policy digest: {}; required jobs: {:?}; suites: {:?}; selection policy digest: {:?}",
+                    store
+                        .repository_policy_digest()?
+                        .as_deref()
+                        .unwrap_or("unbound"),
+                    record.plan.required_jobs,
+                    record.plan.suites,
+                    record.plan.selection_policy_digest
+                );
                 if let Some(snapshot) = record.snapshot {
                     println!(
                         "attempt: {}; run status: {:?}; conclusion: {:?}",
@@ -1233,6 +1296,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Benchmark { .. } => {
             unreachable!("benchmark is handled before opening the database")
+        }
+        Command::InspectCiPolicy { .. } => {
+            unreachable!("policy inspection is handled before opening the database")
+        }
+        Command::PolicyDigest { .. } => {
+            unreachable!("policy digest is handled before opening the database")
         }
         Command::Queue => {
             let failed: std::collections::BTreeMap<_, _> = store

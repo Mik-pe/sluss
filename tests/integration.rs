@@ -955,3 +955,35 @@ fn selective_bisection_stages_the_same_full_suite_for_comparable_halves() {
             .collect()
     );
 }
+
+#[test]
+fn reviewed_commit_policy_digest_matches_staging_and_ignores_worktree_changes() {
+    use sluss::integration::policy_snapshot_at_commit;
+    let (dir, base, one, _) = fixture();
+    let integration = build(dir.path(), &base, &[one]).unwrap();
+    let paths = vec!["shared".to_string()];
+    let from_staging = integration.check_policy(&base, &paths).unwrap();
+    std::fs::write(dir.path().join("shared"), "uncommitted change\n").unwrap();
+    let reviewed = policy_snapshot_at_commit(dir.path(), &base, &paths).unwrap();
+    assert_eq!(reviewed, from_staging);
+    let database = dir.path().join("unused.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&database)
+        .args(["policy-digest", "--source"])
+        .arg(dir.path())
+        .args(["--commit", &base, "--policy-file", "shared"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains(&reviewed.digest));
+    assert!(text.contains("independently verified"));
+    assert!(!database.exists());
+    assert!(policy_snapshot_at_commit(dir.path(), &"0".repeat(40), &paths).is_err());
+    assert!(policy_snapshot_at_commit(dir.path(), &base, &["missing".into()]).is_err());
+}

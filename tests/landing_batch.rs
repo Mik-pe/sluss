@@ -521,3 +521,58 @@ fn concurrent_operators_cannot_freeze_different_trust_policies_for_one_intent() 
         1
     );
 }
+
+#[test]
+fn cli_inspects_trust_policy_without_creating_an_intent_or_database() {
+    use std::process::Command;
+    let fixture = setup();
+    let policy = trusted_policy();
+    let policy_file = fixture._dir.path().join("trust.toml");
+    std::fs::write(&policy_file, toml::to_string(&policy).unwrap()).unwrap();
+    let run = |db: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db)
+            .args(["inspect-ci-policy", "--batch-id", BATCH, "--policy"])
+            .arg(&policy_file)
+            .output()
+            .unwrap()
+    };
+    let output = run(&fixture.db);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains(&policy.digest().unwrap()));
+    assert!(text.contains("no provider refresh"));
+    let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM landing_intents_v1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    let absent = fixture._dir.path().join("nonexistent.sqlite");
+    assert!(!run(&absent).status.success());
+    assert!(!absent.exists());
+    let mut wrong = policy.clone();
+    wrong.workflow_id = 4;
+    std::fs::write(&policy_file, toml::to_string(&wrong).unwrap()).unwrap();
+    assert!(!run(&fixture.db).status.success());
+    std::fs::write(
+        &policy_file,
+        format!("{}\nunknown = true\n", toml::to_string(&policy).unwrap()),
+    )
+    .unwrap();
+    assert!(!run(&fixture.db).status.success());
+}
+
+#[test]
+fn published_trust_policy_example_parses_without_establishing_trust() {
+    let policy = sluss::landing::TrustedCiPolicy::load(std::path::Path::new(
+        "examples/trusted-ci-policy.toml",
+    ))
+    .unwrap();
+    assert_eq!(policy.workflow_path, ".github/workflows/sluss-ci.yml");
+    assert_eq!(policy.digest().unwrap().len(), 64);
+}

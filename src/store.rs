@@ -149,6 +149,17 @@ impl Store {
         }))
     }
 
+    /// Admission configuration bound by successful repository reconciliation.
+    pub fn repository_policy_digest(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT policy_digest FROM repository_binding WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
     /// Scope fixed by successful repository reconciliation.
     pub fn repository_scope(&self) -> Result<(u64, u64), StoreError> {
         let binding: Option<(i64, i64)> = self

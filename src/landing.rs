@@ -72,6 +72,10 @@ pub enum LandingError {
     BatchBound,
     #[error("operator CI trust policy is missing, changed or inconsistent with the recorded run")]
     TrustPolicy,
+    #[error("could not read operator CI trust policy")]
+    TrustPolicyRead,
+    #[error("invalid operator CI trust policy TOML")]
+    TrustPolicyFormat,
 }
 
 /// An operator-reviewed allowlist. Matching it is necessary but does not prove
@@ -94,6 +98,23 @@ pub struct TrustedCiPolicy {
     pub runner_ids: BTreeSet<u64>,
 }
 impl TrustedCiPolicy {
+    /// Read an operator-owned file. Matching a file does not establish its trust.
+    pub fn load(path: &Path) -> Result<Self, LandingError> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|_| LandingError::TrustPolicyRead)?
+            .take(65_537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| LandingError::TrustPolicyRead)?;
+        if bytes.len() > 65_536 {
+            return Err(LandingError::TrustPolicyFormat);
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| LandingError::TrustPolicyFormat)?;
+        let policy: Self = toml::from_str(text).map_err(|_| LandingError::TrustPolicyFormat)?;
+        policy.digest()?;
+        Ok(policy)
+    }
     pub fn digest(&self) -> Result<String, LandingError> {
         if self.version != 1
             || self.installation_id == 0
@@ -221,6 +242,22 @@ pub(crate) struct RefreshTarget {
     pub repository_policy_digest: String,
 }
 impl LandingJournal {
+    /// Compare a frozen local batch to an operator policy without creating a
+    /// journal intent or querying the provider. The database is opened read-only.
+    pub fn inspect_trusted_batch(
+        path: impl AsRef<Path>,
+        batch_id: &str,
+        policy: &TrustedCiPolicy,
+    ) -> Result<LandingPlan, LandingError> {
+        let mut conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let plan = observed_plan(&tx, "inspect-policy", batch_id, &policy.repository_node_id)?;
+        verify_trusted_policy(&tx, &plan, policy)?;
+        tx.commit()?;
+        Ok(plan)
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LandingError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
