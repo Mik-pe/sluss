@@ -206,6 +206,11 @@ fn dispatch_intent_survives_crashes_and_cannot_release_capacity_early() {
         scheduler.finish_dispatch("job", 51),
         Err(SchedulerError::DispatchTransition)
     ));
+    assert!(matches!(
+        scheduler.finish_dispatch("job", 50),
+        Err(SchedulerError::DispatchTransition)
+    ));
+    scheduler.record_receipt("job", 50).unwrap();
     scheduler.finish_dispatch("job", 50).unwrap();
     scheduler.finish_dispatch("job", 50).unwrap();
     assert!(scheduler.pending_dispatches().unwrap().is_empty());
@@ -323,4 +328,108 @@ fn completed_job_metrics_are_idempotent_and_reject_conflicting_or_invalid_eviden
     let totals = Store::open(&db).unwrap().metrics().unwrap();
     assert_eq!(totals.completed_jobs, 1);
     assert_eq!(totals.runner_milliseconds, 90_000);
+}
+
+#[test]
+fn conflicting_recovery_and_direct_receipt_stay_visible_and_reserve_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dispatch-conflict.sqlite");
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    let req = request(&[("macos", 1)]);
+    scheduler
+        .reserve_dispatch("job", &req, &dispatch_plan())
+        .unwrap()
+        .unwrap();
+    assert!(scheduler.claim_dispatch("job").unwrap());
+    scheduler.observe_dispatch("job", 50).unwrap();
+    assert!(matches!(
+        scheduler.record_receipt("job", 51),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert_eq!(scheduler.receipt_conflict("job").unwrap(), Some((50, 51)));
+    assert_eq!(
+        scheduler.receipt_source("job").unwrap().as_deref(),
+        Some("conflict")
+    );
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    assert_eq!(scheduler.receipt_conflict("job").unwrap(), Some((50, 51)));
+    assert!(matches!(
+        scheduler.observe_dispatch("job", 50),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert!(scheduler.finish_dispatch("job", 50).is_err());
+    assert!(scheduler.finish_dispatch("job", 51).is_err());
+    assert!(scheduler.reserve("other", &req).unwrap().is_none());
+}
+
+#[test]
+fn one_provider_run_cannot_be_recovered_into_two_intents() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dispatch-unique.sqlite");
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    scheduler
+        .reserve_dispatch("first", &request(&[("rust", 1)]), &dispatch_plan())
+        .unwrap()
+        .unwrap();
+    scheduler
+        .reserve_dispatch("second", &request(&[("macos", 1)]), &dispatch_plan())
+        .unwrap()
+        .unwrap();
+    assert!(scheduler.claim_dispatch("first").unwrap());
+    assert!(scheduler.claim_dispatch("second").unwrap());
+    scheduler.observe_dispatch("first", 50).unwrap();
+    assert!(scheduler.observe_dispatch("second", 50).is_err());
+    let second = scheduler
+        .pending_dispatches()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.reservation.id == "second")
+        .unwrap();
+    assert_eq!(second.state, sluss::scheduler::DispatchState::Sending);
+}
+
+#[test]
+fn legacy_finished_recovery_conflict_is_not_reported_as_an_active_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("legacy-conflict.sqlite");
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    scheduler
+        .reserve_dispatch("job", &request(&[("macos", 1)]), &dispatch_plan())
+        .unwrap()
+        .unwrap();
+    scheduler.claim_dispatch("job").unwrap();
+    scheduler.observe_dispatch("job", 50).unwrap();
+    // Simulate a preview database written by the former permissive finish API.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM capacity_reservations WHERE id='job'", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE dispatch_intents SET state='finished' WHERE id='job'",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        scheduler.record_receipt("job", 51),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert_eq!(scheduler.receipt_conflict("job").unwrap(), Some((50, 51)));
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_duplicate_run_receipts_block_scheduler_without_deleting_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("duplicates.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT); INSERT INTO dispatch_intents VALUES('one','{}','observed','50'),('two','{}','observed','50');").unwrap();
+    assert!(Scheduler::open(&db, capacity()).is_err());
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM dispatch_intents WHERE run_id='50'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
 }

@@ -64,6 +64,8 @@ pub enum SchedulerError {
     DispatchManaged,
     #[error("dispatch transition or run identity is invalid")]
     DispatchTransition,
+    #[error("direct and recovered dispatch receipts identify different runs")]
+    DispatchReceiptConflict,
     #[error("batch, queue, or repository changed before dispatch")]
     StaleBatch,
     #[error("registered workflow is not in the frozen policy file list")]
@@ -93,6 +95,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS dispatch_unique_run ON dispatch_intents(run_id) WHERE run_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_branch_rules (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
@@ -104,6 +107,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_receipt_conflicts (id TEXT PRIMARY KEY NOT NULL, recovered_run TEXT NOT NULL, direct_run TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_conflict_cancellations (id TEXT NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','accepted')), PRIMARY KEY(id,run_id));
             CREATE TABLE IF NOT EXISTS stale_cancellations (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL);")?;
         crate::metrics::ensure_schema(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -769,6 +774,16 @@ impl Scheduler {
             )
             .optional()?;
         let run = run_id.to_string();
+        let conflict: Option<(String, String)> = tx
+            .query_row(
+                "SELECT recovered_run,direct_run FROM dispatch_receipt_conflicts WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if conflict.is_some() {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
         match row {
             Some((state, None)) if state == "sending" => {
                 tx.execute(
@@ -779,6 +794,59 @@ impl Scheduler {
             Some((state, Some(old)))
                 if (state == "accepted" || state == "observed" || state == "finished")
                     && old == run => {}
+            Some((state, Some(old)))
+                if matches!(state.as_str(), "observed" | "finished") && old != run =>
+            {
+                let source: Option<String> = tx
+                    .query_row(
+                        "SELECT source FROM dispatch_receipt_sources WHERE id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if source.as_deref() != Some("recovered")
+                    || old
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| *value > 0 && value.to_string() == old)
+                        .is_none()
+                {
+                    return Err(SchedulerError::DispatchTransition);
+                }
+                tx.execute("INSERT INTO dispatch_receipt_conflicts(id,recovered_run,direct_run) VALUES(?1,?2,?3)", params![id,old,run])?;
+                tx.execute(
+                    "UPDATE dispatch_receipt_sources SET source='conflict' WHERE id=?1",
+                    [id],
+                )?;
+                let prior: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT run_id,state FROM stale_cancellations WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((prior_run, state)) = prior {
+                    if prior_run != old || !matches!(state.as_str(), "sending" | "accepted") {
+                        return Err(SchedulerError::Corrupt);
+                    }
+                    tx.execute("INSERT INTO dispatch_conflict_cancellations(id,run_id,state) VALUES(?1,?2,?3)", params![id,prior_run,state])?;
+                }
+                let bound: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM dispatch_batches WHERE id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                if bound {
+                    mark_ci_conflict(&tx, id)?;
+                } else {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO ci_observation_conflicts(id) VALUES(?1)",
+                        [id],
+                    )?;
+                }
+                tx.commit()?;
+                return Err(SchedulerError::DispatchReceiptConflict);
+            }
             _ => return Err(SchedulerError::DispatchTransition),
         }
         tx.execute("INSERT INTO dispatch_receipt_sources(id,source) VALUES(?1,'direct') ON CONFLICT(id) DO UPDATE SET source='direct'", [id])?;
@@ -796,6 +864,32 @@ impl Scheduler {
             )
             .optional()?)
     }
+    /// Both IDs remain historical candidates; conflict never frees capacity.
+    pub fn receipt_conflict(&self, id: &str) -> Result<Option<(u64, u64)>, SchedulerError> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT recovered_run,direct_run FROM dispatch_receipt_conflicts WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(old, new)| {
+            let parse = |s: String| {
+                s.parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0 && n.to_string() == s)
+                    .ok_or(SchedulerError::Corrupt)
+            };
+            let old = parse(old)?;
+            let new = parse(new)?;
+            if old == new {
+                return Err(SchedulerError::Corrupt);
+            }
+            Ok((old, new))
+        })
+        .transpose()
+    }
     /// Bind a provider-observed run. The caller must authenticate and verify
     /// the run identity against the frozen plan before recording it.
     pub fn observe_dispatch(&mut self, id: &str, run_id: u64) -> Result<(), SchedulerError> {
@@ -805,6 +899,14 @@ impl Scheduler {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflict {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
         let row: Option<(String, Option<String>)> = tx
             .query_row(
                 "SELECT state,run_id FROM dispatch_intents WHERE id=?1",
@@ -846,6 +948,32 @@ impl Scheduler {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_batches WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if bound {
+            return Err(SchedulerError::DispatchManaged);
+        }
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflict {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
+        let source: Option<String> = tx
+            .query_row(
+                "SELECT source FROM dispatch_receipt_sources WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if source.as_deref() != Some("direct") {
+            return Err(SchedulerError::DispatchTransition);
+        }
         let row: Option<(String, Option<String>)> = tx
             .query_row(
                 "SELECT state,run_id FROM dispatch_intents WHERE id=?1",
@@ -1739,6 +1867,9 @@ impl Scheduler {
     /// Read a stale run identity before contacting GitHub. State is checked
     /// again atomically when the cancellation attempt is claimed.
     pub fn stale_run(&self, id: &str) -> Result<StaleRun, SchedulerError> {
+        if self.receipt_conflict(id)?.is_some() {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
         let row: Option<(String,String,Option<String>,String)> = self.conn.query_row("SELECT d.plan,d.state,d.run_id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         stale_run_from_row(row)
     }
@@ -1749,6 +1880,14 @@ impl Scheduler {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conflicted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflicted {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
         let row: Option<(String,String,Option<String>,String)> = tx.query_row("SELECT d.plan,d.state,d.run_id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let stale = stale_run_from_row(row)?;
         let prior: Option<(String, String)> = tx
@@ -1782,12 +1921,109 @@ impl Scheduler {
         id: &str,
         run_id: u64,
     ) -> Result<(), SchedulerError> {
-        let updated = self.conn.execute("UPDATE stale_cancellations SET state='accepted' WHERE id=?1 AND run_id=?2 AND state='sending'", params![id,run_id.to_string()])?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute("UPDATE stale_cancellations SET state='accepted' WHERE id=?1 AND run_id=?2 AND state='sending'", params![id,run_id.to_string()])?;
         if updated != 1 {
             return Err(SchedulerError::DispatchTransition);
         }
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflict && tx.execute("UPDATE dispatch_conflict_cancellations SET state='accepted' WHERE id=?1 AND run_id=?2 AND state='sending'", params![id,run_id.to_string()])? != 1 { return Err(SchedulerError::DispatchReceiptConflict); }
+        tx.commit()?;
         Ok(())
     }
+    /// Both conflicting runs must be handled independently and retain capacity.
+    pub fn conflicting_stale_run(&self, id: &str, run_id: u64) -> Result<StaleRun, SchedulerError> {
+        conflicting_stale_from_conn(&self.conn, id, run_id)
+    }
+    pub fn claim_conflict_cancellation(
+        &mut self,
+        id: &str,
+        run_id: u64,
+    ) -> Result<CancellationClaim, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale = conflicting_stale_from_conn(&tx, id, run_id)?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT state FROM dispatch_conflict_cancellations WHERE id=?1 AND run_id=?2",
+                params![id, run_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let result = match prior.as_deref() {
+            Some("sending") => CancellationClaim::Uncertain,
+            Some("accepted") => CancellationClaim::AlreadyRequested,
+            Some(_) => return Err(SchedulerError::Corrupt),
+            None => {
+                tx.execute("INSERT INTO dispatch_conflict_cancellations(id,run_id,state) VALUES(?1,?2,'sending')", params![id,run_id.to_string()])?;
+                CancellationClaim::New(stale)
+            }
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+    pub fn record_conflict_cancellation(
+        &mut self,
+        id: &str,
+        run_id: u64,
+    ) -> Result<(), SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        conflicting_stale_from_conn(&tx, id, run_id)?;
+        if tx.execute("UPDATE dispatch_conflict_cancellations SET state='accepted' WHERE id=?1 AND run_id=?2 AND state='sending'", params![id,run_id.to_string()])? != 1 { return Err(SchedulerError::DispatchTransition); }
+        tx.commit()?;
+        Ok(())
+    }
+}
+fn conflicting_stale_from_conn(
+    conn: &Connection,
+    id: &str,
+    run_id: u64,
+) -> Result<StaleRun, SchedulerError> {
+    let conflict: Option<(String, String)> = conn
+        .query_row(
+            "SELECT recovered_run,direct_run FROM dispatch_receipt_conflicts WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (recovered, direct) = conflict.ok_or(SchedulerError::DispatchReceiptConflict)?;
+    let source: Option<String> = conn
+        .query_row(
+            "SELECT source FROM dispatch_receipt_sources WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if source.as_deref() != Some("conflict") {
+        return Err(SchedulerError::Corrupt);
+    }
+    let parse = |s: &str| {
+        s.parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0 && n.to_string() == s)
+            .ok_or(SchedulerError::Corrupt)
+    };
+    let recovered = parse(&recovered)?;
+    let direct = parse(&direct)?;
+    if recovered == direct || (run_id != recovered && run_id != direct) {
+        return Err(SchedulerError::DispatchReceiptConflict);
+    }
+    let row: Option<(String,String,Option<String>,String)> = conn.query_row("SELECT d.plan,d.state,d.run_id,b.body FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let mut stale = stale_run_from_row(row)?;
+    if stale.run_id != recovered {
+        return Err(SchedulerError::Corrupt);
+    }
+    stale.run_id = run_id;
+    Ok(stale)
 }
 fn stale_run_from_row(
     row: Option<(String, String, Option<String>, String)>,
@@ -2215,6 +2451,14 @@ impl Scheduler {
         ).optional()?;
         let (plan_body, state, saved_run, batch_body, source) =
             row.ok_or(SchedulerError::DispatchTransition)?;
+        let conflicted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflicted {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
         let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
         let batch: Batch = serde_json::from_str(&batch_body)?;
         if run_id == 0

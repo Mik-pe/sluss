@@ -205,7 +205,7 @@ fn finish_with_workflow(
     scheduler.complete_ci_only(id).unwrap();
     scheduler.complete_ci_only(id).unwrap(); // repeated recovery is idempotent
     if !retain_reservation {
-        scheduler.finish_dispatch(id, run_id).unwrap(); // local test assumes the runner is no longer consuming capacity
+        scheduler.release_completed_ci_only(id, run_id).unwrap(); // local test assumes the runner is no longer consuming capacity
     }
 }
 
@@ -1296,5 +1296,174 @@ fn missing_previously_observed_job_creates_a_durable_conflict() {
     assert!(matches!(
         scheduler.complete_ci_only(&root.id),
         Err(SchedulerError::CiConflict)
+    ));
+}
+
+#[test]
+fn late_direct_receipt_conflict_invalidates_batch_and_journals_each_cancellation() {
+    use sluss::{
+        batch::State,
+        scheduler::{CancellationClaim, SchedulerError},
+    };
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let batch = plan(&mut store, 1).unwrap();
+    let id = &batch.id;
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let dispatch = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    scheduler
+        .reserve_batch_dispatch(
+            id,
+            &Request {
+                pools: [("rust".into(), 1)].into(),
+            },
+            &dispatch,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduler
+            .claim_batch_dispatch(id, ".github/workflows/ci.yml")
+            .unwrap()
+    );
+    scheduler.observe_dispatch(id, 41).unwrap();
+    assert!(matches!(
+        scheduler.record_receipt(id, 42),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert_eq!(scheduler.receipt_conflict(id).unwrap(), Some((41, 42)));
+    assert!(matches!(
+        scheduler.claim_stale_cancellation(id),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 99),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 41),
+        Ok(CancellationClaim::New(_))
+    ));
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 41),
+        Ok(CancellationClaim::Uncertain)
+    ));
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 42),
+        Ok(CancellationClaim::New(_))
+    ));
+    scheduler.record_conflict_cancellation(id, 42).unwrap();
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 42),
+        Ok(CancellationClaim::AlreadyRequested)
+    ));
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE dispatch_receipt_sources SET source='direct' WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    assert!(matches!(
+        scheduler.release_invalidated_ci_only(id, 41),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+}
+
+#[test]
+fn cancellation_claim_survives_a_late_receipt_conflict_without_resending() {
+    use sluss::scheduler::{CancellationClaim, SchedulerError};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let batch = plan(&mut store, 1).unwrap();
+    let id = &batch.id;
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let dispatch = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    scheduler
+        .reserve_batch_dispatch(
+            id,
+            &Request {
+                pools: [("rust".into(), 1)].into(),
+            },
+            &dispatch,
+        )
+        .unwrap()
+        .unwrap();
+    scheduler
+        .claim_batch_dispatch(id, ".github/workflows/ci.yml")
+        .unwrap();
+    scheduler.observe_dispatch(id, 41).unwrap();
+    store.remove_candidate(batch.candidates[0].number).unwrap();
+    assert!(matches!(
+        scheduler.claim_stale_cancellation(id),
+        Ok(CancellationClaim::New(_))
+    ));
+    assert!(matches!(
+        scheduler.record_receipt(id, 42),
+        Err(SchedulerError::DispatchReceiptConflict)
+    ));
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 41),
+        Ok(CancellationClaim::Uncertain)
+    ));
+    scheduler.record_stale_cancellation(id, 41).unwrap();
+    assert!(matches!(
+        scheduler.claim_conflict_cancellation(id, 41),
+        Ok(CancellationClaim::AlreadyRequested)
+    ));
+    drop(scheduler);
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut restarted = Scheduler::open(
+        dir.path().join("queue.sqlite"),
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [7].into(),
+                    pools,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted.claim_conflict_cancellation(id, 41),
+        Ok(CancellationClaim::AlreadyRequested)
     ));
 }

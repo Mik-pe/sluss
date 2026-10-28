@@ -225,6 +225,24 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Show both IDs for conflicting direct and recovered receipts.
+    DispatchConflict {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
+    /// Cancel one identified conflicting run without releasing capacity.
+    CancelConflict {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Release a reservation only if its dispatch has not been claimed.
     CancelDispatch {
         #[arg(long)]
@@ -1266,6 +1284,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!(
                 "stale cancellation: {outcome:?}; capacity remains reserved until separately reconciled"
+            );
+        }
+        Command::DispatchConflict { batch_id, capacity } => {
+            let scheduler = sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            if let Some((recovered, direct)) = scheduler.receipt_conflict(&batch_id)? {
+                println!(
+                    "dispatch conflict for {batch_id}: recovered run {recovered}, direct receipt run {direct}"
+                );
+                if scheduler
+                    .pending_dispatches()?
+                    .iter()
+                    .any(|pending| pending.reservation.id == batch_id)
+                {
+                    println!("capacity remains reserved");
+                } else {
+                    println!(
+                        "no active reservation recorded; investigate legacy state before scheduling more work"
+                    );
+                }
+            } else {
+                println!("no recorded dispatch receipt conflict for {batch_id}");
+            }
+        }
+        Command::CancelConflict {
+            batch_id,
+            run_id,
+            config,
+            capacity,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            if store.repository_scope()?
+                != (
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+            {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id,
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let token = app
+                .dispatch_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let outcome = app
+                .cancel_conflicting_run(
+                    &mut scheduler,
+                    &token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &batch_id,
+                    run_id,
+                )
+                .await?;
+            println!(
+                "conflicting run {run_id} cancellation: {outcome:?}; capacity remains reserved"
             );
         }
         Command::CancelDispatch { batch_id, capacity } => {

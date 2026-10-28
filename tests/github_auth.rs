@@ -201,12 +201,12 @@ async fn dispatched_run(
         ".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef"
     };
     let sha = if mode == 22 && count >= 3 { "b" } else { "a" };
-    let status = if mode == 31 {
+    let status = if matches!(mode, 31 | 32) {
         "in_progress"
     } else {
         "completed"
     };
-    let conclusion = if mode == 31 {
+    let conclusion = if matches!(mode, 31 | 32) {
         None
     } else if matches!(mode, 40 | 95..=100 | 103) {
         Some("failure")
@@ -216,7 +216,7 @@ async fn dispatched_run(
         Some("success")
     };
     Json(
-        json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":workflow_path,"event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
+        json!({"id":if path.0.path().contains("/runs/124") {124} else {123},"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":workflow_path,"event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
 }
 async fn cancel_run(State(state): State<ServerState>, headers: HeaderMap) -> StatusCode {
@@ -523,12 +523,25 @@ async fn dispatch_post(
         json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "return_run_details":true, "inputs":{"sluss_host":"sluss-host-test","sluss_suites":suites}})
     );
     state.permissions.fetch_add(1, Ordering::SeqCst);
-    if state.mode.load(Ordering::SeqCst) == 17 {
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 123 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.mode.load(Ordering::SeqCst) == 123 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dispatch race must release sender");
+    }
+    if mode == 17 {
         (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
-    } else if state.mode.load(Ordering::SeqCst) == 39 {
+    } else if mode == 39 {
         (StatusCode::NO_CONTENT, Json(json!({})))
     } else {
-        (StatusCode::OK, Json(json!({"workflow_run_id":123})))
+        (
+            StatusCode::OK,
+            Json(json!({"workflow_run_id":if mode == 123 {124} else {123}})),
+        )
     }
 }
 async fn token(
@@ -1655,8 +1668,13 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             post(dispatch_post),
         )
         .route("/repos/owner/repo/actions/runs/123", get(dispatched_run))
+        .route("/repos/owner/repo/actions/runs/124", get(dispatched_run))
         .route(
             "/repos/owner/repo/actions/runs/123/cancel",
+            post(cancel_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/124/cancel",
             post(cancel_run),
         )
         .route(
@@ -2147,6 +2165,209 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         foreign_journal.get("foreign-land").unwrap().unwrap().1,
         sluss::landing::IntentState::Prepared
     );
+    // A recovered candidate can race with a later direct receipt. Preserve
+    // both identities, cancel each at most once, and keep the reservation.
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let conflict_db = data.path().join("dispatch-conflict.sqlite");
+    let mut conflict_inbox = Inbox::open(&conflict_db).unwrap();
+    let mut conflict_store = Store::open(&conflict_db).unwrap();
+    conflict_inbox
+        .record("conflict", "pull_request", &[99; 32], 42, 7)
+        .unwrap();
+    let event = conflict_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut conflict_store,
+        &event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    conflict_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    conflict_store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    conflict_store.start_integration(id).unwrap();
+    conflict_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    let mut conflict_scheduler =
+        sluss::scheduler::Scheduler::open(&conflict_db, one_host.clone()).unwrap();
+    mode.store(123, Ordering::SeqCst);
+    posts.store(0, Ordering::SeqCst);
+    let (sent, recovered) = tokio::join!(
+        sluss::dispatch::batch(
+            &conflict_db,
+            &fixture_app,
+            &fixture_policy,
+            &one_host,
+            &settings,
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while posts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = fixture_app
+                .recover_uncertain_dispatch(
+                    &mut conflict_scheduler,
+                    &fixture_token,
+                    "owner",
+                    "repo",
+                    id,
+                    123,
+                )
+                .await;
+            mode.store(0, Ordering::SeqCst);
+            result
+        }
+    );
+    assert!(recovered.is_ok(), "{recovered:?}");
+    assert!(matches!(
+        sent,
+        Err(sluss::dispatch::Error::Dispatch(
+            sluss::github::DispatchError::Scheduler(
+                sluss::scheduler::SchedulerError::DispatchReceiptConflict
+            )
+        ))
+    ));
+    let report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&conflict_db)
+        .args(["dispatch-conflict", "--batch-id", id, "--capacity"])
+        .arg(&capacity)
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    assert!(
+        String::from_utf8_lossy(&report.stdout)
+            .contains("recovered run 123, direct receipt run 124")
+    );
+    let write_token = fixture_app.dispatch_token(42, 7).await.unwrap();
+    posts.store(0, Ordering::SeqCst);
+    assert!(
+        fixture_app
+            .cancel_conflicting_run(
+                &mut conflict_scheduler,
+                &write_token,
+                "owner",
+                "repo",
+                id,
+                125
+            )
+            .await
+            .is_err()
+    );
+    mode.store(23, Ordering::SeqCst);
+    assert!(matches!(
+        fixture_app
+            .cancel_conflicting_run(
+                &mut conflict_scheduler,
+                &write_token,
+                "owner",
+                "repo",
+                id,
+                123
+            )
+            .await,
+        Err(sluss::github::DispatchError::RunMismatch)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    mode.store(31, Ordering::SeqCst);
+    let mut competitor = sluss::scheduler::Scheduler::open(&conflict_db, one_host.clone()).unwrap();
+    let (first_cancel, second_cancel) = tokio::join!(
+        fixture_app.cancel_conflicting_run(
+            &mut conflict_scheduler,
+            &write_token,
+            "owner",
+            "repo",
+            id,
+            123
+        ),
+        fixture_app.cancel_conflicting_run(&mut competitor, &write_token, "owner", "repo", id, 123),
+    );
+    assert_eq!(
+        [&first_cancel, &second_cancel]
+            .iter()
+            .filter(|r| matches!(r, Ok(sluss::github::StaleCancellation::Requested)))
+            .count(),
+        1
+    );
+    assert!([first_cancel, second_cancel].iter().all(|r| matches!(
+        r,
+        Ok(sluss::github::StaleCancellation::Requested
+            | sluss::github::StaleCancellation::AlreadyRequested
+            | sluss::github::StaleCancellation::Uncertain)
+    )));
+    assert!(matches!(
+        fixture_app
+            .cancel_conflicting_run(
+                &mut conflict_scheduler,
+                &write_token,
+                "owner",
+                "repo",
+                id,
+                123
+            )
+            .await,
+        Ok(sluss::github::StaleCancellation::AlreadyRequested)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    mode.store(32, Ordering::SeqCst);
+    let db_arg = conflict_db.clone();
+    let config_arg = config.clone();
+    let capacity_arg = capacity.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let cancel_cli = move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db_arg)
+            .args([
+                "cancel-conflict",
+                "--batch-id",
+                id,
+                "--run-id",
+                "124",
+                "--config",
+            ])
+            .arg(&config_arg)
+            .arg("--capacity")
+            .arg(&capacity_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", &key_arg)
+            .output()
+            .unwrap()
+    };
+    let output = tokio::task::spawn_blocking(cancel_cli).await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Uncertain"));
+    drop(conflict_scheduler);
+    let mut restarted = sluss::scheduler::Scheduler::open(&conflict_db, one_host.clone()).unwrap();
+    assert!(matches!(
+        fixture_app
+            .cancel_conflicting_run(&mut restarted, &write_token, "owner", "repo", id, 124)
+            .await,
+        Ok(sluss::github::StaleCancellation::Uncertain)
+    ));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "ambiguous cancellation must not be resent"
+    );
+    assert!(restarted.release_invalidated_ci_only(id, 123).is_err());
+    assert_eq!(restarted.pending_dispatches().unwrap().len(), 1);
     posts.store(0, Ordering::SeqCst);
     let check_token = fixture_app.failed_check_token(42, 7).await.unwrap();
     for check_mode in [40, 95, 96, 97, 98, 99, 103] {

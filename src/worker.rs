@@ -137,6 +137,33 @@ pub async fn supervise_stale_cancellation(
                     Ok(token) => {
                         let mut result = Ok(());
                         for id in ids {
+                            match scheduler.receipt_conflict(&id) {
+                                Ok(Some((recovered, direct))) => {
+                                    for run_id in [recovered, direct] {
+                                        match app
+                                            .cancel_conflicting_run(
+                                                &mut scheduler,
+                                                &token,
+                                                &policy.owner,
+                                                &policy.name,
+                                                &id,
+                                                run_id,
+                                            )
+                                            .await
+                                        {
+                                            Ok(crate::github::StaleCancellation::Uncertain)
+                                            | Err(_) => result = Err(()),
+                                            _ => {}
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(_) => {
+                                    result = Err(());
+                                    continue;
+                                }
+                            }
                             match app
                                 .cancel_stale_run(
                                     &mut scheduler,

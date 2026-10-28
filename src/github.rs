@@ -2671,11 +2671,41 @@ impl App {
         repository: &str,
         id: &str,
     ) -> Result<StaleCancellation, DispatchError> {
+        self.cancel_stale_run_inner(scheduler, token, owner, repository, id, None)
+            .await
+    }
+    /// Request cancellation for either recorded run in a dispatch conflict.
+    /// This never releases capacity and never retries an uncertain request.
+    pub async fn cancel_conflicting_run(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        run_id: u64,
+    ) -> Result<StaleCancellation, DispatchError> {
+        self.cancel_stale_run_inner(scheduler, token, owner, repository, id, Some(run_id))
+            .await
+    }
+    async fn cancel_stale_run_inner(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        conflicting_run: Option<u64>,
+    ) -> Result<StaleCancellation, DispatchError> {
         use crate::scheduler::CancellationClaim;
         if !token.actions_write || !valid_name(owner) || !valid_name(repository) {
             return Err(DispatchError::Invalid);
         }
-        let stale = scheduler.stale_run(id)?;
+        let stale = if let Some(run_id) = conflicting_run {
+            scheduler.conflicting_stale_run(id, run_id)?
+        } else {
+            scheduler.stale_run(id)?
+        };
         if stale.plan.installation_id != token.installation_id
             || stale.plan.repository_id != token.repository_id
         {
@@ -2712,7 +2742,12 @@ impl App {
         ) {
             return Ok(StaleCancellation::Uncertain);
         }
-        match scheduler.claim_stale_cancellation(id)? {
+        let claim = if let Some(run_id) = conflicting_run {
+            scheduler.claim_conflict_cancellation(id, run_id)?
+        } else {
+            scheduler.claim_stale_cancellation(id)?
+        };
+        match claim {
             CancellationClaim::AlreadyRequested => return Ok(StaleCancellation::AlreadyRequested),
             CancellationClaim::Uncertain => return Ok(StaleCancellation::Uncertain),
             CancellationClaim::New(claimed) if claimed == stale => {}
@@ -2732,7 +2767,11 @@ impl App {
             .await;
         match response {
             Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
-                scheduler.record_stale_cancellation(id, stale.run_id)?;
+                if conflicting_run.is_some() {
+                    scheduler.record_conflict_cancellation(id, stale.run_id)?;
+                } else {
+                    scheduler.record_stale_cancellation(id, stale.run_id)?;
+                }
                 Ok(StaleCancellation::Requested)
             }
             _ => Ok(StaleCancellation::Uncertain),
