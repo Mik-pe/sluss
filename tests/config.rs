@@ -112,6 +112,31 @@ fn lane_worker_rejects_incomplete_or_unsupported_configuration_before_startup() 
 }
 
 #[test]
+fn lane_doctor_validates_suite_coverage_before_accessing_credentials_or_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("sluss.toml");
+    let db = dir.path().join("queue.sqlite");
+    std::fs::write(&config, VALID).unwrap();
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["doctor", "--ci-only", "--config"])
+        .arg(&config)
+        .arg("--capacity")
+        .arg(examples.join("capacity.toml"))
+        .arg("--lane-policy")
+        .arg(examples.join("lane-policy.toml"))
+        .args(["--policy-file", ".github/workflows/ci.yml"])
+        .env_remove("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lane policy does not cover"));
+    assert!(!db.exists());
+}
+
+#[test]
 fn adaptive_batching_requires_single_active_batch_and_ci_completion_worker() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("adaptive.toml");

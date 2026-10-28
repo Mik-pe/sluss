@@ -554,20 +554,23 @@ enum Command {
     Resume,
     /// Inspect GitHub prerequisites without enabling landing.
     Doctor {
-        #[arg(long, requires_all = ["capacity", "workflow_id"])]
+        #[arg(long, requires = "capacity")]
         config: Option<PathBuf>,
-        #[arg(long, requires_all = ["config", "workflow_id"])]
+        #[arg(long, requires = "config")]
         capacity: Option<PathBuf>,
-        #[arg(long, requires_all = ["config", "capacity"])]
+        #[arg(long, requires_all = ["config", "capacity"], conflicts_with = "lane_policy")]
         workflow_id: Option<u64>,
         /// Inspect CI-only prerequisites without claiming merge readiness.
-        #[arg(long, requires_all = ["config", "capacity", "workflow_id"])]
+        #[arg(long, requires_all = ["config", "capacity"])]
         ci_only: bool,
+        /// Inspect every workflow and pool in an operator-owned lane policy.
+        #[arg(long, requires = "ci_only", conflicts_with_all = ["workflow_id", "pool", "required_job"])]
+        lane_policy: Option<PathBuf>,
         /// CI-only resource request, in name=count form.
-        #[arg(long, requires = "ci_only")]
+        #[arg(long, requires = "ci_only", conflicts_with = "lane_policy")]
         pool: Vec<String>,
         /// Expected CI job name; may be repeated.
-        #[arg(long, requires = "ci_only")]
+        #[arg(long, requires = "ci_only", conflicts_with = "lane_policy")]
         required_job: Vec<String>,
         /// Operator-reviewed policy file path; may be repeated.
         #[arg(long, requires = "ci_only")]
@@ -1132,27 +1135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
-            let (suites, digest) = if let Some(path) = &verification_policy {
-                let policy = sluss::selective::Policy::load(path)?;
-                (
-                    policy.full_suites.into_iter().collect(),
-                    Some("0".repeat(64)),
-                )
-            } else {
-                (std::collections::BTreeSet::from(["full".into()]), None)
-            };
-            let template = sluss::scheduler::DispatchPlan {
-                installation_id: 1,
-                repository_id: 1,
-                workflow_id: 0,
-                integration_sha: "0".repeat(40),
-                staging_ref: "refs/heads/sluss/batch-0000000000000000".into(),
-                policy_digest: "0".repeat(64),
-                required_jobs: Default::default(),
-                suites: suites.clone(),
-                selection_policy_digest: digest,
-            };
-            sluss::lanes::Policy::load(&path)?.plan(template, &suites, capacity)?;
+            preflight_lane_policy(&path, verification_policy.as_deref(), capacity)?;
             Some(sluss::dispatch::LaneSettings {
                 policy: path,
                 verification_policy: verification_policy.clone(),
@@ -1409,6 +1392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         capacity,
         workflow_id,
         ci_only,
+        lane_policy,
         pool,
         required_job,
         policy_file,
@@ -1420,6 +1404,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sluss::config::Config::load(config.as_ref().ok_or("configuration is required")?)?;
             let capacity = load_capacity(capacity.as_ref().ok_or("capacity is required")?)?;
             sluss::scheduler::validate_capacity(&capacity)?;
+            if let Some(lane_policy) = lane_policy {
+                return doctor_lanes(
+                    &config,
+                    &capacity,
+                    lane_policy,
+                    verification_policy.as_deref(),
+                    policy_file,
+                    &new_cli_app,
+                )
+                .await;
+            }
             let workflow_id = workflow_id.ok_or("workflow ID is required")?;
             let settings = build_dispatch_settings(
                 &capacity,
@@ -3316,6 +3311,146 @@ fn format_unix_ms(value: i64) -> Result<String, Box<dyn std::error::Error>> {
             .format(&time::format_description::well_known::Rfc3339)?,
     )
 }
+async fn doctor_lanes(
+    config: &sluss::config::Config,
+    capacity: &sluss::scheduler::Capacity,
+    path: &std::path::Path,
+    verification: Option<&std::path::Path>,
+    policy_files: &[String],
+    new_app: &impl Fn(String, &[u8], &str) -> Result<sluss::github::App, sluss::github::GitHubError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sluss::verification::check_release_topology(capacity)?;
+    let policy = preflight_lane_policy(path, verification, capacity)?;
+    let paths: std::collections::BTreeSet<_> = policy_files.iter().collect();
+    if paths.is_empty()
+        || paths.len() != policy_files.len()
+        || paths.len() > 128
+        || paths
+            .iter()
+            .any(|path| !sluss::integration::valid_policy_path(path))
+    {
+        return Err("invalid or duplicate CI policy paths".into());
+    }
+    let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+        .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+    let app = new_app(
+        config.github.app_client_id.clone(),
+        &std::fs::read(key_path)?,
+        &config.github.api,
+    )?;
+    let identity = app.observe_app_identity().await?;
+    let installation = config.github.installation_id as u64;
+    let repository = config.github.repository_id as u64;
+    let read = app.read_token(installation, repository).await?;
+    let inventory = app.runner_inventory_token(installation, repository).await?;
+    let runners = app
+        .observe_repository_runners(&inventory, &config.github.owner, &config.github.repository)
+        .await?;
+    let available = sluss::verification::available_repository_hosts(capacity, &runners)?;
+    let mut workflows = std::collections::BTreeMap::new();
+    let mut observed_branch: Option<(String, String, String, String)> = None;
+    for (name, lane) in &policy.lanes {
+        if let std::collections::btree_map::Entry::Vacant(entry) = workflows.entry(lane.workflow_id)
+        {
+            let result = app
+                .inspect_ci_repository(
+                    &read,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &config.queue.target,
+                    lane.workflow_id,
+                )
+                .await?;
+            let identity = (
+                result.branch.name.clone(),
+                result.branch.commit.sha.clone(),
+                result.default_workflow.branch.clone(),
+                result.default_workflow.commit_sha.clone(),
+            );
+            if observed_branch
+                .as_ref()
+                .is_some_and(|previous| previous != &identity)
+            {
+                return Err("target or default branch changed during lane diagnostics".into());
+            }
+            observed_branch = Some(identity);
+            if !paths.contains(&result.workflow.path) {
+                return Err("workflow path must be included in --policy-file".into());
+            }
+            entry.insert(result.workflow.path);
+        }
+        let eligible = available
+            .iter()
+            .filter(|host| {
+                lane.request.pools.iter().all(|(pool, count)| {
+                    capacity.hosts[*host]
+                        .pools
+                        .get(pool)
+                        .is_some_and(|limit| count <= limit)
+                })
+            })
+            .count();
+        if eligible == 0 {
+            return Err(format!("no idle configured host satisfies lane {name}").into());
+        }
+        println!(
+            "lane {name}: workflow {} ({}), {eligible} eligible idle host(s)",
+            lane.workflow_id, workflows[&lane.workflow_id]
+        );
+    }
+    let branch = observed_branch.ok_or("lane policy has no workflows")?;
+    let _staging = app.staging_token(installation, repository).await?;
+    let _dispatch = app.dispatch_token(installation, repository).await?;
+    println!(
+        "CI-only provider checks: App {} (ID {}), {}/{} (ID {}), target {} at {}",
+        identity.slug,
+        identity.id,
+        config.github.owner,
+        config.github.repository,
+        repository,
+        branch.0,
+        branch.1
+    );
+    println!("read, staging and Actions tokens issued for the configured repository");
+    eprintln!(
+        "CI-only diagnostic: no merge authorization; workflow trust, runner isolation, branch permissions and live execution are not established. Host availability is sampled separately for each lane."
+    );
+    if !app.supports_github_git() {
+        return Err("Git staging is unsupported for this API origin".into());
+    }
+    Ok(())
+}
+
+fn preflight_lane_policy(
+    path: &std::path::Path,
+    verification: Option<&std::path::Path>,
+    capacity: &sluss::scheduler::Capacity,
+) -> Result<sluss::lanes::Policy, Box<dyn std::error::Error>> {
+    let (suites, digest) = if let Some(path) = verification {
+        let policy = sluss::selective::Policy::load(path)?;
+        (
+            policy.full_suites.into_iter().collect(),
+            Some("0".repeat(64)),
+        )
+    } else {
+        (std::collections::BTreeSet::from(["full".into()]), None)
+    };
+    let template = sluss::scheduler::DispatchPlan {
+        installation_id: 1,
+        repository_id: 1,
+        workflow_id: 0,
+        integration_sha: "0".repeat(40),
+        staging_ref: "refs/heads/sluss/batch-0000000000000000".into(),
+        policy_digest: "0".repeat(64),
+        required_jobs: Default::default(),
+        suites: suites.clone(),
+        selection_policy_digest: digest,
+    };
+    let policy = sluss::lanes::Policy::load(path)?;
+    policy.plan(template, &suites, capacity)?;
+    Ok(policy)
+}
+
 fn build_dispatch_settings(
     capacity: &sluss::scheduler::Capacity,
     workflow_id: u64,

@@ -8192,11 +8192,67 @@ async fn cli_dispatches_fixture() {
     assert!(ci_error.contains("no merge authorization"));
     assert!(ci_error.contains("Git staging is unsupported for this API origin"));
     assert!(!ci_output.contains("fake-installation-token"));
+    let lanes = data.path().join("doctor-lanes.toml");
+    std::fs::write(&lanes, "version=1\n[lanes.full]\nworkflow_id=17\nsuites=['full']\nrequired_jobs=['job-1-0']\n[lanes.full.request.pools]\nrust=1\n").unwrap();
+    let lane_args = || {
+        vec![
+            "doctor".into(),
+            "--ci-only".into(),
+            "--config".into(),
+            config.to_str().unwrap().into(),
+            "--capacity".into(),
+            capacity.to_str().unwrap().into(),
+            "--lane-policy".into(),
+            lanes.to_str().unwrap().into(),
+            "--policy-file".into(),
+            ".github/workflows/ci.yml".into(),
+        ]
+    };
+    let lane_doctor = launch(lane_args()).await.unwrap();
+    assert!(!lane_doctor.status.success());
+    let lane_output = String::from_utf8_lossy(&lane_doctor.stdout);
+    assert!(lane_output.contains("lane full: workflow 17"));
+    assert!(lane_output.contains("1 eligible idle host"));
+    assert!(
+        String::from_utf8_lossy(&lane_doctor.stderr)
+            .contains("Git staging is unsupported for this API origin")
+    );
     mode.store(41, Ordering::SeqCst);
+    let lane_busy = launch(lane_args()).await.unwrap();
+    assert!(!lane_busy.status.success());
+    assert!(
+        String::from_utf8_lossy(&lane_busy.stderr)
+            .contains("no idle configured host satisfies lane full")
+    );
     let busy = launch(ci_args()).await.unwrap();
     assert!(!busy.status.success());
     assert!(String::from_utf8_lossy(&busy.stderr).contains("no idle configured host"));
     mode.store(0, Ordering::SeqCst);
+    let mut wrong_lane_policy_file = lane_args();
+    *wrong_lane_policy_file.last_mut().unwrap() = ".github/workflows/other.yml".into();
+    let wrong_lane_policy_file = launch(wrong_lane_policy_file).await.unwrap();
+    assert!(!wrong_lane_policy_file.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_lane_policy_file.stderr)
+            .contains("workflow path must be included")
+    );
+    std::fs::write(&lanes, "version=1\n[lanes.first]\nworkflow_id=17\nsuites=['one']\nrequired_jobs=['job-1-0']\n[lanes.first.request.pools]\nrust=1\n[lanes.second]\nworkflow_id=17\nsuites=['two']\nrequired_jobs=['job-1-0']\n[lanes.second.request.pools]\nrust=1\n").unwrap();
+    let verification = data.path().join("doctor-verification.toml");
+    std::fs::write(&verification, "version=1\nfull_suites=['one','two']\n[[components]]\nname='all'\npaths=['src/']\nsuites=['one','two']\n").unwrap();
+    let mut two_lane_args = lane_args();
+    two_lane_args.extend([
+        "--verification-policy".into(),
+        verification.to_str().unwrap().into(),
+    ]);
+    let two_lanes = launch(two_lane_args).await.unwrap();
+    let output = String::from_utf8_lossy(&two_lanes.stdout);
+    assert!(
+        output.contains("lane first: workflow 17") && output.contains("lane second: workflow 17")
+    );
+    assert!(
+        String::from_utf8_lossy(&two_lanes.stderr)
+            .contains("Host availability is sampled separately")
+    );
     let mut wrong_policy = ci_args();
     *wrong_policy.last_mut().unwrap() = ".github/workflows/other.yml".into();
     let wrong_policy = launch(wrong_policy).await.unwrap();
