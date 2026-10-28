@@ -1907,6 +1907,126 @@ impl App {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum MarkerCreationError {
+    #[error("marker credentials or repository scope do not match the frozen intent")]
+    Scope,
+    #[error("marker creation may have succeeded; do not retry")]
+    Uncertain,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Journal(#[from] crate::landing::LandingError),
+}
+
+impl App {
+    /// Create only the frozen marker ref, once. A crash or an ambiguous
+    /// response remains uncertain; matching readback does not prove origin.
+    /// This does not publish CI success or send a landing mutation.
+    pub async fn create_landing_marker(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        read: &InstallationToken,
+        write: &InstallationToken,
+        repository: &crate::reconcile::RepositoryPolicy,
+        trusted: &crate::landing::TrustedCiPolicy,
+        operation_id: &str,
+    ) -> Result<crate::landing::MarkerCreationState, MarkerCreationError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        if !valid_name(&repository.owner)
+            || !valid_name(&repository.name)
+            || !read.checks_read
+            || !write.contents_write
+            || read.repository_id != write.repository_id
+            || read.installation_id != write.installation_id
+            || read.app_client_id != self.client_id
+            || write.app_client_id != self.client_id
+            || read.api_origin != self.api.as_str()
+            || write.api_origin != self.api.as_str()
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        let target = journal.refresh_target(operation_id, trusted)?;
+        let plan = &target.plan;
+        if i64::try_from(read.repository_id).ok() != Some(plan.repository_id)
+            || i64::try_from(read.installation_id).ok() != Some(plan.installation_id)
+            || repository.repository != plan.repository_id
+            || repository.installation != plan.installation_id
+            || plan.target_ref != format!("refs/heads/{}", repository.target_branch)
+            || crate::reconcile::policy_digest(self, repository)
+                .ok()
+                .as_deref()
+                != Some(target.repository_policy_digest.as_str())
+            || plan.marker_ref.is_none()
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        let root = format!("repos/{}/{}", repository.owner, repository.name);
+        let first: Identity = self.get_json(read, &root, None).await?;
+        let last: Identity = self.get_json(read, &root, None).await?;
+        if first != last
+            || first.id != read.repository_id
+            || first.node_id != plan.repository_node_id
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        match journal.claim_marker_creation(&target, trusted)? {
+            crate::landing::MarkerCreationState::Creating => {
+                return Err(MarkerCreationError::Uncertain);
+            }
+            crate::landing::MarkerCreationState::Created => {
+                return Ok(crate::landing::MarkerCreationState::Created);
+            }
+            crate::landing::MarkerCreationState::Prepared => {}
+        }
+        let url = self
+            .api
+            .join(&format!("{root}/git/refs"))
+            .map_err(|_| MarkerCreationError::Scope)?;
+        let body = serde_json::json!({"ref":plan.marker_ref,"sha":plan.base_sha});
+        let mut response = self
+            .client
+            .post(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(write.secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| MarkerCreationError::Uncertain)?;
+        if response.status() != reqwest::StatusCode::CREATED {
+            return Err(MarkerCreationError::Uncertain);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| MarkerCreationError::Uncertain)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 65536 {
+                return Err(MarkerCreationError::Uncertain);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let observed: DispatchRef =
+            serde_json::from_slice(&bytes).map_err(|_| MarkerCreationError::Uncertain)?;
+        if Some(observed.reference.as_str()) != plan.marker_ref.as_deref()
+            || observed.object.kind != "commit"
+            || observed.object.sha != plan.base_sha
+        {
+            return Err(MarkerCreationError::Uncertain);
+        }
+        journal
+            .record_marker_created(plan)
+            .map_err(|_| MarkerCreationError::Uncertain)?;
+        Ok(crate::landing::MarkerCreationState::Created)
+    }
+}
+
 /// GitHub's current review status, not a complete mergeability or CODEOWNERS proof.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -2219,6 +2219,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         )
         .route("/repos/owner/repo/rulesets/10", get(doctor_ruleset))
         .route(
+            "/repos/owner/repo/git/refs",
+            post(create_landing_marker_stub),
+        )
+        .route(
             "/repos/owner/repo/git/ref/heads/sluss/receipts/123456789abcdef0123456789abcdef0",
             get(landing_marker_preflight),
         )
@@ -5734,6 +5738,20 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let frozen_landing = landing
         .prepare_trusted_batch_with_marker("123456789abcdef0123456789abcdef0", id, &selected_trust)
         .unwrap();
+    let marker_token = observer_app.staging_token(42, 7).await.unwrap();
+    Box::pin(exercise_marker_creation(
+        &observer_app,
+        &mut landing,
+        &db,
+        &data,
+        &fixture_token,
+        &marker_token,
+        &security_token,
+        &observer_policy,
+        &selected_trust,
+        &mode,
+    ))
+    .await;
     let mut wider_trust = selected_trust.clone();
     wider_trust.runner_ids.insert(2);
     assert!(matches!(
@@ -7227,7 +7245,13 @@ async fn uncertain_landing_observes_marker_without_resolving_or_unlocking() {
         branch_security_digest: None,
     };
     journal.prepare(&plan).unwrap();
-    journal.claim(id).unwrap().unwrap();
+    // Model an already-claimed provider write; this test only observes it.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE landing_intents_v1 SET state='sending' WHERE id=?1",
+        [id],
+    )
+    .unwrap();
     for (current, expected) in [(120, "b"), (121, "a")] {
         mode.store(current, Ordering::SeqCst);
         marker_reads.store(0, Ordering::SeqCst);
@@ -7241,7 +7265,10 @@ async fn uncertain_landing_observes_marker_without_resolving_or_unlocking() {
             Some(observation)
         );
         assert_eq!(journal.get(id).unwrap().unwrap().1, IntentState::Sending);
-        assert!(journal.claim(id).unwrap().is_none());
+        assert!(matches!(
+            journal.claim(id),
+            Err(sluss::landing::LandingError::BatchBound)
+        ));
     }
     for current in [122, 123, 124, 125] {
         mode.store(current, Ordering::SeqCst);
@@ -7304,4 +7331,152 @@ async fn landing_marker_preflight(
             json!({"ref":reference,"object":{"sha":sha.repeat(40),"type":if mode == 204 {"tree"} else {"commit"}}}),
         ),
     )
+}
+
+static MARKER_POSTS: AtomicUsize = AtomicUsize::new(0);
+
+async fn create_landing_marker_stub(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(
+        body["ref"],
+        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+    );
+    assert_eq!(body["sha"], "b".repeat(40));
+    MARKER_POSTS.fetch_add(1, Ordering::SeqCst);
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 209 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if mode == 206 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message":"uncertain"})),
+        );
+    }
+    let sha = if mode == 207 { "a" } else { "b" };
+    let name = if mode == 208 {
+        "refs/heads/sluss/receipts/other"
+    } else {
+        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+    };
+    (
+        StatusCode::CREATED,
+        Json(json!({"ref":name,"object":{"sha":sha.repeat(40),"type":"commit"}})),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exercise_marker_creation(
+    app: &App,
+    journal: &mut sluss::landing::LandingJournal,
+    db: &std::path::Path,
+    data: &tempfile::TempDir,
+    read: &sluss::github::InstallationToken,
+    write: &sluss::github::InstallationToken,
+    security: &sluss::github::InstallationToken,
+    repository: &sluss::reconcile::RepositoryPolicy,
+    trust: &sluss::landing::TrustedCiPolicy,
+    mode: &AtomicU8,
+) {
+    use sluss::landing::{IntentState, MarkerCreationState};
+    let id = "123456789abcdef0123456789abcdef0";
+    mode.store(0, Ordering::SeqCst);
+    MARKER_POSTS.store(0, Ordering::SeqCst);
+    assert_eq!(
+        journal.marker_creation_state(id).unwrap(),
+        MarkerCreationState::Prepared
+    );
+    assert!(
+        app.refresh_and_claim_observed_landing(journal, read, security, repository, trust, id)
+            .await
+            .is_err()
+    );
+    assert_eq!(journal.get(id).unwrap().unwrap().1, IntentState::Prepared);
+    assert!(
+        app.create_landing_marker(journal, read, read, repository, trust, id)
+            .await
+            .is_err()
+    );
+    assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), 0);
+    let conn = rusqlite::Connection::open(db).unwrap();
+    for invalid in [206, 207, 208] {
+        let copy = data.path().join(format!("marker-{invalid}.sqlite"));
+        conn.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+            .unwrap();
+        let mut uncertain = sluss::landing::LandingJournal::open(&copy).unwrap();
+        mode.store(invalid, Ordering::SeqCst);
+        let before = MARKER_POSTS.load(Ordering::SeqCst);
+        assert!(
+            app.create_landing_marker(&mut uncertain, read, write, repository, trust, id)
+                .await
+                .is_err()
+        );
+        assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+        drop(uncertain);
+        let mut uncertain = sluss::landing::LandingJournal::open(&copy).unwrap();
+        assert_eq!(
+            uncertain.marker_creation_state(id).unwrap(),
+            MarkerCreationState::Creating
+        );
+        mode.store(0, Ordering::SeqCst);
+        assert!(
+            app.create_landing_marker(&mut uncertain, read, write, repository, trust, id)
+                .await
+                .is_err()
+        );
+        assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+        assert!(
+            app.refresh_and_claim_observed_landing(
+                &mut uncertain,
+                read,
+                security,
+                repository,
+                trust,
+                id
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(uncertain.get(id).unwrap().unwrap().1, IntentState::Prepared);
+    }
+    let concurrent = data.path().join("marker-concurrent.sqlite");
+    conn.execute("VACUUM INTO ?1", [concurrent.to_str().unwrap()])
+        .unwrap();
+    let mut first = sluss::landing::LandingJournal::open(&concurrent).unwrap();
+    let mut second = sluss::landing::LandingJournal::open(&concurrent).unwrap();
+    mode.store(209, Ordering::SeqCst);
+    let before = MARKER_POSTS.load(Ordering::SeqCst);
+    let (one, two) = tokio::join!(
+        app.create_landing_marker(&mut first, read, write, repository, trust, id),
+        app.create_landing_marker(&mut second, read, write, repository, trust, id),
+    );
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+    assert_eq!(
+        first.marker_creation_state(id).unwrap(),
+        MarkerCreationState::Created
+    );
+    mode.store(0, Ordering::SeqCst);
+    let before = MARKER_POSTS.load(Ordering::SeqCst);
+    assert_eq!(
+        app.create_landing_marker(journal, read, write, repository, trust, id)
+            .await
+            .unwrap(),
+        MarkerCreationState::Created
+    );
+    assert_eq!(
+        journal.marker_creation_state(id).unwrap(),
+        MarkerCreationState::Created
+    );
+    assert_eq!(
+        app.create_landing_marker(journal, read, write, repository, trust, id)
+            .await
+            .unwrap(),
+        MarkerCreationState::Created
+    );
+    assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
 }

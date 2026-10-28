@@ -52,6 +52,13 @@ pub enum IntentState {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerCreationState {
+    Prepared,
+    Creating,
+    Created,
+}
+
 #[derive(Debug, Error)]
 pub enum LandingError {
     #[error(transparent)]
@@ -68,6 +75,8 @@ pub enum LandingError {
     TargetBusy,
     #[error("invalid landing intent transition")]
     Transition,
+    #[error("marker creation is not directly confirmed or its journal is inconsistent")]
+    MarkerUnconfirmed,
     #[error("provider response is ambiguous; keep the intent unresolved")]
     Uncertain,
     #[error("stored landing intent is corrupt")]
@@ -841,7 +850,8 @@ impl LandingJournal {
         CREATE TABLE IF NOT EXISTS pending_ci_check_conflicts_v1 (batch_id TEXT PRIMARY KEY NOT NULL, other_check_id TEXT NOT NULL, other_suite_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS pending_ci_cancellations_v1 (batch_id TEXT PRIMARY KEY NOT NULL, check_id TEXT NOT NULL, suite_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','cancelled')), direct INTEGER NOT NULL DEFAULT 0 CHECK(direct IN (0,1)), recovered INTEGER NOT NULL DEFAULT 0 CHECK(recovered IN (0,1)));
         CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
-        CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);",
+        CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS landing_marker_creation_v1 (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','creating','created')));",
         )?;
         Ok(Self { conn })
     }
@@ -988,6 +998,9 @@ impl LandingJournal {
             return Err(LandingError::TrustPolicy);
         }
         let (plan, state) = decode_row(id, row)?;
+        if plan.marker_ref.is_some() {
+            return Err(LandingError::BatchBound);
+        }
         if plan.trusted_ci_policy_digest.is_some() {
             return Err(LandingError::TrustPolicy);
         }
@@ -1109,6 +1122,12 @@ impl LandingJournal {
                 "INSERT INTO landing_batch_bindings_v1(id) VALUES(?1)",
                 [operation_id],
             )?;
+            if plan.marker_ref.is_some() {
+                tx.execute(
+                    "INSERT INTO landing_marker_creation_v1(id,plan,state) VALUES(?1,?2,'prepared')",
+                    params![operation_id, body],
+                )?;
+            }
             if let Some(policy) = policy {
                 tx.execute(
                     "INSERT INTO landing_trust_bindings_v1(id,body,digest) VALUES(?1,?2,?3)",
@@ -1176,6 +1195,11 @@ impl LandingJournal {
         if let Some(policy) = policy {
             verify_trusted_policy(&tx, &plan, policy)?;
         }
+        if plan.marker_ref.is_some()
+            && marker_creation_state(&tx, &plan)? != MarkerCreationState::Created
+        {
+            return Err(LandingError::MarkerUnconfirmed);
+        }
         if let Some(revision) = revision
             && delivery_revision(&tx)? != revision
         {
@@ -1203,6 +1227,80 @@ impl LandingJournal {
         }
         tx.commit()?;
         Ok(Some(plan))
+    }
+
+    /// Inspect a marker send without creating or changing journal state.
+    pub fn marker_creation_state(&self, id: &str) -> Result<MarkerCreationState, LandingError> {
+        let (plan, _) = self.get(id)?.ok_or(LandingError::Transition)?;
+        marker_creation_state(&self.conn, &plan)
+    }
+
+    /// Atomically claim a single marker creation only while the original batch,
+    /// trust policy and provider-read delivery revision remain current.
+    pub(crate) fn claim_marker_creation(
+        &mut self,
+        target: &RefreshTarget,
+        policy: &TrustedCiPolicy,
+    ) -> Result<MarkerCreationState, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,i64,String)> = tx.query_row(
+            "SELECT i.plan,i.state,i.repository_id,i.target_ref FROM landing_intents_v1 i JOIN landing_batch_bindings_v1 b ON b.id=i.id WHERE i.id=?1",
+            [&target.plan.operation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        let (plan, state) = decode_row(
+            &target.plan.operation_id,
+            row.ok_or(LandingError::BatchBound)?,
+        )?;
+        if state != IntentState::Prepared || plan != target.plan || plan.marker_ref.is_none() {
+            return Err(LandingError::StaleBatch);
+        }
+        let mut now = observed_plan(
+            &tx,
+            &plan.operation_id,
+            &plan.batch_id,
+            &plan.repository_node_id,
+        )?;
+        now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
+        now.marker_ref = plan.marker_ref.clone();
+        if now != plan || refresh_target_details(&tx, now)? != *target {
+            return Err(LandingError::StaleBatch);
+        }
+        verify_trust_binding(&tx, &plan, Some(policy))?;
+        verify_trusted_policy(&tx, &plan, policy)?;
+        let state = marker_creation_state(&tx, &plan)?;
+        if state == MarkerCreationState::Prepared
+            && tx.execute("UPDATE landing_marker_creation_v1 SET state='creating' WHERE id=?1 AND state='prepared'", [&plan.operation_id])? != 1
+        {
+            return Err(LandingError::Transition);
+        }
+        tx.commit()?;
+        Ok(state)
+    }
+
+    /// A response can arrive after the batch was invalidated; preserve the
+    /// direct receipt as history without restoring the landing intent.
+    pub(crate) fn record_marker_created(&mut self, plan: &LandingPlan) -> Result<(), LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, i64, String)> = tx
+            .query_row(
+                "SELECT plan,state,repository_id,target_ref FROM landing_intents_v1 WHERE id=?1",
+                [&plan.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (current, _) = decode_row(&plan.operation_id, row.ok_or(LandingError::Transition)?)?;
+        if current != *plan || marker_creation_state(&tx, plan)? != MarkerCreationState::Creating {
+            return Err(LandingError::MarkerUnconfirmed);
+        }
+        if tx.execute("UPDATE landing_marker_creation_v1 SET state='created' WHERE id=?1 AND state='creating'", [&plan.operation_id])? != 1 {
+            return Err(LandingError::Transition);
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn refresh_target(
@@ -1303,6 +1401,32 @@ impl LandingJournal {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn marker_creation_state(
+    conn: &Connection,
+    plan: &LandingPlan,
+) -> Result<MarkerCreationState, LandingError> {
+    if plan.marker_ref.is_none() {
+        return Err(LandingError::MarkerUnconfirmed);
+    }
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT plan,state FROM landing_marker_creation_v1 WHERE id=?1",
+            [&plan.operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (body, state) = row.ok_or(LandingError::MarkerUnconfirmed)?;
+    if body != serde_json::to_string(plan)? {
+        return Err(LandingError::MarkerUnconfirmed);
+    }
+    match state.as_str() {
+        "prepared" => Ok(MarkerCreationState::Prepared),
+        "creating" => Ok(MarkerCreationState::Creating),
+        "created" => Ok(MarkerCreationState::Created),
+        _ => Err(LandingError::MarkerUnconfirmed),
     }
 }
 

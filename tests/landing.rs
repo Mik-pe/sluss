@@ -61,14 +61,14 @@ fn marked_plan_freezes_atomic_marker_and_survives_restart() {
     assert_eq!(refs[2]["force"], false);
     let mut journal = LandingJournal::open(&db).unwrap();
     journal.prepare(&p).unwrap();
-    assert_eq!(journal.claim(id).unwrap(), Some(p.clone()));
+    assert!(matches!(journal.claim(id), Err(LandingError::BatchBound)));
     drop(journal);
     let mut journal = LandingJournal::open(&db).unwrap();
     assert_eq!(
         journal.get(id).unwrap(),
-        Some((p.clone(), IntentState::Sending))
+        Some((p.clone(), IntentState::Prepared))
     );
-    assert!(journal.claim(id).unwrap().is_none());
+    assert!(matches!(journal.claim(id), Err(LandingError::BatchBound)));
     let mut without_marker = p.clone();
     without_marker.marker_ref = None;
     assert!(matches!(
