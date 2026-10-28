@@ -161,6 +161,7 @@ fn finish_with_workflow(
         }],
     };
     scheduler.record_ci_observation(id, &snapshot).unwrap();
+    scheduler.record_job_metrics(id, &snapshot).unwrap();
     scheduler.complete_ci_only(id).unwrap();
     scheduler.complete_ci_only(id).unwrap(); // repeated completion cannot double-count
     if release {
@@ -242,6 +243,105 @@ fn adapts_measured_cost_and_failures_across_restart() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("limit 2 -> 1"));
     queue(&mut store, &mut inbox, 14, 4);
     assert_eq!(plan(&mut store).candidates.len(), 1);
+}
+
+fn rerun_snapshot(batch: &Batch, run: u64) -> ActionsSnapshot {
+    ActionsSnapshot {
+        run: ActionsRun {
+            id: run,
+            run_attempt: 2,
+            workflow_id: 3,
+            head_sha: "b".repeat(40),
+            head_branch: Some(format!("sluss/{}", batch.id)),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 2000 + run,
+            run_id: run,
+            head_sha: "b".repeat(40),
+            name: "test".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            started_at: Some("2026-01-01T00:01:00Z".into()),
+            completed_at: Some("2026-01-01T00:01:30Z".into()),
+            runner_id: Some(7),
+        }],
+    }
+}
+
+#[test]
+fn observed_reruns_contribute_to_batch_size_comparisons() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("adaptive-rerun.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    let mut scheduler = Scheduler::open(&db, capacity()).unwrap();
+    for serial in 1..=3 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 12);
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
+    let mut rerun_batch = String::new();
+    for serial in 4..=6 {
+        queue(&mut store, &mut inbox, serial, 4);
+        let batch = plan(&mut store);
+        assert_eq!(batch.candidates.len(), 3);
+        finish(&mut store, &mut scheduler, &batch, serial, "success", 15);
+        if serial == 4 {
+            rerun_batch = batch.id.clone();
+            let snapshot = rerun_snapshot(&batch, serial);
+            assert_eq!(
+                scheduler
+                    .record_rerun_metrics(&batch.id, &snapshot)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                scheduler
+                    .record_rerun_metrics(&batch.id, &snapshot)
+                    .unwrap(),
+                0
+            );
+            drop(scheduler);
+            drop(store);
+            store = Store::open(&db).unwrap();
+            scheduler = Scheduler::open(&db, capacity()).unwrap();
+        }
+    }
+    assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 2);
+    let event = Store::adaptive_history(&db)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.batch_id == rerun_batch)
+        .unwrap();
+    assert_eq!(
+        (event.observed_rerun_jobs, event.observed_rerun_ms),
+        (1, 30_000)
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .arg("adaptive-history")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("observed reruns: 1 job, 0.50 runner-minutes")
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE ci_job_metrics SET body=json_set(body,'$.head_sha',?1) WHERE job_id='2004'",
+        ["e".repeat(40)],
+    )
+    .unwrap();
+    assert!(Store::adaptive_history(&db).is_err());
 }
 
 #[test]
@@ -752,7 +852,7 @@ fn investigation_cost_prevents_return_to_an_expensive_batch_size() {
     queue(&mut store, &mut inbox, 10, 4);
     let root = plan(&mut store);
     assert_eq!(root.candidates.len(), 4);
-    finish(&mut store, &mut scheduler, &root, 10, "failure", 24);
+    finish(&mut store, &mut scheduler, &root, 10, "failure", 2);
     let root_event = Store::adaptive_history(&db)
         .unwrap()
         .into_iter()
@@ -763,7 +863,15 @@ fn investigation_cost_prevents_return_to_an_expensive_batch_size() {
     for run in 11..=12 {
         let child = plan(&mut store);
         assert_eq!(child.candidates.len(), 2);
-        finish(&mut store, &mut scheduler, &child, run, "success", 12);
+        finish(&mut store, &mut scheduler, &child, run, "success", 2);
+        if run == 11 {
+            assert_eq!(
+                scheduler
+                    .record_rerun_metrics(&child.id, &rerun_snapshot(&child, run))
+                    .unwrap(),
+                1
+            );
+        }
     }
     let root_event = Store::adaptive_history(&db)
         .unwrap()
@@ -773,7 +881,11 @@ fn investigation_cost_prevents_return_to_an_expensive_batch_size() {
     assert!(root_event.recovery_settled);
     assert_eq!(
         (root_event.recovery_jobs, root_event.recovery_runner_ms),
-        (2, 24_000)
+        (2, 4_000)
+    );
+    assert_eq!(
+        (root_event.observed_rerun_jobs, root_event.observed_rerun_ms),
+        (1, 30_000)
     );
     // Six successful size-two batches end the cooldown and allow size three.
     for serial in 13..=18 {
@@ -789,8 +901,8 @@ fn investigation_cost_prevents_return_to_an_expensive_batch_size() {
         assert_eq!(batch.candidates.len(), 3);
         finish(&mut store, &mut scheduler, &batch, serial, "success", 18);
     }
-    // At size four, 24 s of failed parent work and 24 s of investigation
-    // are charged to the three earlier successful root batches.
+    // The failed parent and initial investigation cost alone are below the
+    // regression threshold. Its collected rerun makes size four expensive.
     assert_eq!(store.adaptive_status().unwrap().unwrap().limit, 3);
 }
 

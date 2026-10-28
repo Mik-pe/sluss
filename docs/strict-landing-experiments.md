@@ -1,0 +1,33 @@
+# GitHub branch-rule experiments
+
+These observations narrow the design space; they are not a strict-landing implementation or proof of a race-free protocol. They were performed on GitHub.com on 2026-10-28 in [a public repository containing only synthetic test data](https://github.com/Mik-pe/sluss-protocol-lab-public). The actor moving refs was a user credential, not a Sluss App installation. No CI attestation, runner isolation or concurrent policy change was tested.
+
+A separate private test repository on the same personal account rejected creation of an active PR ruleset with HTTP 403: GitHub requested Pro or a public repository. This is an observation for that account and configuration, not a claim about all private repositories or plans.
+
+## Exact batch with no required reviews
+
+An active ruleset on `lab-target-2` required changes through a pull request, dismissed stale approvals and had no bypass actors, but required **zero** approvals. Two synthetic pull requests, [#4](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/4) and [#5](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/5), began open against base `5e35b2f5147e3461d417f42324b666bf822419ae`. A two-parent merge chain using the Sluss commit metadata produced final SHA `834c71d4b1bacf9514517f7f1e2dc1ee8a5cde43`.
+
+A direct non-force push of that commit was rejected with GitHub rule error GH013, stating that changes must be made through a pull request. After creating an [aggregate PR #6](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/6) whose head was the same batch SHA, the same non-force push succeeded in one ref update. GitHub reported all three PRs merged and the target at exactly that SHA. The test did not run CI and zero reviews were required.
+
+## Approval of the aggregate does not approve the members
+
+On `lab-target-3`, a separate active ruleset required one approving review and listed no bypass actors. Synthetic member PRs [#7](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/7) and [#8](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/8) had no reviews. Only the [aggregate PR #9](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/9), whose head was the exact batch SHA `5ee3d7d78a5d5f51e0be166b5fe5d2b2e0563326`, received an `APPROVED` review from `github-actions[bot]` on that SHA. The synthetic review was created by [this workflow run](https://github.com/Mik-pe/sluss-protocol-lab-public/actions/runs/40674013998), using temporarily enabled review permission in the isolated test repository.
+
+A direct non-force push to `lab-target-3` succeeded. GitHub subsequently reported all three PRs merged at the batch SHA, even though the two member PRs had no reviews. This is a concrete counterexample to treating the aggregate PR's branch-rule approval as proof that each member has a current independent review. This trial did not exercise a review change during the observation-to-push interval or a policy change.
+
+## A member review dismissed after observation
+
+A further trial on `lab-target-4` used an active PR ruleset requiring one review, with no bypass actors. The two member PRs [#10](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/10) and [#11](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/11), and [aggregate PR #12](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/12), each received an `APPROVED` review on its exact head from `github-actions[bot]` using a [temporary workflow](https://github.com/Mik-pe/sluss-protocol-lab-public/actions/runs/40674262780). All three reported a clean mergeable state at observation. The operator then dismissed the review on PR #10 and confirmed it was `DISMISSED`; the other member and aggregate approvals remained `APPROVED`.
+
+The operator pushed the frozen aggregate commit `dc3455f2ec7d9bca2b95791f9a8240f5713560fc` non-force to the unchanged target. GitHub accepted the update and subsequently reported all three PRs merged at that exact SHA, including #10 with its review still dismissed. This reproduces the ordering in which a previously observed member approval becomes invalid before publication. It used sequential test actions rather than a simultaneous timing race, a user-token Git push rather than an App or GraphQL mutation, and no CI. It demonstrates why repeated API reads, a target SHA guard and aggregate PR approval alone cannot establish the required per-member review condition at publication.
+
+## Guarded atomic update after a member review is dismissed
+
+On `lab-target-5`, an active ruleset required one approval and had no bypass actors. The [two member PRs #13 and #14](https://github.com/Mik-pe/sluss-protocol-lab-public/pulls?q=is%3Apr+base%3Alab-target-5) and [aggregate PR #15](https://github.com/Mik-pe/sluss-protocol-lab-public/pull/15) were observed open with approvals from `github-actions[bot]` on each exact head; [the temporary review workflow](https://github.com/Mik-pe/sluss-protocol-lab-public/actions/runs/40674582114) had completed successfully. The operator dismissed PR #14's review, confirmed it was `DISMISSED`, and rechecked that the aggregate approval remained `APPROVED`.
+
+Using a user credential, the operator then sent GitHub's GraphQL `updateRefs` mutation. It compared the target against the original base, moved it to the frozen batch SHA, compared the staging ref as a no-op, moved a marker from base to batch, and compared both same-repository member branches as no-ops. GitHub acknowledged the mutation. A subsequent read showed target, staging and marker at `80901a1d67e01d96b1f5240ea3718a93ca3a0317`, both member branches unchanged, and all three PRs merged at that SHA; PR #14's review remained dismissed. The request, response, before and after observations are recorded in [the evidence file](evidence/github-review-race-2026-10-28.json).
+
+This sequential interleaving is a concrete counterexample for the proposed guarded ref mutation when review state changes after observation. It does not prove any general GitHub transaction guarantee, test an independently registered App or bypass permissions, exercise concurrent policy changes, or provide CI evidence. Strict landing remains disabled.
+
+The repository setting allowing Actions to approve PRs has been restored to `false`; default workflow permissions remain `read`. The temporary manually dispatched test workflows have been removed from the lab default branch; no lab workflows remain active. The history and synthetic test PRs are retained for inspection. The experiment does not grant or test App bypass rights and does not authorize enabling strict landing.

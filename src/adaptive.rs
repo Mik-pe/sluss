@@ -30,6 +30,8 @@ pub struct AdaptiveEvent {
     pub recovery_jobs: u64,
     pub recovery_runner_ms: u64,
     pub recovery_settled: bool,
+    pub observed_rerun_jobs: u64,
+    pub observed_rerun_ms: u64,
 }
 
 pub(crate) fn history(path: &std::path::Path) -> Result<Vec<AdaptiveEvent>, StoreError> {
@@ -86,6 +88,7 @@ pub(crate) fn history(path: &std::path::Path) -> Result<Vec<AdaptiveEvent>, Stor
             return Err(StoreError::InvalidBatch);
         }
         let recovery = recovery_cost(&conn, &batch_id)?;
+        let reruns = rerun_cost(&conn, &batch_id)?;
         result.push(AdaptiveEvent {
             batch_id,
             epoch,
@@ -100,6 +103,14 @@ pub(crate) fn history(path: &std::path::Path) -> Result<Vec<AdaptiveEvent>, Stor
             recovery_jobs: recovery.jobs,
             recovery_runner_ms: recovery.runner_ms,
             recovery_settled: recovery.settled,
+            observed_rerun_jobs: reruns
+                .jobs
+                .checked_add(recovery.rerun_jobs)
+                .ok_or(StoreError::InvalidBatch)?,
+            observed_rerun_ms: reruns
+                .runner_ms
+                .checked_add(recovery.rerun_ms)
+                .ok_or(StoreError::InvalidBatch)?,
         });
     }
     Ok(result)
@@ -109,7 +120,79 @@ pub(crate) fn history(path: &std::path::Path) -> Result<Vec<AdaptiveEvent>, Stor
 struct RecoveryCost {
     jobs: u64,
     runner_ms: u64,
+    rerun_jobs: u64,
+    rerun_ms: u64,
     settled: bool,
+}
+
+#[derive(Default)]
+struct RerunCost {
+    jobs: u64,
+    runner_ms: u64,
+}
+
+/// Previously collected, host-checked job measurements remain partial: this
+/// counts only known reruns and does not infer that all attempts were seen.
+fn rerun_cost(conn: &Connection, batch_id: &str) -> Result<RerunCost, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_job_metrics')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(RerunCost::default());
+    }
+    let mut stmt = conn.prepare("SELECT repository_id,job_id,body FROM ci_job_metrics WHERE json_valid(body) AND json_extract(body,'$.batch_id')=?1 AND json_extract(body,'$.attempt')>1")?;
+    let rows = stmt.query_map([batch_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut cost = RerunCost::default();
+    let mut expected: Option<(crate::scheduler::DispatchPlan, String)> = None;
+    for row in rows {
+        let (repository, job, body) = row?;
+        let metric: crate::metrics::JobMeasurement = serde_json::from_str(&body)?;
+        if metric.batch_id != batch_id
+            || metric.attempt < 2
+            || metric.repository_id == 0
+            || metric.job_id == 0
+            || metric.run_id == 0
+            || metric.runner_id == 0
+            || repository != metric.repository_id.to_string()
+            || job != metric.job_id.to_string()
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        if expected.is_none() {
+            let binding: Option<(String, String, String)> = conn.query_row("SELECT d.plan,d.run_id,s.source FROM dispatch_intents d JOIN dispatch_receipt_sources s ON s.id=d.id WHERE d.id=?1 AND d.run_id IS NOT NULL", [batch_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let (plan, run, source) = binding.ok_or(StoreError::InvalidBatch)?;
+            if source != "direct" {
+                return Err(StoreError::InvalidBatch);
+            }
+            expected = Some((serde_json::from_str(&plan)?, run));
+        }
+        let (plan, run) = expected.as_ref().ok_or(StoreError::InvalidBatch)?;
+        if plan.repository_id != metric.repository_id
+            || plan.integration_sha != metric.head_sha
+            || *run != metric.run_id.to_string()
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let elapsed = metric
+            .completed_ms
+            .checked_sub(metric.started_ms)
+            .and_then(|ms| u64::try_from(ms).ok())
+            .ok_or(StoreError::InvalidBatch)?;
+        cost.jobs = cost.jobs.checked_add(1).ok_or(StoreError::InvalidBatch)?;
+        cost.runner_ms = cost
+            .runner_ms
+            .checked_add(elapsed)
+            .ok_or(StoreError::InvalidBatch)?;
+    }
+    Ok(cost)
 }
 
 /// Measure every known descendant CI-only job; missing, invalidated or pending
@@ -156,6 +239,15 @@ fn recovery_cost(conn: &Connection, root: &str) -> Result<RecoveryCost, StoreErr
             cost.settled = false;
             continue;
         }
+        let reruns = rerun_cost(conn, child.as_deref().ok_or(StoreError::InvalidBatch)?)?;
+        cost.rerun_jobs = cost
+            .rerun_jobs
+            .checked_add(reruns.jobs)
+            .ok_or(StoreError::InvalidBatch)?;
+        cost.rerun_ms = cost
+            .rerun_ms
+            .checked_add(reruns.runner_ms)
+            .ok_or(StoreError::InvalidBatch)?;
         if state != "planned" {
             cost.settled = false;
         }
@@ -510,6 +602,7 @@ fn score(tx: &Transaction<'_>, epoch: i64, key: &str, size: usize) -> Result<Sco
             return Ok(Score::Blocked);
         }
         elapsed += *ms as u128;
+        elapsed += u128::from(rerun_cost(tx, batch)?.runner_ms);
         match conclusion.as_str() {
             "success" => passed += size as u128,
             "failure" => {
@@ -518,6 +611,7 @@ fn score(tx: &Transaction<'_>, epoch: i64, key: &str, size: usize) -> Result<Sco
                     return Ok(Score::Blocked);
                 }
                 elapsed += u128::from(recovery.runner_ms);
+                elapsed += u128::from(recovery.rerun_ms);
             }
             _ => return Err(StoreError::InvalidBatch),
         }

@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "date_utc": "2026-10-28",
+  "repository": "Mik-pe/sluss-protocol-lab-public",
+  "workflow_run": 40674582114,
+  "actor": "GitHub user credential",
+  "description": "Sequentially dismiss a member review after observing all three approvals, then send a guarded GraphQL updateRefs mutation. Synthetic test data; no CI attestation.",
+  "before": {
+    "13": {
+      "state": "open",
+      "head": "dbbe6d13545298979f1969eced334a6506df5038",
+      "base": "5e35b2f5147e3461d417f42324b666bf822419ae",
+      "mergeable_state": "clean",
+      "reviews": [
+        {
+          "id": 5681377077,
+          "user": "github-actions[bot]",
+          "state": "APPROVED",
+          "commit_id": "dbbe6d13545298979f1969eced334a6506df5038"
+        }
+      ]
+    },
+    "14": {
+      "state": "open",
+      "head": "4e0c9ce6f97aaa632efbdb9bd86964b100683523",
+      "base": "5e35b2f5147e3461d417f42324b666bf822419ae",
+      "mergeable_state": "clean",
+      "reviews": [
+        {
+          "id": 5681377260,
+          "user": "github-actions[bot]",
+          "state": "APPROVED",
+          "commit_id": "4e0c9ce6f97aaa632efbdb9bd86964b100683523"
+        }
+      ]
+    },
+    "15": {
+      "state": "open",
+      "head": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+      "base": "5e35b2f5147e3461d417f42324b666bf822419ae",
+      "mergeable_state": "clean",
+      "reviews": [
+        {
+          "id": 5681377461,
+          "user": "github-actions[bot]",
+          "state": "APPROVED",
+          "commit_id": "80901a1d67e01d96b1f5240ea3718a93ca3a0317"
+        }
+      ]
+    }
+  },
+  "dismissed_review": {
+    "pull": 14,
+    "id": 5681377260,
+    "state": "DISMISSED"
+  },
+  "graphql_request": {
+    "query": "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }",
+    "variables": {
+      "input": {
+        "repositoryId": "R_kgDOVaXrJA",
+        "clientMutationId": "sluss-protocol-lab-five",
+        "refUpdates": [
+          {
+            "name": "refs/heads/lab-target-5",
+            "beforeOid": "5e35b2f5147e3461d417f42324b666bf822419ae",
+            "afterOid": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+            "force": false
+          },
+          {
+            "name": "refs/heads/lab-five-staging",
+            "beforeOid": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+            "afterOid": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+            "force": false
+          },
+          {
+            "name": "refs/heads/lab-five-marker",
+            "beforeOid": "5e35b2f5147e3461d417f42324b666bf822419ae",
+            "afterOid": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+            "force": false
+          },
+          {
+            "name": "refs/heads/lab-five-a",
+            "beforeOid": "4e0c9ce6f97aaa632efbdb9bd86964b100683523",
+            "afterOid": "4e0c9ce6f97aaa632efbdb9bd86964b100683523",
+            "force": false
+          },
+          {
+            "name": "refs/heads/lab-five-b",
+            "beforeOid": "dbbe6d13545298979f1969eced334a6506df5038",
+            "afterOid": "dbbe6d13545298979f1969eced334a6506df5038",
+            "force": false
+          }
+        ]
+      }
+    }
+  },
+  "graphql_response": {
+    "data": {
+      "updateRefs": {
+        "clientMutationId": "sluss-protocol-lab-five"
+      }
+    }
+  },
+  "after": {
+    "refs": {
+      "lab-target-5": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+      "lab-five-staging": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+      "lab-five-marker": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+      "lab-five-a": "4e0c9ce6f97aaa632efbdb9bd86964b100683523",
+      "lab-five-b": "dbbe6d13545298979f1969eced334a6506df5038"
+    },
+    "prs": {
+      "13": {
+        "state": "closed",
+        "merged": true,
+        "merge_commit_sha": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+        "head": "dbbe6d13545298979f1969eced334a6506df5038",
+        "reviews": [
+          {
+            "id": 5681377077,
+            "state": "APPROVED",
+            "commit_id": "dbbe6d13545298979f1969eced334a6506df5038"
+          }
+        ]
+      },
+      "14": {
+        "state": "closed",
+        "merged": true,
+        "merge_commit_sha": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+        "head": "4e0c9ce6f97aaa632efbdb9bd86964b100683523",
+        "reviews": [
+          {
+            "id": 5681377260,
+            "state": "DISMISSED",
+            "commit_id": "4e0c9ce6f97aaa632efbdb9bd86964b100683523"
+          }
+        ]
+      },
+      "15": {
+        "state": "closed",
+        "merged": true,
+        "merge_commit_sha": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+        "head": "80901a1d67e01d96b1f5240ea3718a93ca3a0317",
+        "reviews": [
+          {
+            "id": 5681377461,
+            "state": "APPROVED",
+            "commit_id": "80901a1d67e01d96b1f5240ea3718a93ca3a0317"
+          }
+        ]
+      }
+    }
+  }
+}

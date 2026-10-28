@@ -1045,9 +1045,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 );
             }
+            if event.observed_rerun_jobs > 0 {
+                println!(
+                    "  observed reruns: {} {}, {:.2} runner-minutes",
+                    event.observed_rerun_jobs,
+                    if event.observed_rerun_jobs == 1 {
+                        "job"
+                    } else {
+                        "jobs"
+                    },
+                    event.observed_rerun_ms as f64 / 60_000.0
+                );
+            }
         }
         println!(
-            "Samples measure observed first-attempt CI jobs, not delivered PRs, later reruns, or merge authorization."
+            "Samples measure observed CI jobs and collected reruns, not complete runner usage, delivered PRs or merge authorization."
         );
         return Ok(());
     }

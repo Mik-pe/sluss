@@ -54,6 +54,7 @@ pub struct CapacityWaitSummary {
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS ci_job_metrics (repository_id TEXT NOT NULL, job_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(repository_id,job_id));
         CREATE INDEX IF NOT EXISTS ci_job_metrics_batch_attempt ON ci_job_metrics(repository_id, json_extract(body, '$.batch_id'), json_extract(body, '$.attempt')) WHERE json_valid(body);
+        CREATE INDEX IF NOT EXISTS ci_job_metrics_batch_reruns ON ci_job_metrics(json_extract(body, '$.batch_id'), json_extract(body, '$.attempt')) WHERE json_valid(body);
         CREATE TABLE IF NOT EXISTS ci_delivery_cursor (id INTEGER PRIMARY KEY CHECK(id=1), after_number INTEGER NOT NULL CHECK(after_number>=0));
         CREATE TABLE IF NOT EXISTS ci_delivery_claims (number INTEGER PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>0));
         CREATE TABLE IF NOT EXISTS ci_delivery_priority_claims (number INTEGER PRIMARY KEY, observation_id INTEGER NOT NULL CHECK(observation_id>0));
