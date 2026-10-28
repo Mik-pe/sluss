@@ -125,6 +125,30 @@ async fn conditional_reviews(
     conditional_response(&state, &headers, value, mode != 219)
 }
 
+async fn conditional_pull20(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let mode = state.mode.load(Ordering::SeqCst);
+    let Json(mut value) = pull(State(state.clone()), headers.clone()).await;
+    value["number"] = json!(20);
+    conditional_response(&state, &headers, value, mode != 219)
+}
+
+async fn conditional_permission(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let call = state.token_calls.fetch_add(1, Ordering::SeqCst);
+    let permission = if state.mode.load(Ordering::SeqCst) == 218 && call > 0 {
+        "read"
+    } else {
+        "write"
+    };
+    Json(json!({"permission":permission,"user":{"id":9,"login":"reviewer","type":"User"}}))
+}
+
 fn conditional_response(
     state: &ServerState,
     headers: &HeaderMap,
@@ -957,6 +981,7 @@ async fn pr_observation_uses_conditional_reads_without_hiding_changes() {
     let mode = Arc::new(AtomicU8::new(0));
     let pulls = Arc::new(AtomicUsize::new(0));
     let unchanged = Arc::new(AtomicUsize::new(0));
+    let permissions = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo/pulls/19", get(conditional_pull))
@@ -964,18 +989,28 @@ async fn pr_observation_uses_conditional_reads_without_hiding_changes() {
             "/repos/owner/repo/pulls/19/reviews",
             get(conditional_reviews),
         )
+        .route("/repos/owner/repo/pulls/20", get(conditional_pull20))
+        .route(
+            "/repos/owner/repo/pulls/20/reviews",
+            get(conditional_reviews),
+        )
+        .route(
+            "/repos/owner/repo/collaborators/reviewer/permission",
+            get(conditional_permission),
+        )
         .with_state(ServerState {
             public_key: Arc::new(public),
             mode: mode.clone(),
             pulls: pulls.clone(),
             permissions: unchanged.clone(),
-            token_calls: Arc::new(AtomicUsize::new(0)),
+            token_calls: permissions.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
     let token = client.read_token(42, 7).await.unwrap();
+    permissions.store(0, Ordering::SeqCst);
     let snapshot = client
         .observe_pull(&token, "owner", "repo", 19)
         .await
@@ -1005,6 +1040,61 @@ async fn pr_observation_uses_conditional_reads_without_hiding_changes() {
         4,
         "each review page has its own cache entry"
     );
+
+    mode.store(0, Ordering::SeqCst);
+    pulls.store(0, Ordering::SeqCst);
+    unchanged.store(0, Ordering::SeqCst);
+    permissions.store(0, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        unchanged.load(Ordering::SeqCst),
+        16,
+        "both phases conditionally reread two PRs"
+    );
+    assert_eq!(
+        permissions.load(Ordering::SeqCst),
+        2,
+        "shared reviewer is still checked twice"
+    );
+    pulls.store(0, Ordering::SeqCst);
+    unchanged.store(0, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        unchanged.load(Ordering::SeqCst),
+        16,
+        "a new scan starts with fresh responses"
+    );
+    mode.store(216, Ordering::SeqCst);
+    pulls.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+            .await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    mode.store(218, Ordering::SeqCst);
+    pulls.store(0, Ordering::SeqCst);
+    permissions.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+            .await,
+        Err(GitHubError::UnstableObservation)
+    ));
 
     pulls.store(0, Ordering::SeqCst);
     mode.store(5, Ordering::SeqCst);

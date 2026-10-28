@@ -494,7 +494,7 @@ pub struct PullSnapshot {
     pub reviews: Vec<ReviewObservation>,
 }
 
-/// Lives only for one PR observation, never across tokens or scans.
+/// Lives only within one authenticated observation or reconciliation scan.
 #[derive(Default)]
 struct PullReadCache {
     entries: BTreeMap<String, (reqwest::header::HeaderValue, Vec<u8>)>,
@@ -539,21 +539,33 @@ impl App {
         repository: &str,
         number: u64,
     ) -> Result<PullSnapshot, GitHubError> {
+        let mut cache = PullReadCache::default();
+        self.observe_pull_cached(token, owner, repository, number, &mut cache)
+            .await
+    }
+
+    async fn observe_pull_cached(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        number: u64,
+        cache: &mut PullReadCache,
+    ) -> Result<PullSnapshot, GitHubError> {
         if !valid_name(owner) || !valid_name(repository) || number == 0 {
             return Err(GitHubError::InvalidConfiguration);
         }
         let path = format!("repos/{owner}/{repository}/pulls/{number}");
-        let mut cache = PullReadCache::default();
         let first: PullObservation = self
-            .get_json_cached(token, &path, None, Some(&mut cache))
+            .get_json_cached(token, &path, None, Some(cache))
             .await?;
-        let reviews1 = self.get_reviews(token, &path, &mut cache).await?;
+        let reviews1 = self.get_reviews(token, &path, cache).await?;
         let middle: PullObservation = self
-            .get_json_cached(token, &path, None, Some(&mut cache))
+            .get_json_cached(token, &path, None, Some(cache))
             .await?;
-        let reviews2 = self.get_reviews(token, &path, &mut cache).await?;
+        let reviews2 = self.get_reviews(token, &path, cache).await?;
         let last: PullObservation = self
-            .get_json_cached(token, &path, None, Some(&mut cache))
+            .get_json_cached(token, &path, None, Some(cache))
             .await?;
         if first != middle
             || middle != last
@@ -744,7 +756,10 @@ impl App {
         repository: &str,
         number: u64,
     ) -> Result<AuthorizedPullObservation, GitHubError> {
-        let first = self.observe_pull(token, owner, repository, number).await?;
+        let mut cache = PullReadCache::default();
+        let first = self
+            .observe_pull_cached(token, owner, repository, number, &mut cache)
+            .await?;
         let reviewers = decision_reviewers(&first)?;
         let mut first_permissions = BTreeMap::new();
         for (id, login) in &reviewers {
@@ -772,7 +787,9 @@ impl App {
                 _ => return Err(GitHubError::UnstableObservation),
             }
         }
-        let last = self.observe_pull(token, owner, repository, number).await?;
+        let last = self
+            .observe_pull_cached(token, owner, repository, number, &mut cache)
+            .await?;
         if first != last {
             return Err(GitHubError::UnstableObservation);
         }
@@ -800,11 +817,14 @@ impl App {
         let mut all_reviewers: BTreeMap<u64, String> = BTreeMap::new();
         let mut first = Vec::with_capacity(numbers.len());
         let mut total_reviews = 0usize;
+        let mut cache = PullReadCache::default();
         for number in numbers {
             if !unique.insert(*number) {
                 return Err(GitHubError::UnstableObservation);
             }
-            let snapshot = self.observe_pull(token, owner, repository, *number).await?;
+            let snapshot = self
+                .observe_pull_cached(token, owner, repository, *number, &mut cache)
+                .await?;
             total_reviews = total_reviews
                 .checked_add(snapshot.reviews.len())
                 .ok_or(GitHubError::UnstableObservation)?;
@@ -847,7 +867,9 @@ impl App {
         }
         let mut observations = Vec::with_capacity(numbers.len());
         for (number, (snapshot, reviewers)) in numbers.iter().zip(first) {
-            let last = self.observe_pull(token, owner, repository, *number).await?;
+            let last = self
+                .observe_pull_cached(token, owner, repository, *number, &mut cache)
+                .await?;
             if last != snapshot {
                 return Err(GitHubError::UnstableObservation);
             }
