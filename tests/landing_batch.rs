@@ -576,3 +576,124 @@ fn published_trust_policy_example_parses_without_establishing_trust() {
     assert_eq!(policy.workflow_path, ".github/workflows/sluss-ci.yml");
     assert_eq!(policy.digest().unwrap().len(), 64);
 }
+
+#[test]
+fn missing_or_legacy_trust_binding_cannot_downgrade_an_intent() {
+    for mode in ["missing-policy", "missing-batch-binding", "legacy"] {
+        let mut fixture = setup();
+        let trust = trusted_policy();
+        let plan = fixture
+            .journal
+            .prepare_trusted_batch("land-trusted", BATCH, &trust)
+            .unwrap();
+        assert_eq!(plan.trusted_ci_policy_digest, Some(trust.digest().unwrap()));
+        let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+        match mode {
+            "missing-policy" => {
+                conn.execute(
+                    "DELETE FROM landing_trust_bindings_v1 WHERE id='land-trusted'",
+                    [],
+                )
+                .unwrap();
+            }
+            "missing-batch-binding" => {
+                conn.execute(
+                    "DELETE FROM landing_batch_bindings_v1 WHERE id='land-trusted'",
+                    [],
+                )
+                .unwrap();
+            }
+            "legacy" => {
+                conn.execute("UPDATE landing_intents_v1 SET plan=json_remove(plan,'$.trusted_ci_policy_digest') WHERE id='land-trusted'", []).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(conn);
+        fixture.journal = LandingJournal::open(&fixture.db).unwrap();
+        if mode == "missing-batch-binding" {
+            assert!(matches!(
+                fixture.journal.claim("land-trusted"),
+                Err(LandingError::TrustPolicy)
+            ));
+        } else {
+            assert!(matches!(
+                fixture.journal.claim_observed_batch("land-trusted"),
+                Err(LandingError::TrustPolicy)
+            ));
+        }
+        assert!(
+            fixture
+                .journal
+                .prepare_trusted_batch("land-trusted", BATCH, &trust)
+                .is_err()
+        );
+        assert_eq!(
+            fixture.journal.get("land-trusted").unwrap().unwrap().1,
+            IntentState::Prepared
+        );
+    }
+}
+
+#[test]
+fn lost_trust_binding_cannot_acknowledge_a_claimed_intent() {
+    let mut fixture = setup();
+    fixture
+        .journal
+        .prepare_trusted_batch("land-trusted", BATCH, &trusted_policy())
+        .unwrap();
+    let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    conn.execute(
+        "UPDATE landing_intents_v1 SET state='sending' WHERE id='land-trusted'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM landing_trust_bindings_v1 WHERE id='land-trusted'",
+        [],
+    )
+    .unwrap();
+    let response = br#"{"data":{"updateRefs":{"clientMutationId":"land-trusted"}}}"#;
+    assert!(matches!(
+        fixture.journal.acknowledge("land-trusted", 200, response),
+        Err(LandingError::TrustPolicy)
+    ));
+    assert_eq!(
+        fixture.journal.get("land-trusted").unwrap().unwrap().1,
+        IntentState::Sending
+    );
+}
+
+#[test]
+fn replacing_policy_and_its_row_digest_cannot_rebind_a_claimed_intent() {
+    let mut fixture = setup();
+    let trusted = trusted_policy();
+    fixture
+        .journal
+        .prepare_trusted_batch("land-trusted", BATCH, &trusted)
+        .unwrap();
+    let mut other = trusted.clone();
+    other.runner_ids.insert(8);
+    let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    conn.execute(
+        "UPDATE landing_intents_v1 SET state='sending' WHERE id='land-trusted'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE landing_trust_bindings_v1 SET body=?1,digest=?2 WHERE id='land-trusted'",
+        rusqlite::params![
+            serde_json::to_string(&other).unwrap(),
+            other.digest().unwrap()
+        ],
+    )
+    .unwrap();
+    let response = br#"{"data":{"updateRefs":{"clientMutationId":"land-trusted"}}}"#;
+    assert!(matches!(
+        fixture.journal.acknowledge("land-trusted", 200, response),
+        Err(LandingError::TrustPolicy)
+    ));
+    assert_eq!(
+        fixture.journal.get("land-trusted").unwrap().unwrap().1,
+        IntentState::Sending
+    );
+}

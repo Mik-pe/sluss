@@ -30,6 +30,9 @@ pub struct LandingPlan {
     pub policy_digest: String,
     pub admission_digest: String,
     pub ci_evidence_digest: String,
+    /// Present only when an independently supplied operator policy is bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_ci_policy_digest: Option<String>,
     /// Missing on historical or purely local intents; not a bypass proof.
     #[serde(default)]
     pub branch_rules_digest: Option<String>,
@@ -205,6 +208,10 @@ impl LandingPlan {
             || !hex(&self.admission_digest, 64)
             || !hex(&self.ci_evidence_digest, 64)
             || self
+                .trusted_ci_policy_digest
+                .as_deref()
+                .is_some_and(|value| !hex(value, 64))
+            || self
                 .branch_rules_digest
                 .as_deref()
                 .is_some_and(|value| !hex(value, 64))
@@ -279,6 +286,9 @@ impl LandingJournal {
     }
     pub fn prepare(&mut self, plan: &LandingPlan) -> Result<IntentState, LandingError> {
         plan.validate()?;
+        if plan.trusted_ci_policy_digest.is_some() {
+            return Err(LandingError::TrustPolicy);
+        }
         let body = serde_json::to_string(plan)?;
         let tx = self
             .conn
@@ -342,7 +352,18 @@ impl LandingJournal {
         if bound {
             return Err(LandingError::BatchBound);
         }
+        let trust_bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM landing_trust_bindings_v1 WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if trust_bound {
+            return Err(LandingError::TrustPolicy);
+        }
         let (plan, state) = decode_row(id, row)?;
+        if plan.trusted_ci_policy_digest.is_some() {
+            return Err(LandingError::TrustPolicy);
+        }
         if state != IntentState::Prepared {
             tx.commit()?;
             return Ok(None);
@@ -395,9 +416,10 @@ impl LandingJournal {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let plan = observed_plan(&tx, operation_id, batch_id, repository_node_id)?;
+        let mut plan = observed_plan(&tx, operation_id, batch_id, repository_node_id)?;
         if let Some(policy) = policy {
             verify_trusted_policy(&tx, &plan, policy)?;
+            plan.trusted_ci_policy_digest = Some(policy.digest()?);
         }
         let body = serde_json::to_string(&plan)?;
         let existing: Option<(String, String, i64, String)> = tx
@@ -414,13 +436,19 @@ impl LandingJournal {
                 [operation_id],
                 |r| r.get(0),
             )?;
-            if !bound || old != plan {
+            if !bound {
+                return Err(LandingError::IdConflict);
+            }
+            if old.trusted_ci_policy_digest != plan.trusted_ci_policy_digest {
+                return Err(LandingError::TrustPolicy);
+            }
+            if old != plan {
                 return Err(LandingError::IdConflict);
             }
             if state != IntentState::Prepared {
                 return Err(LandingError::Transition);
             }
-            verify_trust_binding(&tx, operation_id, policy)?;
+            verify_trust_binding(&tx, &plan, policy)?;
         } else {
             let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM landing_intents_v1 WHERE repository_id=?1 AND target_ref=?2 AND state IN ('prepared','sending'))", params![plan.repository_id,plan.target_ref], |r| r.get(0))?;
             if busy {
@@ -486,11 +514,12 @@ impl LandingJournal {
             tx.commit()?;
             return Ok(None);
         }
-        let now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
+        let mut now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
+        now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
         if now != plan {
             return Err(LandingError::StaleBatch);
         }
-        verify_trust_binding(&tx, operation_id, policy)?;
+        verify_trust_binding(&tx, &plan, policy)?;
         if let Some(policy) = policy {
             verify_trusted_policy(&tx, &plan, policy)?;
         }
@@ -534,10 +563,12 @@ impl LandingJournal {
         if state != IntentState::Prepared {
             return Err(LandingError::Transition);
         }
-        if observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)? != plan {
+        let mut now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
+        now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
+        if now != plan {
             return Err(LandingError::StaleBatch);
         }
-        verify_trust_binding(&tx, operation_id, Some(policy))?;
+        verify_trust_binding(&tx, &plan, Some(policy))?;
         verify_trusted_policy(&tx, &plan, policy)?;
         let body: String = tx.query_row(
             "SELECT body FROM ci_observations WHERE id=?1",
@@ -613,7 +644,22 @@ impl LandingJournal {
         let Some((body, state, repository, target, recorded)) = row else {
             return Err(LandingError::Transition);
         };
-        let (_, state) = decode_row(id, (body, state, repository, target))?;
+        let (plan, state) = decode_row(id, (body, state, repository, target))?;
+        if plan.trusted_ci_policy_digest.is_some() {
+            let body: Option<String> = tx
+                .query_row(
+                    "SELECT body FROM landing_trust_bindings_v1 WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let policy: TrustedCiPolicy =
+                serde_json::from_str(&body.ok_or(LandingError::TrustPolicy)?)
+                    .map_err(|_| LandingError::TrustPolicy)?;
+            verify_trust_binding(&tx, &plan, Some(&policy))?;
+        } else {
+            verify_trust_binding(&tx, &plan, None)?;
+        }
         match state {
             IntentState::Sending if recorded.is_none() => {
                 if tx.execute(
@@ -631,22 +677,26 @@ impl LandingJournal {
 
 fn verify_trust_binding(
     tx: &rusqlite::Transaction<'_>,
-    id: &str,
+    plan: &LandingPlan,
     policy: Option<&TrustedCiPolicy>,
 ) -> Result<(), LandingError> {
     let row: Option<(String, String)> = tx
         .query_row(
             "SELECT body,digest FROM landing_trust_bindings_v1 WHERE id=?1",
-            [id],
+            [&plan.operation_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    match (row, policy) {
-        (None, None) => Ok(()),
-        (Some((body, digest)), Some(policy)) => {
+    match (row, policy, plan.trusted_ci_policy_digest.as_deref()) {
+        (None, None, None) => Ok(()),
+        (Some((body, digest)), Some(policy), Some(expected)) => {
             let saved: TrustedCiPolicy =
                 serde_json::from_str(&body).map_err(|_| LandingError::TrustPolicy)?;
-            if saved != *policy || saved.digest()? != digest || policy.digest()? != digest {
+            if saved != *policy
+                || saved.digest()? != digest
+                || policy.digest()? != digest
+                || digest != expected
+            {
                 return Err(LandingError::TrustPolicy);
             }
             Ok(())
@@ -851,6 +901,7 @@ fn observed_plan(
         policy_digest: dispatch.policy_digest,
         admission_digest: hex::encode(Sha256::digest(admission_body)),
         ci_evidence_digest: hex::encode(Sha256::digest(ci_digest_body)),
+        trusted_ci_policy_digest: None,
         branch_rules_digest: Some(rules_digest),
         branch_security_digest: Some(security_digest),
     };
