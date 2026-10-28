@@ -1,12 +1,7 @@
 //! Conservative selection from an operator-owned verification policy.
 //! Selection is not CI evidence and does not authorize landing.
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    io::Read,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{collections::BTreeSet, path::Path, process::Command};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -278,6 +273,21 @@ fn git(repo: &Path) -> Command {
         .args(["-c", "core.hooksPath=/dev/null"]);
     cmd
 }
+fn selection_git(
+    cmd: Command,
+    limit: u64,
+    full_on_limit: bool,
+) -> Result<std::process::Output, SelectionError> {
+    crate::integration::bounded_local_command(cmd, None, limit, std::time::Duration::from_secs(60))
+        .map_err(|error| match error {
+            crate::integration::LocalCommandError::Io(error) => SelectionError::Io(error),
+            crate::integration::LocalCommandError::Limit if full_on_limit => {
+                SelectionError::ChangeList
+            }
+            crate::integration::LocalCommandError::Limit => SelectionError::Git,
+            crate::integration::LocalCommandError::Timeout => SelectionError::Git,
+        })
+}
 /// List additions and deletions separately so renames classify both paths.
 /// Both objects must be commits and the base must be an ancestor of the head.
 pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>, SelectionError> {
@@ -292,45 +302,36 @@ pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>,
     }
     let repo = repo.canonicalize()?;
     for sha in [base, head] {
-        let object = git(&repo).args(["cat-file", "-t", sha]).output()?;
+        let mut kind = git(&repo);
+        kind.args(["cat-file", "-t", sha]);
+        let object = selection_git(kind, 64, false)?;
         if !object.status.success() || object.stdout != b"commit\n" {
             return Err(SelectionError::InvalidCommit);
         }
     }
-    let ancestry = git(&repo)
-        .args(["merge-base", "--is-ancestor", base, head])
-        .status()?;
-    if !ancestry.success() {
+    let mut ancestry = git(&repo);
+    ancestry.args(["merge-base", "--is-ancestor", base, head]);
+    if !selection_git(ancestry, 64, false)?.status.success() {
         return Err(SelectionError::InvalidCommit);
     }
-    let mut child = git(&repo)
-        .args([
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--name-only",
-            "-z",
-            base,
-            head,
-            "--",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut output = Vec::new();
-    let reader = child.stdout.take().ok_or(SelectionError::Git)?;
-    reader.take(4 * 1024 * 1024 + 1).read_to_end(&mut output)?;
-    if output.len() > 4 * 1024 * 1024 {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(SelectionError::ChangeList);
-    }
-    if !child.wait()?.success() {
+    let mut diff = git(&repo);
+    diff.args([
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--name-only",
+        "-z",
+        base,
+        head,
+        "--",
+    ]);
+    let output = selection_git(diff, 4 * 1024 * 1024, true)?;
+    if !output.status.success() {
         return Err(SelectionError::Git);
     }
+    let output = output.stdout;
     if output.is_empty() {
         return Ok(Vec::new());
     }
@@ -346,4 +347,27 @@ pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>,
         );
     }
     Ok(paths)
+}
+
+#[cfg(all(test, unix))]
+mod git_limit_tests {
+    use super::{SelectionError, selection_git};
+    use std::process::Command;
+
+    #[test]
+    fn only_an_oversized_diff_can_select_the_full_suite() {
+        let noisy = || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "yes x"]);
+            command
+        };
+        assert!(matches!(
+            selection_git(noisy(), 64, true),
+            Err(SelectionError::ChangeList)
+        ));
+        assert!(matches!(
+            selection_git(noisy(), 64, false),
+            Err(SelectionError::Git)
+        ));
+    }
 }

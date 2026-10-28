@@ -201,13 +201,13 @@ fn build_command(
 }
 
 #[derive(Debug)]
-enum LocalCommandError {
+pub(crate) enum LocalCommandError {
     Io(std::io::Error),
     Limit,
     Timeout,
 }
 
-fn bounded_local_command(
+pub(crate) fn bounded_local_command(
     mut command: Command,
     input: Option<&[u8]>,
     limit: u64,
@@ -373,27 +373,16 @@ pub enum StagingWorkflowError {
     Io(#[from] std::io::Error),
 }
 
-fn bounded_git(mut cmd: Command, limit: u64) -> Result<Vec<u8>, StagingWorkflowError> {
-    cmd.stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    let mut output = Vec::new();
-    let stdout = child.stdout.take().ok_or(StagingWorkflowError::Tree)?;
-    if let Err(error) = stdout.take(limit + 1).read_to_end(&mut output) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error.into());
-    }
-    if output.len() as u64 > limit {
-        let _ = child.kill();
-        let _ = child.wait();
+fn bounded_git(cmd: Command, limit: u64) -> Result<Vec<u8>, StagingWorkflowError> {
+    let output = bounded_local_command(cmd, None, limit, std::time::Duration::from_secs(30))
+        .map_err(|error| match error {
+            LocalCommandError::Io(error) => StagingWorkflowError::Io(error),
+            LocalCommandError::Limit | LocalCommandError::Timeout => StagingWorkflowError::Tree,
+        })?;
+    if !output.status.success() {
         return Err(StagingWorkflowError::Tree);
     }
-    if !child.wait()?.success() {
-        return Err(StagingWorkflowError::Tree);
-    }
-    Ok(output)
+    Ok(output.stdout)
 }
 
 fn tree_entry(line: &[u8]) -> Result<(&str, &str, &str, &str), StagingWorkflowError> {
@@ -736,40 +725,18 @@ fn remote_ref(
     Ok(Some(sha.into()))
 }
 /// Bound external Git calls and never surface stdout/stderr containing secrets.
-fn run_git(mut cmd: Command, capture: bool) -> Result<Output, StageError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+fn run_git(cmd: Command, capture: bool) -> Result<Output, StageError> {
+    let mut output =
+        bounded_local_command(cmd, None, 1024 * 1024, std::time::Duration::from_secs(30)).map_err(
+            |error| match error {
+                LocalCommandError::Io(error) => StageError::Io(error),
+                LocalCommandError::Limit | LocalCommandError::Timeout => StageError::Uncertain,
+            },
+        )?;
+    if !capture {
+        output.stdout.clear();
     }
-    cmd.stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(if capture {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-    let mut child = cmd.spawn()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(StageError::from);
-        }
-        if std::time::Instant::now() >= deadline {
-            #[cfg(unix)]
-            {
-                // The child is the leader of a new process group. Terminate
-                // Git helpers as well as the parent so credentials do not linger.
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(StageError::Uncertain);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    Ok(output)
 }
 
 /// Digest of explicitly selected policy files, with their exact bytes and modes.
@@ -830,7 +797,9 @@ fn policy_snapshot(
     {
         return Err(PolicyError::Invalid);
     }
-    let kind = git(repo).args(["cat-file", "-t", base]).output()?;
+    let mut kind = git(repo);
+    kind.args(["cat-file", "-t", base]);
+    let kind = policy_git(kind, 64)?;
     if !kind.status.success() || kind.stdout != b"commit\n" {
         return Err(PolicyError::Invalid);
     }
@@ -842,7 +811,9 @@ fn policy_snapshot(
             PolicyError::Changed => PolicyError::BaseUnavailable,
             other => other,
         })?;
-        let size = git(repo).args(["cat-file", "-s", &object]).output()?;
+        let mut size = git(repo);
+        size.args(["cat-file", "-s", &object]);
+        let size = policy_git(size, 64)?;
         if !size.status.success() {
             return Err(PolicyError::Git);
         }
@@ -862,7 +833,9 @@ fn policy_snapshot(
         if mode != staged_mode || object != staged_object {
             return Err(PolicyError::Changed);
         }
-        let content = git(repo).args(["cat-file", "blob", &object]).output()?;
+        let mut content = git(repo);
+        content.args(["cat-file", "blob", &object]);
+        let content = policy_git(content, 1024 * 1024)?;
         if !content.status.success() || content.stdout.len() != size {
             return Err(PolicyError::Git);
         }
@@ -888,18 +861,27 @@ pub fn valid_policy_path(path: &str) -> bool {
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != ".." && part != ".git")
 }
+fn policy_git(cmd: Command, limit: u64) -> Result<Output, PolicyError> {
+    bounded_local_command(cmd, None, limit, std::time::Duration::from_secs(30)).map_err(|error| {
+        match error {
+            LocalCommandError::Io(error) => PolicyError::Io(error),
+            LocalCommandError::Limit | LocalCommandError::Timeout => PolicyError::Git,
+        }
+    })
+}
+
 fn policy_entry(repo: &Path, commit: &str, path: &str) -> Result<(String, String), PolicyError> {
-    let output = git(repo)
-        .args([
-            "--literal-pathspecs",
-            "ls-tree",
-            "-z",
-            "--full-tree",
-            commit,
-            "--",
-            path,
-        ])
-        .output()?;
+    let mut command = git(repo);
+    command.args([
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        commit,
+        "--",
+        path,
+    ]);
+    let output = policy_git(command, 4096)?;
     if !output.status.success() {
         return Err(PolicyError::Git);
     }
@@ -1099,7 +1081,10 @@ fn fetch_inputs(
 
 #[cfg(all(test, unix))]
 mod build_process_tests {
-    use super::{IntegrationError, LocalCommandError, bounded_local_command, build_command};
+    use super::{
+        IntegrationError, LocalCommandError, PolicyError, StageError, StagingWorkflowError,
+        bounded_git, bounded_local_command, build_command, policy_git, run_git,
+    };
     use std::{process::Command, time::Duration};
 
     #[test]
@@ -1127,6 +1112,21 @@ mod build_process_tests {
             build_command(excessive, None, "merging trees"),
             Err(IntegrationError::OutputLimit("merging trees"))
         ));
+    }
+
+    #[test]
+    fn inspection_and_transport_limits_fail_closed_without_claiming_conflict() {
+        let noisy = || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "yes x"]);
+            command
+        };
+        assert!(matches!(
+            bounded_git(noisy(), 64),
+            Err(StagingWorkflowError::Tree)
+        ));
+        assert!(matches!(policy_git(noisy(), 64), Err(PolicyError::Git)));
+        assert!(matches!(run_git(noisy(), true), Err(StageError::Uncertain)));
     }
 
     #[test]
