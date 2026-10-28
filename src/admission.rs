@@ -72,7 +72,6 @@ pub fn evaluate(snapshot: &PullSnapshot, policy: &Policy) -> Result<EligibleForC
             "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" | "COMMENTED" => {}
             _ => return Err(AdmissionError::Invalid),
         }
-        let user = review.user.as_ref().ok_or(AdmissionError::Invalid)?;
         let timestamp = review
             .submitted_at
             .as_ref()
@@ -80,10 +79,17 @@ pub fn evaluate(snapshot: &PullSnapshot, policy: &Policy) -> Result<EligibleForC
         let submitted =
             time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
                 .map_err(|_| AdmissionError::Invalid)?;
-        if user.id == 0 || last_time.is_some_and(|old| submitted < old) {
+        if last_time.is_some_and(|old| submitted < old) {
             return Err(AdmissionError::Invalid);
         }
         last_time = Some(submitted);
+        if review.state == "COMMENTED" {
+            continue;
+        }
+        let user = review.user.as_ref().ok_or(AdmissionError::Invalid)?;
+        if user.id == 0 {
+            return Err(AdmissionError::Invalid);
+        }
         if !policy.authorized_reviewers.contains(&user.id)
             || user.id == pull.user.id
             || user.kind != "User"
@@ -97,7 +103,6 @@ pub fn evaluate(snapshot: &PullSnapshot, policy: &Policy) -> Result<EligibleForC
                     (review.state.as_str(), review.commit_id.as_deref()),
                 );
             }
-            "COMMENTED" => {}
             _ => unreachable!(),
         }
     }

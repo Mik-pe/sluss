@@ -643,6 +643,11 @@ impl App {
         let first = self.observe_pull(token, owner, repository, number).await?;
         let mut reviewers = BTreeMap::new();
         for review in &first.reviews {
+            match review.state.as_str() {
+                "PENDING" | "COMMENTED" => continue,
+                "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" => {}
+                _ => return Err(GitHubError::UnstableObservation),
+            }
             let user = review
                 .user
                 .as_ref()

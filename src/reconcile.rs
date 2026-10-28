@@ -45,9 +45,16 @@ pub(crate) fn admission_digest(
     observed: &crate::github::AuthorizedPullObservation,
 ) -> Result<String, ReconcileError> {
     use sha2::Digest;
+    let decisions: Vec<_> = observed
+        .snapshot
+        .reviews
+        .iter()
+        .filter(|review| !matches!(review.state.as_str(), "PENDING" | "COMMENTED"))
+        .collect();
     let input = serde_json::to_vec(&(
-        "sluss-admission-v1",
-        &observed.snapshot,
+        "sluss-admission-v2",
+        &observed.snapshot.pull,
+        decisions,
         &observed.authorized_reviewers,
         &observed.reviewer_permissions,
     ))

@@ -126,6 +126,33 @@ fn decisions_are_per_reviewer_and_comments_do_not_cancel_approvals() {
     ));
     assert_eq!(evaluate(&s, &p), Err(AdmissionError::InsufficientReviews));
 }
+
+#[test]
+fn deleted_commenter_or_pending_review_does_not_erase_an_approval() {
+    let mut s = snapshot();
+    s.reviews.push(review(
+        1,
+        user(2, "User"),
+        "APPROVED",
+        Some(&"a".repeat(40)),
+    ));
+    let mut comment = review(2, user(3, "User"), "COMMENTED", None);
+    comment.user = None;
+    s.reviews.push(comment);
+    s.reviews.push(ReviewObservation {
+        id: 3,
+        user: None,
+        state: "PENDING".into(),
+        commit_id: None,
+        submitted_at: None,
+    });
+    assert_eq!(
+        evaluate(&s, &policy()).unwrap().reviewers,
+        BTreeSet::from([2])
+    );
+    s.reviews[1].state = "CHANGES_REQUESTED".into();
+    assert_eq!(evaluate(&s, &policy()), Err(AdmissionError::Invalid));
+}
 #[test]
 fn blocks_drafts_wrong_targets_closed_prs_and_blocking_labels() {
     let p = policy();

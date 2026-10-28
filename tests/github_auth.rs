@@ -96,7 +96,7 @@ async fn reviews(
     };
     let mut items: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"user":{"id":9,"login":"reviewer","type":"User"},"state":"APPROVED","commit_id":"a".repeat(40),"submitted_at":"2026-01-01T00:00:00Z"})).collect();
     if matches!(state.mode.load(Ordering::SeqCst), 24 | 26) {
-        items.push(json!({"id":2,"user":{"id":9,"login":"reviewer","type":"User"},"state":"COMMENTED","commit_id":"a".repeat(40),"submitted_at":"2026-01-02T00:00:00Z"}));
+        items.push(json!({"id":2,"user":if state.mode.load(Ordering::SeqCst) == 24 { Value::Null } else {json!({"id":9,"login":"reviewer","type":"User"})},"state":"COMMENTED","commit_id":"a".repeat(40),"submitted_at":"2026-01-02T00:00:00Z"}));
     }
     Json(json!(items))
 }
@@ -1004,6 +1004,15 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         authorized_reviewers: authorized.authorized_reviewers,
     };
     assert!(sluss::admission::evaluate(&authorized.snapshot, &policy).is_ok());
+    mode.store(24, Ordering::SeqCst);
+    permissions.store(0, Ordering::SeqCst);
+    let commented = client
+        .observe_authorized_pull(&token, "owner", "repo", 19)
+        .await
+        .unwrap();
+    assert!(sluss::admission::evaluate(&commented.snapshot, &policy).is_ok());
+    assert_eq!(permissions.load(Ordering::SeqCst), 2);
+    mode.store(0, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
     let mut inbox = sluss::webhook::Inbox::open(&path).unwrap();
@@ -1126,10 +1135,10 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .await
         .unwrap();
     assert_eq!(store.candidates().unwrap()[0].head_sha, "a".repeat(40));
-    assert!(matches!(
+    assert_eq!(
         store.batch(&frozen.id).unwrap().unwrap().0.state,
-        sluss::batch::State::Invalidated { .. }
-    ));
+        sluss::batch::State::Planned
+    );
     mode.store(0, Ordering::SeqCst);
     inbox
         .record("reconcile-2", "pull_request", &[2; 32], 42, 7)
