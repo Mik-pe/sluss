@@ -1613,6 +1613,58 @@ fn valid_transition(previous: &State, next: &State) -> bool {
     }
 }
 
+/// A signed provider security-change hint invalidates all active evidence in
+/// this single-repository database before its wakeup can be acknowledged.
+pub(crate) fn invalidate_security_event(
+    tx: &Transaction<'_>,
+    installation: i64,
+    repository: i64,
+) -> Result<(), StoreError> {
+    let has_binding: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='repository_binding')", [], |r| r.get(0))?;
+    if !has_binding {
+        return Ok(());
+    }
+    let scope: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT installation,repository FROM repository_binding WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if scope != Some((installation, repository)) {
+        return Ok(());
+    }
+    let rows = {
+        let mut stmt = tx.prepare("SELECT id,body FROM batches")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, body) in rows {
+        let mut batch: Batch = serde_json::from_str(&body)?;
+        if batch
+            .invalidate("provider security policy or permissions changed".into())
+            .is_ok()
+        {
+            tx.execute(
+                "UPDATE batches SET version=version+1,body=?1 WHERE id=?2",
+                params![serde_json::to_string(&batch)?, id],
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE split_tasks SET state='stale' WHERE state='pending'",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE ci_investigations SET state='stale' WHERE state!='stale'",
+        [],
+    )?;
+    tx.execute("DELETE FROM ci_candidate_completions", [])?;
+    tx.execute("DELETE FROM failed_singletons", [])?;
+    tx.execute("DELETE FROM ci_capacity_waits WHERE ended_ms IS NULL", [])?;
+    Ok(())
+}
+
 /// Run in the same write transaction as the observation so a stale worker's
 /// optimistic update cannot restore a batch invalidated by a newer head.
 fn invalidate_batches(

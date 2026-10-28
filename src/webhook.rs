@@ -69,7 +69,7 @@ struct Entity {
 #[derive(Deserialize)]
 struct Envelope {
     installation: Entity,
-    repository: Entity,
+    repository: Option<Entity>,
 }
 
 async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> StatusCode {
@@ -102,18 +102,49 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
             | "push"
             | "repository"
             | "repository_ruleset"
+            | "branch_protection_rule"
+            | "installation"
+            | "installation_repositories"
+            | "member"
+            | "membership"
+            | "organization"
+            | "team"
+            | "team_add"
     ) {
         return StatusCode::ACCEPTED;
     }
     let Ok(envelope) = serde_json::from_slice::<Envelope>(&body) else {
         return StatusCode::BAD_REQUEST;
     };
-    if envelope.installation.id <= 0 || envelope.repository.id <= 0 {
+    if envelope.installation.id <= 0
+        || envelope
+            .repository
+            .as_ref()
+            .is_some_and(|repo| repo.id <= 0)
+    {
         return StatusCode::BAD_REQUEST;
     }
+    let installation_wide = matches!(
+        event,
+        "installation" | "installation_repositories" | "membership" | "organization" | "team"
+    );
+    let organization_rules = event == "repository_ruleset" && envelope.repository.is_none();
+    let repository = if installation_wide || organization_rules {
+        let Some((configured_installation, configured_repository)) = state.scope else {
+            return StatusCode::BAD_REQUEST;
+        };
+        if configured_installation != envelope.installation.id {
+            return StatusCode::ACCEPTED;
+        }
+        configured_repository
+    } else if let Some(repo) = envelope.repository {
+        repo.id
+    } else {
+        return StatusCode::BAD_REQUEST;
+    };
     if state
         .scope
-        .is_some_and(|scope| scope != (envelope.installation.id, envelope.repository.id))
+        .is_some_and(|scope| scope != (envelope.installation.id, repository))
     {
         return StatusCode::ACCEPTED;
     }
@@ -127,7 +158,7 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
             &event,
             &digest,
             envelope.installation.id,
-            envelope.repository.id,
+            repository,
         )
     })
     .await
@@ -143,6 +174,30 @@ pub enum Record {
     New,
     Duplicate,
     Collision,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InboxError {
+    #[error(transparent)]
+    Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
+}
+
+fn security_event(event: &str) -> bool {
+    matches!(
+        event,
+        "repository"
+            | "repository_ruleset"
+            | "branch_protection_rule"
+            | "installation"
+            | "installation_repositories"
+            | "member"
+            | "membership"
+            | "organization"
+            | "team"
+            | "team_add"
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -182,7 +237,7 @@ impl Inbox {
         digest: &[u8; 32],
         installation: i64,
         repository: i64,
-    ) -> rusqlite::Result<Record> {
+    ) -> Result<Record, InboxError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -210,6 +265,9 @@ impl Inbox {
             ON CONFLICT(installation, repository) DO UPDATE SET revision=excluded.revision",
             params![installation, repository, revision],
         )?;
+        if security_event(event) {
+            crate::store::invalidate_security_event(&tx, installation, repository)?;
+        }
         tx.commit()?;
         Ok(Record::New)
     }
