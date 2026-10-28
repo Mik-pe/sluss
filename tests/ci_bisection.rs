@@ -205,7 +205,7 @@ fn splits_only_after_an_independent_successful_sibling() {
             .ci_investigations()
             .unwrap()
             .iter()
-            .any(|(id, state)| id == &root.id && state == "investigating")
+            .any(|(id, state)| id == &root.id && state == "needs-review")
     );
     assert!(
         store
@@ -271,16 +271,13 @@ fn changed_sibling_inputs_prevent_deeper_isolation() {
             "main",
         )
         .unwrap();
-    let right = plan(&mut store, 3).unwrap();
-    assert_eq!(numbers(&right), [3, 4]);
-    finish(&mut store, &mut scheduler, &right, 3, "success");
     assert!(
         store
             .ci_investigations()
             .unwrap()
             .contains(&(root.id, "stale".into()))
     );
-    let new_work = plan(&mut store, 4).unwrap();
+    let new_work = plan(&mut store, 3).unwrap();
     assert_eq!(numbers(&new_work), [1]);
 }
 
@@ -315,4 +312,197 @@ fn different_suite_sets_are_inconclusive() {
             .contains(&(root.id, "inconclusive".into()))
     );
     assert!(store.failed_candidates().unwrap().is_empty());
+}
+
+#[test]
+fn changed_inputs_atomically_invalidate_planned_siblings_and_survive_restart() {
+    let (dir, mut store, mut inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = store
+        .plan_batch("batch-0000000000000002", &"a".repeat(40), 4, 2)
+        .unwrap()
+        .unwrap();
+    let right = store
+        .plan_batch("batch-0000000000000003", &"a".repeat(40), 4, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(numbers(&left), [1, 2]);
+    assert_eq!(numbers(&right), [3, 4]);
+    inbox
+        .record("changed", "pull_request", &[3; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates: Vec<_> = store
+        .candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| AdmissionCandidate {
+            evidence_digest: format!("{:064x}", candidate.number),
+            candidate,
+        })
+        .collect();
+    candidates[0].candidate.head_sha = "e".repeat(40);
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &candidates,
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(dir.path().join("queue.sqlite")).unwrap();
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "stale".into()))
+    );
+    for batch in [left, right] {
+        assert!(matches!(
+            store.batch(&batch.id).unwrap().unwrap().0.state,
+            State::Invalidated { .. }
+        ));
+        assert!(matches!(
+            store.start_integration(&batch.id),
+            Err(StoreError::StaleBatch | StoreError::InvalidBatch)
+        ));
+    }
+    assert_eq!(numbers(&plan(&mut store, 4).unwrap()), [1]);
+}
+
+#[test]
+fn integration_conflict_stops_ci_comparison_but_keeps_conflict_bisection() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    store.start_integration(&left.id).unwrap();
+    store.fail_integration(&left.id, "merge conflict").unwrap();
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id.clone(), "inconclusive".into()))
+    );
+    let first = plan(&mut store, 3).unwrap();
+    assert_eq!(numbers(&first), [1]);
+    finish(&mut store, &mut scheduler, &first, 3, "failure");
+    let second = plan(&mut store, 4).unwrap();
+    assert_eq!(numbers(&second), [2]);
+    finish(&mut store, &mut scheduler, &second, 4, "success");
+    assert!(plan(&mut store, 5).is_none());
+    assert_eq!(
+        store.ci_investigations().unwrap(),
+        vec![(root.id, "inconclusive".into())]
+    );
+    assert!(store.failed_candidates().unwrap().is_empty());
+}
+
+#[test]
+fn changed_successful_sibling_invalidates_nested_investigation() {
+    let (_dir, mut store, mut inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    finish(&mut store, &mut scheduler, &left, 2, "failure");
+    let right = plan(&mut store, 3).unwrap();
+    finish(&mut store, &mut scheduler, &right, 3, "success");
+    let nested = plan(&mut store, 4).unwrap();
+    assert_eq!(numbers(&nested), [1]);
+    inbox
+        .record("review-change", "pull_request_review", &[4; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates: Vec<_> = store
+        .candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| AdmissionCandidate {
+            evidence_digest: format!("{:064x}", candidate.number),
+            candidate,
+        })
+        .collect();
+    candidates[3].evidence_digest = "9".repeat(64);
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &candidates,
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    let investigations = store.ci_investigations().unwrap();
+    assert!(investigations.contains(&(root.id, "stale".into())));
+    assert!(investigations.contains(&(left.id, "stale".into())));
+    assert!(matches!(
+        store.batch(&nested.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert_eq!(numbers(&plan(&mut store, 5).unwrap()), [4]);
+}
+
+#[test]
+fn nested_inconclusive_result_finishes_the_root_investigation() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    finish(&mut store, &mut scheduler, &left, 2, "failure");
+    let right = plan(&mut store, 3).unwrap();
+    finish(&mut store, &mut scheduler, &right, 3, "success");
+    let first = plan(&mut store, 4).unwrap();
+    finish(&mut store, &mut scheduler, &first, 4, "failure");
+    let second = plan(&mut store, 5).unwrap();
+    finish(&mut store, &mut scheduler, &second, 5, "failure");
+    let investigations = store.ci_investigations().unwrap();
+    assert!(investigations.contains(&(root.id, "inconclusive".into())));
+    assert!(investigations.contains(&(left.id, "inconclusive".into())));
+    assert!(plan(&mut store, 6).is_none());
+}
+
+#[test]
+fn target_change_invalidates_ci_investigation_and_planned_child() {
+    let (_dir, mut store, mut inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let child = plan(&mut store, 2).unwrap();
+    inbox.record("target", "push", &[5; 32], 1, 2).unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates: Vec<_> = store
+        .candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| AdmissionCandidate {
+            evidence_digest: format!("{:064x}", candidate.number),
+            candidate,
+        })
+        .collect();
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &candidates,
+            &"c".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "stale".into()))
+    );
+    assert!(matches!(
+        store.batch(&child.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    let next = store
+        .plan_batch("batch-0000000000000003", &"c".repeat(40), 4, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(numbers(&next), [1, 2, 3, 4]);
 }

@@ -374,7 +374,6 @@ impl Store {
                 )?;
                 tx.execute("DELETE FROM failed_singletons", [])?;
                 tx.execute("DELETE FROM ci_candidate_completions", [])?;
-                tx.execute("UPDATE ci_investigations SET state='stale' WHERE state IN ('pending','investigating')", [])?;
             }
             let old_target: Option<String> = tx
                 .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
@@ -458,6 +457,7 @@ impl Store {
             tx.execute("INSERT INTO candidates(number,head_sha,sequence) VALUES(?1,?2,(SELECT COALESCE(MAX(sequence),0)+1 FROM candidates)) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,sequence=excluded.sequence WHERE candidates.head_sha!=excluded.head_sha",params![candidate.number as i64,candidate.head_sha])?;
             invalidate_batches(&tx, candidate.number, Some(&candidate.head_sha))?;
         }
+        invalidate_stale_ci_investigations(&tx)?;
         tx.execute(
             "DELETE FROM reconciliations WHERE installation=?1 AND repository=?2 AND revision=?3",
             params![job.installation, job.repository, job.revision],
@@ -1217,6 +1217,29 @@ impl Store {
             "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
             params![serde_json::to_string(&batch)?, id, version],
         )?;
+        // A subgroup that cannot be integrated has no comparable CI result.
+        // Keep its separate integration-conflict bisection, but stop the CI
+        // experiment and its unstarted sibling work.
+        let parent: Option<String> = tx
+            .query_row(
+                "SELECT parent_id FROM split_tasks WHERE child_id=?1 AND state='planned'",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(parent) = parent {
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ci_investigations WHERE batch_id=?1 AND state='pending')",
+                [&parent], |r| r.get(0),
+            )?;
+            if pending {
+                finish_ci_investigation(&tx, &parent, "inconclusive")?;
+                tx.execute(
+                    "UPDATE split_tasks SET state='stale' WHERE parent_id=?1 AND state='pending'",
+                    [&parent],
+                )?;
+            }
+        }
         enqueue_bisection(&tx, &batch)?;
         tx.commit()?;
         Ok(batch)
@@ -1433,6 +1456,96 @@ fn invalidate_batches(
                 "UPDATE batches SET version=version+1, body=?1 WHERE id=?2",
                 params![serde_json::to_string(&batch)?, id],
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// Propagate a terminal outcome to any still-active ancestor investigation.
+pub(crate) fn finish_ci_investigation(
+    tx: &Transaction<'_>,
+    id: &str,
+    outcome: &str,
+) -> Result<(), StoreError> {
+    if !matches!(outcome, "needs-review" | "inconclusive") {
+        return Err(StoreError::InvalidBatch);
+    }
+    tx.execute(
+        "WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM split_tasks t JOIN ancestors a ON t.child_id=a.id WHERE t.state='planned') UPDATE ci_investigations SET state=?2 WHERE batch_id IN (SELECT id FROM ancestors) AND state IN ('pending','investigating')",
+        params![id, outcome],
+    )?;
+    Ok(())
+}
+
+/// Invalidate a CI experiment and all of its descendants in the same
+/// transaction as the admission snapshot. Terminal batch records remain as
+/// historical observations; active descendant work cannot be revived.
+fn invalidate_stale_ci_investigations(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let base: Option<String> = tx
+        .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+        .optional()?;
+    let investigations: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT i.batch_id,b.body FROM ci_investigations i JOIN batches b ON b.id=i.batch_id WHERE i.state!='stale'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut stale = std::collections::BTreeSet::new();
+    for (id, body) in investigations {
+        let batch: Batch = serde_json::from_str(&body)?;
+        let mut changed = base.as_deref() != Some(batch.base_sha.as_str());
+        for candidate in &batch.candidates {
+            let current: Option<(String, String)> = tx.query_row(
+                "SELECT c.head_sha,e.digest FROM candidates c JOIN candidate_evidence e ON e.number=c.number WHERE c.number=?1",
+                [i64::try_from(candidate.number).map_err(|_| StoreError::InvalidCandidate)?],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            let frozen: Option<String> = tx
+                .query_row(
+                    "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                    params![id, candidate.number as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if current.as_ref().map(|(head, _)| head.as_str()) != Some(candidate.head_sha.as_str())
+                || current.as_ref().map(|(_, digest)| digest) != frozen.as_ref()
+                || frozen.is_none()
+            {
+                changed = true;
+            }
+        }
+        if changed {
+            let mut stmt = tx.prepare(
+                "WITH RECURSIVE descendants(id) AS (SELECT ?1 UNION SELECT t.child_id FROM split_tasks t JOIN descendants d ON t.parent_id=d.id WHERE t.child_id IS NOT NULL) SELECT id FROM descendants",
+            )?;
+            let rows = stmt.query_map([&id], |r| r.get::<_, String>(0))?;
+            stale.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+    }
+    for id in stale {
+        tx.execute(
+            "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
+            [&id],
+        )?;
+        tx.execute(
+            "UPDATE split_tasks SET state='stale' WHERE parent_id=?1 AND state='pending'",
+            [&id],
+        )?;
+        let body: Option<String> = tx
+            .query_row("SELECT body FROM batches WHERE id=?1", [&id], |r| r.get(0))
+            .optional()?;
+        if let Some(body) = body {
+            let mut batch: Batch = serde_json::from_str(&body)?;
+            if batch
+                .invalidate("CI investigation inputs changed".into())
+                .is_ok()
+            {
+                tx.execute(
+                    "UPDATE batches SET body=?1,version=version+1 WHERE id=?2",
+                    params![serde_json::to_string(&batch)?, id],
+                )?;
+            }
         }
     }
     Ok(())

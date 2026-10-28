@@ -1345,7 +1345,7 @@ fn investigate_ci_batch(
             && plans[0].suites == plans[1].suites
             && plans[0].selection_policy_digest == plans[1].selection_policy_digest;
         if !comparable {
-            tx.execute("INSERT INTO ci_investigations(batch_id,state) VALUES(?1,'inconclusive') ON CONFLICT(batch_id) DO UPDATE SET state=excluded.state", [&parent])?;
+            crate::store::finish_ci_investigation(tx, &parent, "inconclusive")?;
             return Ok(());
         }
         let failure = match (observed[0].1.as_str(), observed[1].1.as_str()) {
@@ -1358,7 +1358,11 @@ fn investigate_ci_batch(
             Some(_) => "investigating",
             None => "inconclusive",
         };
-        tx.execute("INSERT INTO ci_investigations(batch_id,state) VALUES(?1,?2) ON CONFLICT(batch_id) DO UPDATE SET state=excluded.state", params![parent,state])?;
+        if state == "investigating" {
+            tx.execute("UPDATE ci_investigations SET state='investigating' WHERE batch_id=?1 AND state='pending'", [&parent])?;
+        } else {
+            crate::store::finish_ci_investigation(tx, &parent, state)?;
+        }
         if let Some(failed) = failure.filter(|failed| failed.candidates.len() > 1) {
             crate::store::enqueue_bisection(tx, failed)?;
             tx.execute(
