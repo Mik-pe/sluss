@@ -2064,7 +2064,7 @@ impl Scheduler {
             |r| r.get(0),
         )?;
         let candidate: Option<(i64, String)> = tx.query_row(
-            "SELECT d.rowid,d.id FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id AND x.batch_id=d.id JOIN batches b ON b.id=x.batch_id JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id WHERE d.rowid>?1 AND d.state IN ('observed','finished') AND s.source='direct' AND d.run_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts c WHERE c.id=d.id) AND json_extract(d.plan,'$.installation_id')=?2 AND json_extract(d.plan,'$.repository_id')=?3 AND EXISTS(SELECT 1 FROM ci_job_metrics m WHERE m.repository_id=CAST(?3 AS TEXT) AND json_valid(m.body) AND json_extract(m.body,'$.batch_id')=d.id AND json_extract(m.body,'$.attempt')=1) ORDER BY d.rowid LIMIT 1",
+            "SELECT d.rowid,d.id FROM dispatch_intents d JOIN dispatch_batches x ON x.id=d.id JOIN batches b ON b.id=x.batch_id JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id WHERE d.rowid>?1 AND d.state IN ('observed','finished') AND s.source='direct' AND d.run_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts c WHERE c.id=d.id) AND json_extract(d.plan,'$.installation_id')=?2 AND json_extract(d.plan,'$.repository_id')=?3 AND EXISTS(SELECT 1 FROM ci_job_metrics m WHERE m.repository_id=CAST(?3 AS TEXT) AND json_valid(m.body) AND json_extract(m.body,'$.batch_id')=d.id AND json_extract(m.body,'$.attempt')=1) ORDER BY d.rowid LIMIT 1",
             params![after,installation,repository], |r| Ok((r.get(0)?,r.get(1)?))
         ).optional()?;
         let Some((rowid, id)) = candidate else {
@@ -2558,6 +2558,33 @@ fn direct_metric_identity(
         return Err(SchedulerError::DispatchReceiptConflict);
     }
     let plan: DispatchPlan = serde_json::from_str(&body)?;
+    let batch_id: Option<String> = conn
+        .query_row(
+            "SELECT batch_id FROM dispatch_batches WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(batch_id) = batch_id.filter(|batch_id| batch_id != id) {
+        let name = id
+            .strip_prefix(&format!("{batch_id}:lane:"))
+            .ok_or(SchedulerError::Corrupt)?;
+        let (body, capacity): (String, String) = conn.query_row(
+            "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+            [&batch_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let frozen: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+        let capacity: Capacity = serde_json::from_str(&capacity)?;
+        if !frozen.validate(&capacity)
+            || frozen.batch.staging_ref != format!("refs/heads/sluss/{batch_id}")
+            || frozen
+                .dispatch(name)
+                .is_none_or(|(expected, _)| expected != plan)
+        {
+            return Err(SchedulerError::Corrupt);
+        }
+    }
     let run = run
         .and_then(|s| {
             s.parse::<u64>()
@@ -4391,5 +4418,125 @@ mod rerun_scan_tests {
         assert_eq!(Scheduler::rerun_scan_issues(&db).unwrap()[0].occurrences, 2);
         assert!(scheduler.advance_rerun_scan(&next, 2).unwrap());
         assert!(Scheduler::rerun_scan_issues(&db).unwrap().is_empty());
+
+        // A released lane has a dispatch ID distinct from its batch ID; it
+        // must participate in the same bounded, restart-safe scan.
+        let batch_id = "batch-0000000000000007";
+        let lane_id = format!("{batch_id}:lane:full");
+        let mut batch = Batch::new(
+            batch_id.into(),
+            "b".repeat(40),
+            vec![Candidate {
+                number: 7,
+                head_sha: "c".repeat(40),
+            }],
+        )
+        .unwrap();
+        batch.state = State::CiCompleteLanes {
+            integration_sha: "a".repeat(40),
+            lanes: [(
+                "full".into(),
+                crate::batch::LaneResult {
+                    run_id: 7,
+                    conclusion: "success".into(),
+                },
+            )]
+            .into(),
+            conclusion: "success".into(),
+        };
+        let plan = DispatchPlan {
+            installation_id: 1,
+            repository_id: 2,
+            workflow_id: 3,
+            integration_sha: "a".repeat(40),
+            staging_ref: format!("refs/heads/sluss/{batch_id}"),
+            policy_digest: "d".repeat(64),
+            required_jobs: ["test".into()].into(),
+            suites: ["full".into()].into(),
+            selection_policy_digest: None,
+        };
+        let frozen = crate::lanes::LanePlan {
+            batch: plan.clone(),
+            lanes: [(
+                "full".into(),
+                crate::lanes::Lane {
+                    workflow_id: 3,
+                    suites: ["full".into()].into(),
+                    required_jobs: ["test".into()].into(),
+                    request: super::Request {
+                        pools: [("rust".into(), 1)].into(),
+                    },
+                },
+            )]
+            .into(),
+        };
+        let metric = JobMeasurement {
+            repository_id: 2,
+            job_id: 7,
+            run_id: 7,
+            attempt: 1,
+            batch_id: lane_id.clone(),
+            head_sha: "a".repeat(40),
+            name: "test".into(),
+            host: "host".into(),
+            runner_id: 41,
+            started_ms: 100,
+            completed_ms: 200,
+            conclusion: "success".into(),
+        };
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO batches(id,version,body) VALUES(?1,0,?2)",
+            rusqlite::params![batch_id, serde_json::to_string(&batch).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lane_batch_plans(batch_id,body,capacity) VALUES(?1,?2,?3)",
+            rusqlite::params![
+                batch_id,
+                serde_json::to_string(&frozen).unwrap(),
+                serde_json::to_string(&scheduler.capacity).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES(?1,?2,'finished','7')",
+            rusqlite::params![lane_id, serde_json::to_string(&plan).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dispatch_batches(id,batch_id) VALUES(?1,?2)",
+            rusqlite::params![lane_id, batch_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dispatch_receipt_sources(id,source) VALUES(?1,'direct')",
+            [&lane_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dispatch_workflows(id,path) VALUES(?1,'.github/workflows/ci.yml')",
+            [&lane_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_job_metrics(repository_id,job_id,body) VALUES('2','7',?1)",
+            [serde_json::to_string(&metric).unwrap()],
+        )
+        .unwrap();
+        for n in 2..=5 {
+            assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().run, n);
+        }
+        let claim = scheduler.next_rerun_scan().unwrap().unwrap();
+        assert_eq!((claim.id.as_str(), claim.run), (lane_id.as_str(), 7));
+        assert!(scheduler.advance_rerun_scan(&claim, 2).unwrap());
+        let mut forged = frozen;
+        forged.lanes.get_mut("full").unwrap().workflow_id = 99;
+        conn.execute(
+            "UPDATE lane_batch_plans SET body=?1 WHERE batch_id=?2",
+            rusqlite::params![serde_json::to_string(&forged).unwrap(), batch_id],
+        )
+        .unwrap();
+        assert!(scheduler.rerun_metric_scope(&lane_id).is_err());
     }
 }

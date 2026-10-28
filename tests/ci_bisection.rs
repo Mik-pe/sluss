@@ -312,14 +312,20 @@ fn lane_completion_scenario(second_conclusion: &str, expected_conclusion: &str) 
             name: "compile-job".into(),
             status: "completed".into(),
             conclusion: Some("success".into()),
-            started_at: None,
-            completed_at: None,
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            completed_at: Some("2026-01-01T00:01:00Z".into()),
             runner_id: Some(7),
         }],
     };
     scheduler
         .record_ci_observation(&first.id, &first_snapshot)
         .unwrap();
+    assert_eq!(
+        scheduler
+            .record_job_metrics(&first.id, &first_snapshot)
+            .unwrap(),
+        1
+    );
     assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
     scheduler.release_completed_lane(&first.id, 90).unwrap();
     drop(scheduler);
@@ -339,6 +345,18 @@ fn lane_completion_scenario(second_conclusion: &str, expected_conclusion: &str) 
         },
     )
     .unwrap();
+    let mut rerun = first_snapshot.clone();
+    rerun.run.run_attempt = 2;
+    rerun.jobs[0].id = 290;
+    assert_eq!(scheduler.rerun_metric_scope(&first.id).unwrap(), (1, 2, 90));
+    assert_eq!(
+        scheduler.record_rerun_metrics(&first.id, &rerun).unwrap(),
+        1
+    );
+    assert_eq!(
+        scheduler.record_rerun_metrics(&first.id, &rerun).unwrap(),
+        0
+    );
     assert!(!scheduler.complete_lanes_ci_only(&batch.id).unwrap());
     let second = scheduler
         .reserve_lane_dispatch_on(&batch.id, "test", &eligible)

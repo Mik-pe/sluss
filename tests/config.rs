@@ -99,14 +99,14 @@ fn lane_worker_rejects_incomplete_or_unsupported_configuration_before_startup() 
     assert!(!incomplete.status.success());
     assert!(String::from_utf8_lossy(&incomplete.stderr).contains("requires --complete-ci-only"));
     assert!(!db.exists());
-    let reruns = run(&[
+    let bisection = run(&[
         "--observe-dispatches",
         "--complete-ci-only",
         "--release-ci-only",
-        "--observe-reruns",
+        "--bisect-ci-failures",
     ]);
-    assert!(!reruns.status.success());
-    assert!(String::from_utf8_lossy(&reruns.stderr).contains("rerun collection"));
+    assert!(!bisection.status.success());
+    assert!(String::from_utf8_lossy(&bisection.stderr).contains("lane bisection"));
     assert!(!db.exists());
 }
 
