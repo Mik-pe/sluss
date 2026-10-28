@@ -882,6 +882,13 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    Resolved,
+    AlreadyResolved,
+    Waiting,
+}
+
 #[derive(Debug, Error)]
 pub enum DispatchError {
     #[error("invalid dispatch request or scoped credential")]
@@ -1213,6 +1220,136 @@ impl App {
         }
         scheduler.observe_dispatch(id, run_id)?;
         Ok(snapshot)
+    }
+
+    /// Release only the physical capacity bound to a conflicted receipt after
+    /// two stable provider observations and an idle runner inventory. The
+    /// conflicting identities remain invalidated and cannot authorize a merge.
+    pub async fn resolve_dispatch_conflict(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        read: &InstallationToken,
+        inventory: &InstallationToken,
+        repository: (&str, &str),
+        id: &str,
+        capacity: &crate::scheduler::Capacity,
+    ) -> Result<ConflictResolution, DispatchError> {
+        let (owner, repository) = repository;
+        use crate::{
+            scheduler::{ConflictReleaseEvidence, DispatchState},
+            verification::Placement,
+        };
+        if !valid_name(owner)
+            || !valid_name(repository)
+            || !read.checks_read
+            || !inventory.runner_inventory_read
+            || read.repository_id != inventory.repository_id
+            || read.installation_id != inventory.installation_id
+            || read.app_client_id != self.client_id
+            || inventory.app_client_id != self.client_id
+            || read.api_origin != self.api.as_str()
+            || inventory.api_origin != self.api.as_str()
+        {
+            return Err(DispatchError::Invalid);
+        }
+        crate::verification::check_release_topology(capacity)
+            .map_err(|_| DispatchError::Invalid)?;
+        if scheduler.conflict_release_recorded(id)? {
+            return Ok(ConflictResolution::AlreadyResolved);
+        }
+        let Some(pending) = scheduler
+            .pending_dispatches()?
+            .into_iter()
+            .find(|p| p.reservation.id == id)
+        else {
+            return if scheduler.conflict_release_recorded(id)? {
+                Ok(ConflictResolution::AlreadyResolved)
+            } else {
+                Err(DispatchError::Invalid)
+            };
+        };
+        let (recovered, direct) = scheduler
+            .receipt_conflict(id)?
+            .ok_or(DispatchError::Invalid)?;
+        if pending.plan.repository_id != read.repository_id
+            || pending.plan.installation_id != read.installation_id
+            || pending.state != (DispatchState::Observed { run_id: recovered })
+        {
+            return Err(DispatchError::Invalid);
+        }
+        for run_id in [recovered, direct] {
+            if let Err(error) = scheduler.conflicting_stale_run(id, run_id) {
+                if scheduler.conflict_release_recorded(id)? {
+                    return Ok(ConflictResolution::AlreadyResolved);
+                }
+                return Err(error.into());
+            }
+        }
+        let workflow = scheduler
+            .dispatch_workflow(id)?
+            .ok_or(DispatchError::Invalid)?;
+        let host = capacity
+            .hosts
+            .get(&pending.reservation.host)
+            .ok_or(DispatchError::Invalid)?;
+        let first_recovered = self
+            .verify_dispatch_run(read, owner, repository, &pending, recovered)
+            .await?;
+        let first_direct = self
+            .verify_dispatch_run(read, owner, repository, &pending, direct)
+            .await?;
+        for snapshot in [&first_recovered, &first_direct] {
+            if !workflow_path_matches(&workflow, &snapshot.run.path) {
+                return Err(DispatchError::RunMismatch);
+            }
+            if snapshot.run.status != "completed"
+                || snapshot.run.conclusion.as_deref().is_none_or(str::is_empty)
+                || snapshot.jobs.iter().any(|job| {
+                    job.status != "completed" || job.conclusion.as_deref().is_none_or(str::is_empty)
+                })
+            {
+                return Ok(ConflictResolution::Waiting);
+            }
+            let placement = crate::verification::check_host_placement(snapshot, &host.runner_ids)
+                .map_err(|_| DispatchError::RunMismatch)?;
+            if matches!(placement, Placement::Waiting)
+                && !snapshot
+                    .jobs
+                    .iter()
+                    .all(|job| job.conclusion.as_deref() == Some("skipped"))
+            {
+                return Err(DispatchError::RunMismatch);
+            }
+        }
+        let runners = self
+            .observe_repository_runners(inventory, owner, repository)
+            .await?;
+        crate::verification::check_repository_runner_inventory(capacity, &runners)
+            .map_err(|_| DispatchError::Invalid)?;
+        let last_recovered = self
+            .verify_dispatch_run(read, owner, repository, &pending, recovered)
+            .await?;
+        let last_direct = self
+            .verify_dispatch_run(read, owner, repository, &pending, direct)
+            .await?;
+        if first_recovered != last_recovered || first_direct != last_direct {
+            return Err(DispatchError::RunMismatch);
+        }
+        let evidence = ConflictReleaseEvidence {
+            id: id.into(),
+            plan: pending.plan.clone(),
+            host: pending.reservation.host.clone(),
+            capacity: capacity.clone(),
+            workflow,
+            recovered: last_recovered,
+            direct: last_direct,
+            runners,
+        };
+        if scheduler.release_conflicting_ci_only(&pending, &evidence)? {
+            Ok(ConflictResolution::Resolved)
+        } else {
+            Ok(ConflictResolution::AlreadyResolved)
+        }
     }
 
     async fn verify_dispatch_run(
@@ -2017,7 +2154,7 @@ pub fn valid_runner_label(label: &str) -> bool {
 
 /// Repository-level runners only; organization and enterprise runners require
 /// separate inventory and are not included by this GitHub endpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RepositoryRunner {
     pub id: u64,
     pub name: String,
@@ -2025,7 +2162,7 @@ pub struct RepositoryRunner {
     pub busy: bool,
     pub labels: Vec<RunnerLabel>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RunnerLabel {
     pub name: String,
 }

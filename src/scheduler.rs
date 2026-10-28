@@ -108,6 +108,9 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_conflicts (id TEXT PRIMARY KEY NOT NULL, recovered_run TEXT NOT NULL, direct_run TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_conflict_releases (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS dispatch_conflict_run_insert BEFORE INSERT ON dispatch_intents WHEN NEW.run_id IS NOT NULL AND EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id<>NEW.id AND (recovered_run=NEW.run_id OR direct_run=NEW.run_id)) BEGIN SELECT RAISE(ABORT, 'run belongs to another receipt conflict'); END;
+            CREATE TRIGGER IF NOT EXISTS dispatch_conflict_run_update BEFORE UPDATE OF run_id ON dispatch_intents WHEN NEW.run_id IS NOT NULL AND EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id<>NEW.id AND (recovered_run=NEW.run_id OR direct_run=NEW.run_id)) BEGIN SELECT RAISE(ABORT, 'run belongs to another receipt conflict'); END;
             CREATE TABLE IF NOT EXISTS dispatch_conflict_cancellations (id TEXT NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','accepted')), PRIMARY KEY(id,run_id));
             CREATE TABLE IF NOT EXISTS stale_cancellations (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL);")?;
         crate::metrics::ensure_schema(&conn)?;
@@ -2479,6 +2482,152 @@ impl Scheduler {
         finish_bounded_reservation(&tx, id, &self.encoded)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+/// Historical provider observations used only to release a bounded capacity
+/// reservation. They are neither an attestation nor proof of dispatch origin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ConflictReleaseEvidence {
+    pub id: String,
+    pub plan: DispatchPlan,
+    pub host: String,
+    pub capacity: Capacity,
+    pub workflow: String,
+    pub recovered: crate::github::ActionsSnapshot,
+    pub direct: crate::github::ActionsSnapshot,
+    pub runners: Vec<crate::github::RepositoryRunner>,
+}
+
+fn conflict_evidence_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"sluss-conflict-release-v1\0");
+    digest.update(body.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn read_conflict_release(conn: &Connection, id: &str) -> Result<bool, SchedulerError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT body,digest FROM dispatch_conflict_releases WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((body, digest)) = row else {
+        return Ok(false);
+    };
+    if body.len() > 8_000_000 || conflict_evidence_digest(&body) != digest {
+        return Err(SchedulerError::Corrupt);
+    }
+    let evidence: ConflictReleaseEvidence = serde_json::from_str(&body)?;
+    let row: Option<(String, String, String, String, String, String, String)> = conn.query_row(
+        "SELECT d.plan,d.state,d.run_id,s.source,c.recovered_run,c.direct_run,w.path FROM dispatch_intents d JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_receipt_conflicts c ON c.id=d.id JOIN dispatch_workflows w ON w.id=d.id WHERE d.id=?1", [id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+    ).optional()?;
+    let (plan, state, run, source, recovered, direct, workflow) =
+        row.ok_or(SchedulerError::Corrupt)?;
+    let (batch_body, topology): (String, String) = conn.query_row(
+        "SELECT b.body,t.body FROM dispatch_batches x JOIN batches b ON b.id=x.batch_id CROSS JOIN capacity_release_topology t WHERE x.id=?1 AND t.id=1", [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let batch: crate::batch::Batch = serde_json::from_str(&batch_body)?;
+    if batch.id != id
+        || !matches!(batch.state, crate::batch::State::Invalidated { .. })
+        || serde_json::from_str::<Capacity>(&topology)? != evidence.capacity
+    {
+        return Err(SchedulerError::Corrupt);
+    }
+    let finished: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM capacity_finished WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM capacity_reservations WHERE id=?1)", [id], |r| r.get(0))?;
+    if evidence.id != id
+        || serde_json::from_str::<DispatchPlan>(&plan)? != evidence.plan
+        || state != "finished"
+        || source != "conflict"
+        || run != recovered
+        || recovered != evidence.recovered.run.id.to_string()
+        || direct != evidence.direct.run.id.to_string()
+        || recovered == direct
+        || workflow != evidence.workflow
+        || !finished
+    {
+        return Err(SchedulerError::Corrupt);
+    }
+    Ok(true)
+}
+
+impl Scheduler {
+    /// Whether an immutable historical release record exists and agrees with
+    /// the terminal journal. Legacy missing reservations are not resolved.
+    pub fn conflict_release_recorded(&self, id: &str) -> Result<bool, SchedulerError> {
+        read_conflict_release(&self.conn, id)
+    }
+
+    pub(crate) fn release_conflicting_ci_only(
+        &mut self,
+        pending: &PendingDispatch,
+        evidence: &ConflictReleaseEvidence,
+    ) -> Result<bool, SchedulerError> {
+        crate::verification::check_release_topology(&self.capacity)
+            .map_err(|_| SchedulerError::Invalid)?;
+        crate::verification::check_repository_runner_inventory(&self.capacity, &evidence.runners)
+            .map_err(|_| SchedulerError::Invalid)?;
+        if evidence.capacity != self.capacity
+            || evidence.id != pending.reservation.id
+            || evidence.host != pending.reservation.host
+            || evidence.plan != pending.plan
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_conflict_release(&tx, &evidence.id)? {
+            return Ok(false);
+        }
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let recovered = evidence.recovered.run.id;
+        let direct = evidence.direct.run.id;
+        let stale = conflicting_stale_from_conn(&tx, &evidence.id, recovered)?;
+        conflicting_stale_from_conn(&tx, &evidence.id, direct)?;
+        let host: String = tx.query_row(
+            "SELECT host FROM capacity_reservations WHERE id=?1",
+            [&evidence.id],
+            |r| r.get(0),
+        )?;
+        let workflow: String = tx.query_row(
+            "SELECT path FROM dispatch_workflows WHERE id=?1",
+            [&evidence.id],
+            |r| r.get(0),
+        )?;
+        if stale.plan != evidence.plan || host != evidence.host || workflow != evidence.workflow {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let overlap: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_intents WHERE id<>?1 AND run_id IN (?2,?3)) OR EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id<>?1 AND (recovered_run IN (?2,?3) OR direct_run IN (?2,?3)))",
+            params![evidence.id, recovered.to_string(), direct.to_string()], |r| r.get(0),
+        )?;
+        if overlap {
+            return Err(SchedulerError::DispatchReceiptConflict);
+        }
+        let body = serde_json::to_string(evidence)?;
+        if body.len() > 8_000_000 {
+            return Err(SchedulerError::Invalid);
+        }
+        let digest = conflict_evidence_digest(&body);
+        finish_bounded_reservation(&tx, &evidence.id, &self.encoded)?;
+        tx.execute(
+            "INSERT INTO dispatch_conflict_releases(id,body,digest) VALUES(?1,?2,?3)",
+            params![evidence.id, body, digest],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 }
 

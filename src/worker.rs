@@ -591,6 +591,40 @@ pub async fn release_ci_only_once(
             .receipt_source(&pending.reservation.id)
             .map_err(|e| e.to_string())?
             .as_deref()
+            == Some("conflict")
+        {
+            if expected_conclusion.is_some() {
+                continue;
+            }
+            let read = app
+                .read_token(policy.installation as u64, policy.repository as u64)
+                .await
+                .map_err(|e| e.to_string())?;
+            let inventory = app
+                .runner_inventory_token(policy.installation as u64, policy.repository as u64)
+                .await
+                .map_err(|e| e.to_string())?;
+            if matches!(
+                app.resolve_dispatch_conflict(
+                    &mut scheduler,
+                    &read,
+                    &inventory,
+                    (&policy.owner, &policy.name),
+                    &pending.reservation.id,
+                    capacity
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                crate::github::ConflictResolution::Resolved
+            ) {
+                released += 1;
+            }
+            continue;
+        }
+        if scheduler
+            .receipt_source(&pending.reservation.id)
+            .map_err(|e| e.to_string())?
+            .as_deref()
             != Some("direct")
         {
             continue;

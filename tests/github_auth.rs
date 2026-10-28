@@ -126,6 +126,7 @@ async fn actions_jobs(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
+    uri: axum::extract::OriginalUri,
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     assert_eq!(query.get("per_page").map(String::as_str), Some("100"));
@@ -147,7 +148,7 @@ async fn actions_jobs(
     } else {
         1
     };
-    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
+    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
 async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
@@ -194,7 +195,11 @@ async fn dispatched_run(
     } else {
         1
     };
-    let workflow_id = if mode == 23 { 18 } else { 17 };
+    let workflow_id = if mode == 23 || (mode == 104 && path.0.path().contains("/runs/124")) {
+        18
+    } else {
+        17
+    };
     let workflow_path = if mode == 51 {
         ".github/workflows/other.yml@refs/heads/sluss/batch-0123456789abcdef"
     } else {
@@ -1239,6 +1244,14 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
             "/repos/owner/repo/actions/runs/123/attempts/1/jobs",
             get(actions_jobs),
         )
+        .route(
+            "/repos/owner/repo/actions/runs/124/attempts/1",
+            get(dispatched_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/124/attempts/1/jobs",
+            get(actions_jobs),
+        )
         .with_state(ServerState {
             public_key: Arc::new(public),
             mode: mode.clone(),
@@ -1683,6 +1696,14 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         )
         .route(
             "/repos/owner/repo/actions/runs/123/attempts/1/jobs",
+            get(actions_jobs),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/124/attempts/1",
+            get(dispatched_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/124/attempts/1/jobs",
             get(actions_jobs),
         )
         .with_state(ServerState {
@@ -2368,6 +2389,175 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     );
     assert!(restarted.release_invalidated_ci_only(id, 123).is_err());
     assert_eq!(restarted.pending_dispatches().unwrap().len(), 1);
+    let inventory_token = fixture_app.runner_inventory_token(42, 7).await.unwrap();
+    mode.store(31, Ordering::SeqCst);
+    assert!(matches!(
+        fixture_app
+            .resolve_dispatch_conflict(
+                &mut restarted,
+                &fixture_token,
+                &inventory_token,
+                ("owner", "repo"),
+                id,
+                &one_host
+            )
+            .await,
+        Ok(sluss::github::ConflictResolution::Waiting)
+    ));
+    for bad_mode in [21, 23, 41, 51, 104] {
+        mode.store(bad_mode, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        assert!(
+            fixture_app
+                .resolve_dispatch_conflict(
+                    &mut restarted,
+                    &fixture_token,
+                    &inventory_token,
+                    ("owner", "repo"),
+                    id,
+                    &one_host
+                )
+                .await
+                .is_err(),
+            "mode {bad_mode}"
+        );
+        assert_eq!(restarted.pending_dispatches().unwrap().len(), 1);
+    }
+    mode.store(0, Ordering::SeqCst);
+    let collision_db = rusqlite::Connection::open(&conflict_db).unwrap();
+    collision_db.execute("INSERT INTO dispatch_receipt_conflicts(id,recovered_run,direct_run) VALUES('other','124','999')", []).unwrap();
+    assert!(
+        fixture_app
+            .resolve_dispatch_conflict(
+                &mut restarted,
+                &fixture_token,
+                &inventory_token,
+                ("owner", "repo"),
+                id,
+                &one_host
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(restarted.pending_dispatches().unwrap().len(), 1);
+    collision_db
+        .execute(
+            "DELETE FROM dispatch_receipt_conflicts WHERE id='other'",
+            [],
+        )
+        .unwrap();
+    // A consistent copy simulates a restart with the opted-in release worker.
+    let cancelled_db = data.path().join("conflict-cancelled.sqlite");
+    collision_db
+        .execute("VACUUM INTO ?1", [cancelled_db.to_str().unwrap()])
+        .unwrap();
+    mode.store(43, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::release_ci_only_once(
+            &fixture_app,
+            &cancelled_db,
+            &one_host,
+            &fixture_policy
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let cancelled_scheduler =
+        sluss::scheduler::Scheduler::open(&cancelled_db, one_host.clone()).unwrap();
+    assert!(cancelled_scheduler.conflict_release_recorded(id).unwrap());
+    mode.store(0, Ordering::SeqCst);
+    let worker_db = data.path().join("conflict-worker.sqlite");
+    collision_db
+        .execute("VACUUM INTO ?1", [worker_db.to_str().unwrap()])
+        .unwrap();
+    assert_eq!(
+        sluss::worker::release_ci_only_once(&fixture_app, &worker_db, &one_host, &fixture_policy)
+            .await
+            .unwrap(),
+        1
+    );
+    let worker_scheduler = sluss::scheduler::Scheduler::open(&worker_db, one_host.clone()).unwrap();
+    assert!(worker_scheduler.conflict_release_recorded(id).unwrap());
+    assert!(worker_scheduler.pending_dispatches().unwrap().is_empty());
+    let mut competitor = sluss::scheduler::Scheduler::open(&conflict_db, one_host.clone()).unwrap();
+    let (a, b) = tokio::join!(
+        fixture_app.resolve_dispatch_conflict(
+            &mut restarted,
+            &fixture_token,
+            &inventory_token,
+            ("owner", "repo"),
+            id,
+            &one_host
+        ),
+        fixture_app.resolve_dispatch_conflict(
+            &mut competitor,
+            &fixture_token,
+            &inventory_token,
+            ("owner", "repo"),
+            id,
+            &one_host
+        )
+    );
+    assert!(
+        [&a, &b]
+            .iter()
+            .any(|r| matches!(r, Ok(sluss::github::ConflictResolution::Resolved))),
+        "{a:?} {b:?}"
+    );
+    assert!(
+        [&a, &b].iter().all(|r| matches!(
+            r,
+            Ok(sluss::github::ConflictResolution::Resolved
+                | sluss::github::ConflictResolution::AlreadyResolved)
+        )),
+        "{a:?} {b:?}"
+    );
+    assert!(restarted.pending_dispatches().unwrap().is_empty());
+    drop(restarted);
+    let restarted = sluss::scheduler::Scheduler::open(&conflict_db, one_host.clone()).unwrap();
+    assert!(restarted.conflict_release_recorded(id).unwrap());
+    assert_eq!(restarted.receipt_conflict(id).unwrap(), Some((123, 124)));
+    let report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&conflict_db)
+        .args(["dispatch-conflict", "--batch-id", id, "--capacity"])
+        .arg(&capacity)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&report.stdout).contains("evidence is historical"));
+    assert!(collision_db.execute("INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES('future','{}','observed','124')", []).is_err());
+    let db_arg = conflict_db.clone();
+    let config_arg = config.clone();
+    let capacity_arg = capacity.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db_arg)
+            .args(["resolve-dispatch-conflict", "--batch-id", id, "--config"])
+            .arg(config_arg)
+            .arg("--capacity")
+            .arg(capacity_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("AlreadyResolved"));
+    collision_db
+        .execute(
+            "UPDATE dispatch_conflict_releases SET digest='corrupted' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    assert!(restarted.conflict_release_recorded(id).is_err());
     posts.store(0, Ordering::SeqCst);
     let check_token = fixture_app.failed_check_token(42, 7).await.unwrap();
     for check_mode in [40, 95, 96, 97, 98, 99, 103] {
