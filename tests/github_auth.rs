@@ -1416,6 +1416,113 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
 }
 
 #[tokio::test]
+async fn github_staging_marks_changed_policy_as_a_deterministic_batch_failure() {
+    use sluss::{
+        batch::{Candidate, State},
+        coordinator::{self, GitHubRepository, PrepareError},
+        integration::PolicyError,
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (_key_dir, private, public) = keys();
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: Arc::new(AtomicU8::new(0)),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let token = client.staging_token(42, 7).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("source");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-b", "main"]);
+    std::fs::write(repo.join("policy"), "trusted\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-b", "change"]);
+    std::fs::write(repo.join("policy"), "changed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "policy change"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: Candidate {
+                    number: 1,
+                    head_sha: head,
+                },
+                evidence_digest: "e".repeat(64),
+            }],
+        )
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store.plan_batch(id, &base, 1, 1).unwrap().unwrap();
+    assert!(matches!(
+        coordinator::prepare_github(
+            &mut store,
+            &client,
+            &token,
+            GitHubRepository {
+                owner: "owner",
+                repository: "repo"
+            },
+            id,
+            &repo,
+            &["policy".into()]
+        )
+        .await,
+        Err(PrepareError::Policy(PolicyError::Changed))
+    ));
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Failed { .. }
+    ));
+    assert_eq!(store.failed_candidates().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn uncertain_dispatch_discovery_is_read_only_scoped_and_never_asserts_origin() {
     use sluss::{
         batch::Candidate,

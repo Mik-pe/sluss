@@ -111,7 +111,14 @@ pub fn prepare_local_with_options(
         }
         Err(error) => return Err(error.into()),
     };
-    let policy = integration.check_policy(&batch.base_sha, policy_paths)?;
+    let policy = match integration.check_policy(&batch.base_sha, policy_paths) {
+        Ok(policy) => policy,
+        Err(error @ PolicyError::Changed) => {
+            store.fail_integration(batch_id, &error.to_string())?;
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let selection = selection_for(
         &integration,
         &batch.base_sha,
@@ -274,6 +281,10 @@ pub async fn prepare_github_with_options(
         Err(PrepareError::Integration(
             error @ (IntegrationError::Conflict | IntegrationError::AlreadyIntegrated),
         )) => {
+            store.fail_integration(batch_id, &error.to_string())?;
+            return Err(error.into());
+        }
+        Err(PrepareError::Policy(error @ PolicyError::Changed)) => {
             store.fail_integration(batch_id, &error.to_string())?;
             return Err(error.into());
         }

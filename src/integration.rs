@@ -449,8 +449,10 @@ pub struct PolicySnapshot {
 pub enum PolicyError {
     #[error("invalid base commit or policy paths")]
     Invalid,
-    #[error("a policy file is missing, not a regular file, too large, or changed")]
+    #[error("a declared CI policy file differs from the base")]
     Changed,
+    #[error("a declared CI policy file in the base is missing, not regular, or too large")]
+    BaseUnavailable,
     #[error("could not read a policy object")]
     Git,
     #[error(transparent)]
@@ -497,14 +499,14 @@ fn policy_snapshot(
     if !kind.status.success() || kind.stdout != b"commit\n" {
         return Err(PolicyError::Invalid);
     }
-    let mut hasher = Sha256::new();
-    hasher.update(b"sluss-policy-files-v1\0");
+    // Validate the entire base first. A missing or oversized base policy is
+    // an operator configuration problem, not evidence against any PR.
+    let mut base_entries = Vec::with_capacity(paths.len());
     for path in &paths {
-        let (base_mode, base_object) = policy_entry(repo, base, path)?;
-        let (mode, object) = policy_entry(repo, staged, path)?;
-        if mode != base_mode || object != base_object {
-            return Err(PolicyError::Changed);
-        }
+        let (mode, object) = policy_entry(repo, base, path).map_err(|error| match error {
+            PolicyError::Changed => PolicyError::BaseUnavailable,
+            other => other,
+        })?;
         let size = git(repo).args(["cat-file", "-s", &object]).output()?;
         if !size.status.success() {
             return Err(PolicyError::Git);
@@ -514,6 +516,15 @@ fn policy_snapshot(
             .and_then(|s| s.trim().parse().ok())
             .ok_or(PolicyError::Git)?;
         if size > 1024 * 1024 {
+            return Err(PolicyError::BaseUnavailable);
+        }
+        base_entries.push((mode, object, size));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"sluss-policy-files-v1\0");
+    for (path, (mode, object, size)) in paths.iter().zip(base_entries) {
+        let (staged_mode, staged_object) = policy_entry(repo, staged, path)?;
+        if mode != staged_mode || object != staged_object {
             return Err(PolicyError::Changed);
         }
         let content = git(repo).args(["cat-file", "blob", &object]).output()?;

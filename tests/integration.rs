@@ -292,9 +292,31 @@ fn policy_snapshot_detects_policy_changes_and_rejects_missing_or_invalid_paths()
         bad.check_policy(&base, &paths),
         Err(PolicyError::Changed)
     ));
+    git(dir.path(), &["checkout", "-b", "policy-delete", &base]);
+    git(dir.path(), &["rm", ".github/workflows/ci.yml"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "delete policy",
+        ],
+    );
+    let deleted = git(dir.path(), &["rev-parse", "HEAD"]);
+    let deletion = build(dir.path(), &base, &[deleted]).unwrap();
+    assert!(matches!(
+        deletion.check_policy(&base, &paths),
+        Err(PolicyError::Changed)
+    ));
     assert!(matches!(
         good.check_policy(&base, &["missing".into()]),
-        Err(PolicyError::Changed)
+        Err(PolicyError::BaseUnavailable)
+    ));
+    assert!(matches!(
+        bad.check_policy(&base, &[paths[0].clone(), "zzz-missing".into()]),
+        Err(PolicyError::BaseUnavailable)
     ));
     assert!(matches!(
         good.check_policy(&base, &["../main".into()]),
@@ -303,6 +325,176 @@ fn policy_snapshot_detects_policy_changes_and_rejects_missing_or_invalid_paths()
     assert!(matches!(
         good.check_policy(&base, &[paths[0].clone(), paths[0].clone()]),
         Err(PolicyError::Invalid)
+    ));
+}
+
+#[test]
+fn changed_ci_policy_splits_batch_but_unusable_base_does_not_blame_prs() {
+    use sluss::{
+        batch::{Candidate, State},
+        coordinator::{PrepareError, prepare_local},
+        integration::PolicyError,
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (source, base, safe, _) = fixture();
+    git(source.path(), &["checkout", "-b", "policy-change", &base]);
+    std::fs::write(source.path().join("shared"), "changed policy\n").unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "change policy",
+        ],
+    );
+    let changed = git(source.path(), &["rev-parse", "HEAD"]);
+    git(source.path(), &["checkout", "main"]);
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[
+                AdmissionCandidate {
+                    candidate: Candidate {
+                        number: 1,
+                        head_sha: safe,
+                    },
+                    evidence_digest: "e".repeat(64),
+                },
+                AdmissionCandidate {
+                    candidate: Candidate {
+                        number: 2,
+                        head_sha: changed,
+                    },
+                    evidence_digest: "d".repeat(64),
+                },
+            ],
+        )
+        .unwrap();
+    let paths = vec!["shared".into()];
+    let root = "batch-0123456789abcdef";
+    store.plan_batch(root, &base, 2, 2).unwrap().unwrap();
+    assert!(matches!(
+        prepare_local(&mut store, root, source.path(), remote.path(), &paths),
+        Err(PrepareError::Policy(PolicyError::Changed))
+    ));
+    assert!(matches!(
+        store.batch(root).unwrap().unwrap().0.state,
+        State::Failed { .. }
+    ));
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(remote.path())
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/sluss/{root}")
+            ])
+            .output()
+            .unwrap()
+            .status
+            .code()
+            == Some(1)
+    );
+    let safe_batch = "batch-1123456789abcdef";
+    let safe_child = store.plan_batch(safe_batch, &base, 2, 2).unwrap().unwrap();
+    assert_eq!(safe_child.candidates[0].number, 1);
+    prepare_local(&mut store, safe_batch, source.path(), remote.path(), &paths).unwrap();
+    let blocked_batch = "batch-2123456789abcdef";
+    let blocked_child = store
+        .plan_batch(blocked_batch, &base, 2, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked_child.candidates[0].number, 2);
+    assert!(matches!(
+        prepare_local(
+            &mut store,
+            blocked_batch,
+            source.path(),
+            remote.path(),
+            &paths
+        ),
+        Err(PrepareError::Policy(PolicyError::Changed))
+    ));
+    assert_eq!(
+        store
+            .failed_candidates()
+            .unwrap()
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    // A missing base policy file is configuration trouble even if another
+    // declared file would differ in the staged tree.
+    let other = tempfile::tempdir().unwrap();
+    let mut other_inbox = Inbox::open(other.path().join("queue.sqlite")).unwrap();
+    let mut other_store = Store::open(other.path().join("queue.sqlite")).unwrap();
+    other_inbox
+        .record("initial", "pull_request", &[2; 32], 1, 2)
+        .unwrap();
+    let event = other_inbox.pending().unwrap().remove(0);
+    other_store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: blocked_child.candidates[0].clone(),
+                evidence_digest: "d".repeat(64),
+            }],
+        )
+        .unwrap();
+    let id = "batch-3123456789abcdef";
+    other_store.plan_batch(id, &base, 1, 1).unwrap().unwrap();
+    assert!(matches!(
+        prepare_local(
+            &mut other_store,
+            id,
+            source.path(),
+            remote.path(),
+            &["shared".into(), "zzz-missing".into()]
+        ),
+        Err(PrepareError::Policy(PolicyError::BaseUnavailable))
+    ));
+    assert!(matches!(
+        other_store.batch(id).unwrap().unwrap().0.state,
+        State::Building
+    ));
+    assert!(other_store.failed_candidates().unwrap().is_empty());
+}
+
+#[test]
+fn oversized_base_policy_is_not_classified_as_a_pr_change() {
+    use sluss::integration::{PolicyError, policy_snapshot_at_commit};
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-b", "main"]);
+    std::fs::write(dir.path().join("large-policy"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+    );
+    let base = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        policy_snapshot_at_commit(dir.path(), &base, &["large-policy".into()]),
+        Err(PolicyError::BaseUnavailable)
     ));
 }
 
