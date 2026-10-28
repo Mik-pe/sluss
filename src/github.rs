@@ -699,6 +699,8 @@ pub enum DispatchError {
     AlreadyClaimed,
     #[error("the provider may have accepted the dispatch; reconcile without retrying")]
     Uncertain,
+    #[error("the observed workflow run does not match the frozen dispatch")]
+    RunMismatch,
     #[error(transparent)]
     GitHub(#[from] GitHubError),
     #[error(transparent)]
@@ -806,5 +808,64 @@ impl App {
         }
         scheduler.record_receipt(id, receipt.workflow_run_id)?;
         Ok(receipt.workflow_run_id)
+    }
+}
+
+impl App {
+    /// Validate a saved receipt against the provider's latest run and complete
+    /// first-attempt job list before binding it to the durable intent. This
+    /// is observation only: it does not prove the CI policy or free capacity.
+    pub async fn reconcile_dispatch(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+    ) -> Result<ActionsSnapshot, DispatchError> {
+        use crate::scheduler::DispatchState;
+        if !valid_name(owner) || !valid_name(repository) {
+            return Err(DispatchError::Invalid);
+        }
+        let pending = scheduler
+            .pending_dispatches()?
+            .into_iter()
+            .find(|p| p.reservation.id == id)
+            .ok_or(DispatchError::Invalid)?;
+        if pending.plan.repository_id != token.repository_id
+            || pending.plan.installation_id != token.installation_id
+        {
+            return Err(DispatchError::Invalid);
+        }
+        let run_id = match pending.state {
+            DispatchState::Accepted { run_id } | DispatchState::Observed { run_id } => run_id,
+            _ => return Err(DispatchError::Invalid),
+        };
+        let path = format!("repos/{owner}/{repository}/actions/runs/{run_id}");
+        let first: ActionsRun = self.get_json(token, &path, None).await?;
+        let snapshot = self
+            .observe_actions_attempt(token, owner, repository, run_id, 1)
+            .await?;
+        let last: ActionsRun = self.get_json(token, &path, None).await?;
+        let branch = pending
+            .plan
+            .staging_ref
+            .strip_prefix("refs/heads/")
+            .ok_or(DispatchError::Invalid)?;
+        if first != last
+            || last != snapshot.run
+            || last.id != run_id
+            || last.run_attempt != 1
+            || last.workflow_id != pending.plan.workflow_id
+            || last.repository.id != pending.plan.repository_id
+            || last.head_repository.as_ref().map(|r| r.id) != Some(pending.plan.repository_id)
+            || last.head_sha != pending.plan.integration_sha
+            || last.head_branch.as_deref() != Some(branch)
+            || last.event != "workflow_dispatch"
+        {
+            return Err(DispatchError::RunMismatch);
+        }
+        scheduler.observe_dispatch(id, run_id)?;
+        Ok(snapshot)
     }
 }

@@ -128,6 +128,32 @@ async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> J
         json!({"ref":"refs/heads/sluss/batch-0123456789abcdef","object":{"sha":sha.repeat(40),"type":"commit"}}),
     )
 }
+async fn dispatched_run(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    path: axum::extract::OriginalUri,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let latest = !path.0.path().contains("/attempts/");
+    let branch = if mode == 18 {
+        "sluss/other"
+    } else {
+        "sluss/batch-0123456789abcdef"
+    };
+    let event = if mode == 20 {
+        "push"
+    } else {
+        "workflow_dispatch"
+    };
+    let attempt = if mode == 21 && latest { 2 } else { 1 };
+    let workflow_id = if mode == 23 { 18 } else { 17 };
+    let sha = if mode == 22 && count >= 3 { "b" } else { "a" };
+    Json(
+        json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
+    )
+}
 async fn dispatch_post(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -668,6 +694,7 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
     let (_key_dir, private, public) = keys();
     let mode = Arc::new(AtomicU8::new(0));
     let posts = Arc::new(AtomicUsize::new(0));
+    let run_reads = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo", get(dispatch_repo))
@@ -679,10 +706,19 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
             "/repos/owner/repo/actions/workflows/17/dispatches",
             post(dispatch_post),
         )
+        .route("/repos/owner/repo/actions/runs/123", get(dispatched_run))
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/1",
+            get(dispatched_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/1/jobs",
+            get(actions_jobs),
+        )
         .with_state(ServerState {
             public_key: Arc::new(public),
             mode: mode.clone(),
-            pulls: Arc::new(AtomicUsize::new(0)),
+            pulls: run_reads.clone(),
             permissions: posts.clone(),
             token_calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -745,7 +781,31 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         scheduler.observe_dispatch("good", 124),
         Err(sluss::scheduler::SchedulerError::DispatchTransition)
     ));
-    scheduler.observe_dispatch("good", 123).unwrap();
+    for bad_mode in [18, 19, 20, 21, 22, 23] {
+        mode.store(bad_mode, Ordering::SeqCst);
+        run_reads.store(0, Ordering::SeqCst);
+        assert!(
+            client
+                .reconcile_dispatch(&mut scheduler, &read_token, "owner", "repo", "good")
+                .await
+                .is_err(),
+            "mode {bad_mode}"
+        );
+        assert_eq!(
+            scheduler.pending_dispatches().unwrap()[0].state,
+            DispatchState::Accepted { run_id: 123 }
+        );
+    }
+    mode.store(0, Ordering::SeqCst);
+    let snapshot = client
+        .reconcile_dispatch(&mut scheduler, &read_token, "owner", "repo", "good")
+        .await
+        .unwrap();
+    assert_eq!(snapshot.run.head_sha, plan.integration_sha);
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Observed { run_id: 123 }
+    );
     assert!(matches!(
         client
             .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
