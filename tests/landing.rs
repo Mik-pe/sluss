@@ -506,3 +506,19 @@ fn unresolved_intent_listing_is_read_only_and_includes_uncertain_sends() {
     assert!(!cancelled.status.success());
     assert!(!missing.exists());
 }
+
+#[test]
+fn marker_observation_inspection_does_not_migrate_legacy_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("legacy.sqlite");
+    let mut journal = LandingJournal::open(&db).unwrap();
+    journal.prepare(&plan("legacy")).unwrap();
+    drop(journal);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TABLE landing_marker_observations_v1", [])
+        .unwrap();
+    let reader = LandingJournal::open_read_only(&db).unwrap();
+    assert_eq!(reader.last_marker_observation("legacy").unwrap(), None);
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='landing_marker_observations_v1')", [], |r| r.get(0)).unwrap();
+    assert!(!exists);
+}

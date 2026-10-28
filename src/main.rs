@@ -184,6 +184,13 @@ enum Command {
         #[arg(long)]
         policy: PathBuf,
     },
+    /// Read an attempted marker creation without retrying or resolving it.
+    ObserveMarkerCreation {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Cancel a landing intent only before its landing send is claimed.
     CancelLanding {
         #[arg(long)]
@@ -1347,6 +1354,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("No landing mutation, CI attestation or merge authorization was issued.");
         return Ok(());
     }
+    if let Command::ObserveMarkerCreation {
+        operation_id,
+        config,
+    } = &cli.command
+    {
+        let config = sluss::config::Config::load(config)?;
+        let inspect = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        let (plan, _) = inspect.get(operation_id)?.ok_or("unknown landing intent")?;
+        if (plan.installation_id, plan.repository_id)
+            != (config.github.installation_id, config.github.repository_id)
+            || plan.target_ref != format!("refs/heads/{}", config.queue.target)
+            || plan.marker_ref.is_none()
+        {
+            return Err("repository, target or marker does not match the landing intent".into());
+        }
+        let key = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let app = sluss::github::App::new(
+            config.github.app_client_id.clone(),
+            &std::fs::read(key)?,
+            &config.github.api,
+        )?;
+        let token = app
+            .read_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+        let observed = app
+            .observe_marker_creation(
+                &mut journal,
+                &token,
+                (&config.github.owner, &config.github.repository),
+                operation_id,
+            )
+            .await?;
+        match &observed.marker_sha {
+            Some(sha) => println!("marker observed at {sha}"),
+            None => println!("marker not visible (GitHub returned 404)"),
+        }
+        println!(
+            "Observation saved at {} ms. This does not prove request origin or absence, resolve creation, or authorize landing.",
+            observed.observed_ms
+        );
+        return Ok(());
+    }
     if let Command::CancelLanding { operation_id } = &cli.command {
         let inspect = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
         inspect.get(operation_id)?.ok_or("unknown landing intent")?;
@@ -1391,6 +1445,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "marker creation: {:?}",
                 journal.marker_creation_state(operation_id)?
+            );
+        }
+        if let Some(marker) = journal.last_marker_observation(operation_id)? {
+            println!(
+                "last marker observation: {} at {} ms (creation state then {:?})",
+                marker.marker_sha.as_deref().unwrap_or("not visible (404)"),
+                marker.observed_ms,
+                marker.creation_state
             );
         }
         if let Some(observed) = journal.last_recovery_observation(operation_id)? {
@@ -1478,6 +1540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::CreateLandingMarker { .. } => unreachable!(),
         Command::LandingIntents => unreachable!(),
         Command::CancelLanding { .. } => unreachable!(),
+        Command::ObserveMarkerCreation { .. } => unreachable!(),
         Command::Select {
             policy,
             source,

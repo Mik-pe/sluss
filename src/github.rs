@@ -1920,6 +1920,95 @@ pub enum MarkerCreationError {
 }
 
 impl App {
+    /// Observe an attempted marker creation twice. A 404 means only that the
+    /// ref is not visible to this token; no response proves request origin.
+    pub async fn observe_marker_creation(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        repository: (&str, &str),
+        operation_id: &str,
+    ) -> Result<crate::landing::MarkerCreationObservation, MarkerCreationError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        let (owner, name) = repository;
+        if !valid_name(owner)
+            || !valid_name(name)
+            || !token.checks_read
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        let (plan, intent_state) = journal
+            .get(operation_id)?
+            .ok_or(MarkerCreationError::Scope)?;
+        let creation_state = journal.marker_creation_state(operation_id)?;
+        if creation_state == crate::landing::MarkerCreationState::Prepared
+            || i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
+            || i64::try_from(token.installation_id).ok() != Some(plan.installation_id)
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        let marker = plan
+            .marker_ref
+            .as_deref()
+            .ok_or(MarkerCreationError::Scope)?;
+        let root = format!("repos/{owner}/{name}");
+        let path = format!(
+            "{root}/git/ref/{}",
+            marker
+                .strip_prefix("refs/")
+                .ok_or(MarkerCreationError::Scope)?
+        );
+        let first_repo: Identity = self.get_json(token, &root, None).await?;
+        async fn marker_read(
+            app: &App,
+            token: &InstallationToken,
+            path: &str,
+        ) -> Result<Option<DispatchRef>, GitHubError> {
+            match app.get_json(token, path, None).await {
+                Ok(reference) => Ok(Some(reference)),
+                Err(GitHubError::Status(404)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        let first = marker_read(self, token, &path).await?;
+        let last = marker_read(self, token, &path).await?;
+        let last_repo: Identity = self.get_json(token, &root, None).await?;
+        if first_repo != last_repo
+            || first_repo.id != token.repository_id
+            || first_repo.node_id != plan.repository_node_id
+            || first != last
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        if first
+            .as_ref()
+            .is_some_and(|value| value.reference != marker || value.object.kind != "commit")
+        {
+            return Err(MarkerCreationError::Scope);
+        }
+        let observed_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| GitHubError::Clock)?
+            .as_millis()
+            .try_into()
+            .map_err(|_| GitHubError::Clock)?;
+        let observed = crate::landing::MarkerCreationObservation {
+            plan,
+            intent_state,
+            creation_state,
+            marker_sha: first.map(|value| value.object.sha),
+            observed_ms,
+        };
+        journal.record_marker_observation(&observed)?;
+        Ok(observed)
+    }
+
     /// Create only the frozen marker ref, once. A crash or an ambiguous
     /// response remains uncertain; matching readback does not prove origin.
     /// This does not publish CI success or send a landing mutation.

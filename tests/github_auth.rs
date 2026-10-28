@@ -2223,7 +2223,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             post(create_landing_marker_stub),
         )
         .route(
-            "/repos/owner/repo/git/ref/heads/sluss/receipts/123456789abcdef0123456789abcdef0",
+            "/repos/owner/repo/git/ref/heads/sluss/receipts/{marker_id}",
             get(landing_marker_preflight),
         )
         .route(
@@ -7316,29 +7316,39 @@ static MARKER_PREFLIGHT_READS: AtomicUsize = AtomicUsize::new(0);
 
 async fn landing_marker_preflight(
     State(state): State<ServerState>,
+    Path(marker_id): Path<String>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<Value>) {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
-    if mode == 202 {
+    if mode == 217 {
+        MARKER_PREFLIGHT_READS.fetch_add(1, Ordering::SeqCst);
+        while state.mode.load(Ordering::SeqCst) == 217 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    if matches!(mode, 202 | 211) {
         return (StatusCode::NOT_FOUND, Json(json!({"message":"missing"})));
     }
+    if mode == 215 {
+        return (StatusCode::FORBIDDEN, Json(json!({"message":"forbidden"})));
+    }
     let sha = if mode == 201
-        || (mode == 205 && MARKER_PREFLIGHT_READS.fetch_add(1, Ordering::SeqCst) > 0)
+        || (matches!(mode, 205 | 212) && MARKER_PREFLIGHT_READS.fetch_add(1, Ordering::SeqCst) > 0)
     {
         "a"
     } else {
         "b"
     };
-    let reference = if mode == 203 {
-        "refs/heads/sluss/receipts/other"
+    let reference = if matches!(mode, 203 | 213) {
+        "refs/heads/sluss/receipts/other".into()
     } else {
-        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+        format!("refs/heads/sluss/receipts/{marker_id}")
     };
     (
         StatusCode::OK,
         Json(
-            json!({"ref":reference,"object":{"sha":sha.repeat(40),"type":if mode == 204 {"tree"} else {"commit"}}}),
+            json!({"ref":reference,"object":{"sha":sha.repeat(40),"type":if matches!(mode, 204 | 214) {"tree"} else {"commit"}}}),
         ),
     )
 }
@@ -7595,6 +7605,53 @@ async fn exercise_marker_cli(
             })
         );
         if fail {
+            let observe = || {
+                vec![
+                    "observe-marker-creation".into(),
+                    "--operation-id".into(),
+                    id.clone(),
+                    "--config".into(),
+                    config.to_str().unwrap().into(),
+                ]
+            };
+            mode.store(210, Ordering::SeqCst);
+            let visible = launch(observe()).await.unwrap();
+            assert!(
+                visible.status.success(),
+                "{}",
+                String::from_utf8_lossy(&visible.stderr)
+            );
+            assert!(String::from_utf8_lossy(&visible.stdout).contains(&"b".repeat(40)));
+            mode.store(211, Ordering::SeqCst);
+            let missing = launch(observe()).await.unwrap();
+            assert!(missing.status.success());
+            assert!(String::from_utf8_lossy(&missing.stdout).contains("not visible"));
+            for invalid in [212, 213, 214, 215] {
+                MARKER_PREFLIGHT_READS.store(0, Ordering::SeqCst);
+                mode.store(invalid, Ordering::SeqCst);
+                assert!(
+                    !launch(observe()).await.unwrap().status.success(),
+                    "mode {invalid}"
+                );
+                let historical = launch(vec![
+                    "landing-recovery".into(),
+                    "--operation-id".into(),
+                    id.clone(),
+                ])
+                .await
+                .unwrap();
+                assert!(String::from_utf8_lossy(&historical.stdout).contains("not visible (404)"));
+            }
+            MARKER_PREFLIGHT_READS.store(0, Ordering::SeqCst);
+            mode.store(217, Ordering::SeqCst);
+            let reading = launch(observe());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while MARKER_PREFLIGHT_READS.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
             let cancelled = launch(vec![
                 "cancel-landing".into(),
                 "--operation-id".into(),
@@ -7602,11 +7659,47 @@ async fn exercise_marker_cli(
             ])
             .await
             .unwrap();
+            mode.store(0, Ordering::SeqCst);
             assert!(cancelled.status.success());
+            assert!(
+                !reading.await.unwrap().status.success(),
+                "observation must detect concurrent cancellation"
+            );
+            let historical = launch(vec![
+                "landing-recovery".into(),
+                "--operation-id".into(),
+                id.clone(),
+            ])
+            .await
+            .unwrap();
+            assert!(String::from_utf8_lossy(&historical.stdout).contains("not visible (404)"));
             let listed = launch(vec!["landing-intents".into()]).await.unwrap();
             assert!(!String::from_utf8_lossy(&listed.stdout).contains(&id));
             assert!(!launch(create()).await.unwrap().status.success());
             assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+            let observed_after_cancel = launch(observe()).await.unwrap();
+            assert!(observed_after_cancel.status.success());
+            let historical = launch(vec![
+                "landing-recovery".into(),
+                "--operation-id".into(),
+                id.clone(),
+            ])
+            .await
+            .unwrap();
+            assert!(String::from_utf8_lossy(&historical.stdout).contains("Creating"));
+            let raw = rusqlite::Connection::open(&copy).unwrap();
+            raw.execute("UPDATE landing_marker_observations_v1 SET body='{}' WHERE sequence=(SELECT max(sequence) FROM landing_marker_observations_v1)", []).unwrap();
+            let corrupted = launch(vec![
+                "landing-recovery".into(),
+                "--operation-id".into(),
+                id.clone(),
+            ])
+            .await
+            .unwrap();
+            assert!(
+                !corrupted.status.success(),
+                "corrupt historical observations must not be reported"
+            );
         }
     }
 }

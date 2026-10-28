@@ -44,7 +44,7 @@ pub struct LandingPlan {
     pub branch_security_digest: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentState {
     Prepared,
     Sending,
@@ -52,7 +52,7 @@ pub enum IntentState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkerCreationState {
     Prepared,
     Creating,
@@ -263,6 +263,37 @@ impl LandingPlan {
             "refUpdates":refs
         }}}))
     }
+}
+
+/// A historical read of a marker after creation was attempted. `None` means
+/// GitHub returned 404; it does not prove the ref is absent or creation failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerCreationObservation {
+    pub plan: LandingPlan,
+    pub intent_state: IntentState,
+    pub creation_state: MarkerCreationState,
+    pub marker_sha: Option<String>,
+    pub observed_ms: u64,
+}
+impl MarkerCreationObservation {
+    fn validate(&self) -> Result<(), LandingError> {
+        self.plan.validate()?;
+        if self.plan.marker_ref.is_none()
+            || self.creation_state == MarkerCreationState::Prepared
+            || self.marker_sha.as_deref().is_some_and(|sha| !hex(sha, 40))
+            || self.observed_ms == 0
+        {
+            return Err(LandingError::Corrupt);
+        }
+        Ok(())
+    }
+}
+fn marker_observation_digest(body: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-marker-observation-v1\0");
+    hash.update(body.as_bytes());
+    hex::encode(hash.finalize())
 }
 
 /// Historical provider observations made after a sender became uncertain.
@@ -851,7 +882,9 @@ impl LandingJournal {
         CREATE TABLE IF NOT EXISTS pending_ci_cancellations_v1 (batch_id TEXT PRIMARY KEY NOT NULL, check_id TEXT NOT NULL, suite_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','cancelled')), direct INTEGER NOT NULL DEFAULT 0 CHECK(direct IN (0,1)), recovered INTEGER NOT NULL DEFAULT 0 CHECK(recovered IN (0,1)));
         CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
         CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS landing_marker_creation_v1 (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','creating','created')));",
+        CREATE TABLE IF NOT EXISTS landing_marker_creation_v1 (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','creating','created')));
+        CREATE TABLE IF NOT EXISTS landing_marker_observations_v1 (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS landing_marker_observations_by_id_v1 ON landing_marker_observations_v1(id,sequence);",
         )?;
         Ok(Self { conn })
     }
@@ -1253,6 +1286,72 @@ impl LandingJournal {
     pub fn marker_creation_state(&self, id: &str) -> Result<MarkerCreationState, LandingError> {
         let (plan, _) = self.get(id)?.ok_or(LandingError::Transition)?;
         marker_creation_state(&self.conn, &plan)
+    }
+
+    /// Read the last saved observation without refreshing the provider.
+    pub fn last_marker_observation(
+        &self,
+        id: &str,
+    ) -> Result<Option<MarkerCreationObservation>, LandingError> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='landing_marker_observations_v1')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let row: Option<(String,String)> = self.conn.query_row(
+            "SELECT body,digest FROM landing_marker_observations_v1 WHERE id=?1 ORDER BY sequence DESC LIMIT 1", [id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let Some((body, digest)) = row else {
+            return Ok(None);
+        };
+        if body.len() > 65536 || marker_observation_digest(&body) != digest {
+            return Err(LandingError::Corrupt);
+        }
+        let observed: MarkerCreationObservation = serde_json::from_str(&body)?;
+        observed.validate()?;
+        let (plan, _) = self.get(id)?.ok_or(LandingError::Corrupt)?;
+        if observed.plan != plan {
+            return Err(LandingError::Corrupt);
+        }
+        Ok(Some(observed))
+    }
+    /// Append only if the frozen intent and marker-send state did not change
+    /// during the provider reads. This never resolves a creation or landing.
+    pub(crate) fn record_marker_observation(
+        &mut self,
+        observed: &MarkerCreationObservation,
+    ) -> Result<(), LandingError> {
+        observed.validate()?;
+        let body = serde_json::to_string(observed)?;
+        if body.len() > 65536 {
+            return Err(LandingError::Corrupt);
+        }
+        let digest = marker_observation_digest(&body);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, i64, String)> = tx
+            .query_row(
+                "SELECT plan,state,repository_id,target_ref FROM landing_intents_v1 WHERE id=?1",
+                [&observed.plan.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (plan, state) = decode_row(
+            &observed.plan.operation_id,
+            row.ok_or(LandingError::Transition)?,
+        )?;
+        if plan != observed.plan
+            || state != observed.intent_state
+            || marker_creation_state(&tx, &plan)? != observed.creation_state
+        {
+            return Err(LandingError::Transition);
+        }
+        tx.execute(
+            "INSERT INTO landing_marker_observations_v1(id,body,digest) VALUES(?1,?2,?3)",
+            params![plan.operation_id, body, digest],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Atomically claim a single marker creation only while the original batch,
