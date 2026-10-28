@@ -424,9 +424,36 @@ impl Store {
         max_active_batches: usize,
         debounce: Duration,
     ) -> Result<Option<Batch>, StoreError> {
+        self.plan_batch_with_window(
+            id,
+            base_sha,
+            max_batch_size,
+            max_active_batches,
+            debounce,
+            Duration::ZERO,
+        )
+    }
+
+    /// Collect eligible candidates until the window expires or the batch fills.
+    /// The window starts when the oldest selected candidate finishes debouncing;
+    /// persisted candidate timestamps make it survive a process restart.
+    pub fn plan_batch_with_window(
+        &mut self,
+        id: &str,
+        base_sha: &str,
+        max_batch_size: usize,
+        max_active_batches: usize,
+        debounce: Duration,
+        batch_window: Duration,
+    ) -> Result<Option<Batch>, StoreError> {
         let now = now_ms()?;
         let debounce_ms =
             i64::try_from(debounce.as_millis()).map_err(|_| StoreError::InvalidBatch)?;
+        let window_ms =
+            i64::try_from(batch_window.as_millis()).map_err(|_| StoreError::InvalidBatch)?;
+        let waiting_ms = debounce_ms
+            .checked_add(window_ms)
+            .ok_or(StoreError::InvalidBatch)?;
         let valid_sha = |value: &str| {
             value.len() == 40
                 && value
@@ -617,6 +644,28 @@ impl Store {
         if selected.is_empty() {
             tx.commit()?;
             return Ok(None);
+        }
+        // Bisection halves should be verified promptly rather than collected
+        // with unrelated candidates. A full ordinary batch is also ready now.
+        if selected_task.is_none() && window_ms > 0 && selected.len() < max_batch_size {
+            let mut oldest = i64::MAX;
+            for candidate in &selected {
+                let changed: Option<i64> = tx
+                    .query_row(
+                        "SELECT changed_ms FROM candidate_stability WHERE number=?1",
+                        [candidate.number as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(changed) = changed.filter(|time| *time >= 0) else {
+                    return Ok(None);
+                };
+                oldest = oldest.min(changed);
+            }
+            if now.saturating_sub(oldest) < waiting_ms {
+                tx.commit()?;
+                return Ok(None);
+            }
         }
         let batch = Batch::new(id.into(), base_sha.into(), selected)
             .map_err(|_| StoreError::InvalidBatch)?;

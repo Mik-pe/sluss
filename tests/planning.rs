@@ -370,6 +370,82 @@ fn debounce_survives_restart_and_resets_only_for_changed_candidates() {
 }
 
 #[test]
+fn batch_window_survives_restart_and_full_batches_do_not_wait() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    raw.execute(
+        "UPDATE candidate_stability SET changed_ms=?1",
+        [now - 61_000],
+    )
+    .unwrap();
+    let id = "batch-0123456789abcdef";
+    let base = "a".repeat(40);
+    let mut store = Store::open(&db).unwrap();
+    assert!(
+        store
+            .plan_batch_with_window(
+                id,
+                &base,
+                5,
+                1,
+                Duration::from_secs(60),
+                Duration::from_secs(60)
+            )
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    assert!(
+        store
+            .plan_batch_with_window(
+                id,
+                &base,
+                5,
+                1,
+                Duration::from_secs(60),
+                Duration::from_secs(60)
+            )
+            .unwrap()
+            .is_none()
+    );
+    raw.execute(
+        "UPDATE candidate_stability SET changed_ms=?1 WHERE number=1",
+        [now - 121_000],
+    )
+    .unwrap();
+    let batch = store
+        .plan_batch_with_window(
+            id,
+            &base,
+            5,
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.candidates.len(), 4);
+
+    let other = tempfile::tempdir().unwrap();
+    let other_db = other.path().join("queue.sqlite");
+    ready_queue(&other_db);
+    let mut other_store = Store::open(&other_db).unwrap();
+    let full = other_store
+        .plan_batch_with_window(id, &base, 4, 1, Duration::ZERO, Duration::from_secs(3600))
+        .unwrap()
+        .unwrap();
+    assert_eq!(full.candidates.len(), 4);
+}
+
+#[test]
 fn failed_batches_split_durably_and_failed_singletons_wait_for_change() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.sqlite");
@@ -386,7 +462,14 @@ fn failed_batches_split_durably_and_failed_singletons_wait_for_change() {
     drop(store);
     let mut store = Store::open(&db).unwrap();
     let first = store
-        .plan_batch("batch-0000000000000001", &base, 4, 1)
+        .plan_batch_with_window(
+            "batch-0000000000000001",
+            &base,
+            4,
+            1,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(3600),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(

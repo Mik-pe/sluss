@@ -397,6 +397,8 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
             &base,
             "--debounce-seconds",
             "0",
+            "--batch-window-seconds",
+            "0",
         ])
         .output()
         .unwrap();

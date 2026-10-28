@@ -72,6 +72,9 @@ enum Command {
         max_active_batches: usize,
         #[arg(long, default_value_t = 60)]
         debounce_seconds: u64,
+        /// Maximum collection time after the oldest candidate finishes debouncing.
+        #[arg(long, default_value_t = 60)]
+        batch_window_seconds: u64,
     },
     /// Build and publish an experimental staging ref to a local repository.
     PrepareLocal {
@@ -435,14 +438,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_batch_size,
             max_active_batches,
             debounce_seconds,
+            batch_window_seconds,
         } => {
             let mut store = store;
-            match store.plan_batch_debounced(
+            match store.plan_batch_with_window(
                 &id,
                 &base_sha,
                 max_batch_size,
                 max_active_batches,
                 std::time::Duration::from_secs(debounce_seconds),
+                std::time::Duration::from_secs(batch_window_seconds),
             )? {
                 Some(batch) => {
                     println!("planned {} on {}", batch.id, batch.base_sha);
@@ -451,7 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 None => println!(
-                    "no batch ready (paused, pending reconciliation, debounce, or capacity)"
+                    "no batch ready (paused, pending reconciliation, debounce, collection window, or capacity)"
                 ),
             }
         }

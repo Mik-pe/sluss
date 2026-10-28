@@ -31,9 +31,11 @@ For development, `sluss reconcile --help` describes a manual, one-shot reconcili
 For an experimental local Git exercise, reconcile a repository first, then freeze an observed base and prepare an integration in a local bare staging repository:
 
 ```sh
-sluss --db sluss.sqlite plan --id batch-0123456789abcdef --base-sha <base-sha> --debounce-seconds 60
+sluss --db sluss.sqlite plan --id batch-0123456789abcdef --base-sha <base-sha> --debounce-seconds 60 --batch-window-seconds 60
 sluss --db sluss.sqlite prepare-local --batch-id batch-0123456789abcdef --source /path/to/source --staging-remote /path/to/staging.git --policy-file .github/workflows/ci.yml
 ```
+
+The manual planner waits for a partial batch until the oldest selected candidate has been stable for the debounce interval plus the collection window. A full batch and bisection halves do not wait for the collection window. The timestamps survive restarts and depend on the host clock; this planner is not yet connected to automatic dispatch.
 
 The operator must independently obtain the target base SHA and list every policy file; the source must contain the frozen commit objects. Preparing a batch does not start CI or grant merge permission. The local staging remote must be trusted and must not trigger unintended workloads. This path is for development and has not been validated against a live GitHub App.
 
