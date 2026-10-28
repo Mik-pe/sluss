@@ -162,6 +162,20 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Cancel a directly received check whose local CI evidence is stale.
+    CancelStaleStagedCheck {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Recover an uncertain stale-check cancellation by reading GitHub.
+    RecoverCancelledStagedCheck {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Inspect the local nonpassing check journal without contacting GitHub.
     StagedCheck {
         #[arg(long)]
@@ -944,6 +958,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 intent.candidate.snapshot.run.id,
                 intent.candidate_digest
             );
+            if let Some(cancellation) = journal.pending_ci_cancellation(batch_id)? {
+                println!("cancellation: {cancellation:?}");
+            }
             match journal.inspect_ci_candidate(batch_id, &intent.candidate.policy) {
                 Ok(Some(current)) if current.digest == intent.candidate_digest => {
                     println!("local evidence matches; provider state may have changed")
@@ -1664,6 +1681,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!(
                 "nonpassing staged check recovery: {outcome:?}; a match does not prove request origin or authorize a merge"
+            );
+        }
+        Command::CancelStaleStagedCheck { batch_id, config } => {
+            let config = sluss::config::Config::load(&config)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let read = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let write = app
+                .checks_write_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+            let outcome = app
+                .cancel_stale_staged_check(
+                    &mut journal,
+                    (&read, &write),
+                    (&config.github.owner, &config.github.repository),
+                    &batch_id,
+                )
+                .await?;
+            println!("stale staged check cancellation: {outcome:?}; no merge is authorized");
+        }
+        Command::RecoverCancelledStagedCheck { batch_id, config } => {
+            let config = sluss::config::Config::load(&config)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let read = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+            let outcome = app
+                .recover_cancelled_staged_check(
+                    &mut journal,
+                    &read,
+                    (&config.github.owner, &config.github.repository),
+                    &batch_id,
+                )
+                .await?;
+            println!(
+                "stale check cancellation recovery: {outcome:?}; a match does not prove request origin"
             );
         }
         Command::StagedCheck { .. } => unreachable!(),

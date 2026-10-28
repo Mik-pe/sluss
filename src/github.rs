@@ -1925,6 +1925,37 @@ pub enum PendingCheckOutcome {
     AlreadyCreated(u64),
     Recovered(u64),
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingCancellationOutcome {
+    Cancelled(u64),
+    AlreadyCancelled(u64),
+    Recovered(u64),
+}
+const CANCELLED_CHECK_TITLE: &str = "Staging CI verification cancelled";
+fn cancelled_check_summary(intent: &crate::landing::PendingCiCheckIntent) -> String {
+    format!(
+        "CI run {} candidate {} is no longer current. This cancelled check is not an attestation and does not authorize a merge.",
+        intent.candidate.snapshot.run.id, intent.candidate_digest
+    )
+}
+fn cancelled_check_matches(
+    intent: &crate::landing::PendingCiCheckIntent,
+    check: &AppCheckObservation,
+) -> bool {
+    check.id != 0
+        && check.check_suite.id != 0
+        && check.name == "sluss/verified"
+        && check.head_sha == intent.candidate.plan.staged_sha
+        && check.external_id.as_deref() == Some(intent.candidate.plan.batch_id.as_str())
+        && check.status == "completed"
+        && check.conclusion.as_deref() == Some("cancelled")
+        && check.app.id == intent.candidate.app_id
+        && check.app.node_id == intent.candidate.app_node_id
+        && check.output.as_ref().is_some_and(|o| {
+            o.title.as_deref() == Some(CANCELLED_CHECK_TITLE)
+                && o.summary.as_deref() == Some(cancelled_check_summary(intent).as_str())
+        })
+}
 const PENDING_CHECK_TITLE: &str = "Staging CI verification in progress";
 fn pending_check_summary(intent: &crate::landing::PendingCiCheckIntent) -> String {
     format!(
@@ -1987,7 +2018,13 @@ impl App {
                 },
             ) => {
                 let observed = self
-                    .read_pending_ci_check(read, (&policy.owner, &policy.name), &intent, check_id)
+                    .read_staged_ci_check(
+                        read,
+                        (&policy.owner, &policy.name),
+                        &intent,
+                        check_id,
+                        false,
+                    )
                     .await?;
                 if observed.check_suite.id != suite_id {
                     return Err(PendingCheckError::CandidateMismatch);
@@ -2043,12 +2080,13 @@ impl App {
         Ok(PendingCheckOutcome::Created(observed.id))
     }
 
-    async fn read_pending_ci_check(
+    async fn read_staged_ci_check(
         &self,
         token: &InstallationToken,
         repository: (&str, &str),
         intent: &crate::landing::PendingCiCheckIntent,
         check_id: u64,
+        cancelled: bool,
     ) -> Result<AppCheckObservation, PendingCheckError> {
         #[derive(Deserialize, PartialEq, Eq)]
         struct Identity {
@@ -2084,11 +2122,152 @@ impl App {
             || app.node_id != intent.candidate.app_node_id
             || first != last
             || first.id != check_id
-            || !pending_check_matches(intent, &first)
+            || if cancelled {
+                !cancelled_check_matches(intent, &first)
+            } else {
+                !pending_check_matches(intent, &first)
+            }
         {
             return Err(PendingCheckError::CandidateMismatch);
         }
         Ok(first)
+    }
+
+    /// Cancel a directly received, locally stale nonpassing check at most once.
+    /// An ambiguous PATCH remains journaled and is never sent again blindly.
+    pub async fn cancel_stale_staged_check(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        tokens: (&InstallationToken, &InstallationToken),
+        repository: (&str, &str),
+        batch_id: &str,
+    ) -> Result<PendingCancellationOutcome, PendingCheckError> {
+        use crate::landing::PendingCiCancellationState;
+        let (read, write) = tokens;
+        if !write.checks_write
+            || write.repository_id != read.repository_id
+            || write.installation_id != read.installation_id
+            || write.app_client_id != self.client_id
+            || write.api_origin != self.api.as_str()
+        {
+            return Err(PendingCheckError::Scope);
+        }
+        if let Some(state) = journal.pending_ci_cancellation(batch_id)? {
+            match state {
+                PendingCiCancellationState::Sending { .. } => {
+                    return Err(PendingCheckError::Uncertain);
+                }
+                PendingCiCancellationState::Cancelled {
+                    check_id, suite_id, ..
+                } => {
+                    let (intent, _) = journal
+                        .pending_ci_check(batch_id)?
+                        .ok_or(PendingCheckError::Uncertain)?;
+                    let observed = self
+                        .read_staged_ci_check(read, repository, &intent, check_id, true)
+                        .await?;
+                    if observed.check_suite.id != suite_id {
+                        return Err(PendingCheckError::CandidateMismatch);
+                    }
+                    return Ok(PendingCancellationOutcome::AlreadyCancelled(check_id));
+                }
+            }
+        }
+        let target = journal.stale_pending_ci_check(batch_id)?;
+        let before = self
+            .read_staged_ci_check(read, repository, &target.intent, target.check_id, false)
+            .await?;
+        if before.check_suite.id != target.suite_id {
+            return Err(PendingCheckError::CandidateMismatch);
+        }
+        if !journal.claim_pending_ci_cancellation(&target)? {
+            return Err(PendingCheckError::Uncertain);
+        }
+        let (owner, name) = repository;
+        let url = self
+            .api
+            .join(&format!(
+                "repos/{owner}/{name}/check-runs/{}",
+                target.check_id
+            ))
+            .map_err(|_| PendingCheckError::Scope)?;
+        let body = serde_json::json!({"status":"completed","conclusion":"cancelled","output":{"title":CANCELLED_CHECK_TITLE,"summary":cancelled_check_summary(&target.intent)}});
+        let mut response = self
+            .client
+            .patch(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(write.secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| PendingCheckError::Uncertain)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(PendingCheckError::Uncertain);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| PendingCheckError::Uncertain)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 65536 {
+                return Err(PendingCheckError::Uncertain);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let observed: AppCheckObservation =
+            serde_json::from_slice(&bytes).map_err(|_| PendingCheckError::Uncertain)?;
+        if observed.id != target.check_id
+            || observed.check_suite.id != target.suite_id
+            || !cancelled_check_matches(&target.intent, &observed)
+        {
+            return Err(PendingCheckError::Uncertain);
+        }
+        journal
+            .record_pending_ci_cancellation(batch_id, target.check_id, target.suite_id, true)
+            .map_err(|_| PendingCheckError::Uncertain)?;
+        Ok(PendingCancellationOutcome::Cancelled(target.check_id))
+    }
+
+    /// Read back a cancelled check after an uncertain PATCH, without resending.
+    pub async fn recover_cancelled_staged_check(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        repository: (&str, &str),
+        batch_id: &str,
+    ) -> Result<PendingCancellationOutcome, PendingCheckError> {
+        use crate::landing::PendingCiCancellationState;
+        let state = journal
+            .pending_ci_cancellation(batch_id)?
+            .ok_or(PendingCheckError::Uncertain)?;
+        let (check_id, suite_id) = match state {
+            PendingCiCancellationState::Sending { check_id, suite_id }
+            | PendingCiCancellationState::Cancelled {
+                check_id, suite_id, ..
+            } => (check_id, suite_id),
+        };
+        let (intent, _) = journal
+            .pending_ci_check(batch_id)?
+            .ok_or(PendingCheckError::Uncertain)?;
+        let observed = self
+            .read_staged_ci_check(token, repository, &intent, check_id, true)
+            .await?;
+        if observed.check_suite.id != suite_id {
+            return Err(PendingCheckError::CandidateMismatch);
+        }
+        let recorded =
+            journal.record_pending_ci_cancellation(batch_id, check_id, suite_id, false)?;
+        match recorded {
+            PendingCiCancellationState::Cancelled { direct: true, .. } => {
+                Ok(PendingCancellationOutcome::AlreadyCancelled(check_id))
+            }
+            PendingCiCancellationState::Cancelled { .. } => {
+                Ok(PendingCancellationOutcome::Recovered(check_id))
+            }
+            _ => Err(PendingCheckError::Uncertain),
+        }
     }
 
     /// Associate an explicitly identified historical in-progress check without
@@ -2115,7 +2294,7 @@ impl App {
             _ => return Err(PendingCheckError::Uncertain),
         };
         let observed = self
-            .read_pending_ci_check(token, repository, &intent, check_id)
+            .read_staged_ci_check(token, repository, &intent, check_id, false)
             .await?;
         if known_suite.is_some_and(|suite| suite != observed.check_suite.id) {
             return Err(PendingCheckError::CandidateMismatch);

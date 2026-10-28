@@ -385,7 +385,7 @@ async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) ->
         body["bypass_actors"] =
             json!([{"actor_type":"Integration","actor_id":null,"bypass_mode":"always"}]);
     }
-    if mode == 73 || (125..=127).contains(&mode) || matches!(mode, 132..=134) {
+    if mode == 73 || (125..=127).contains(&mode) || matches!(mode, 132..=134 | 138) {
         body["bypass_actors"] = json!([]);
     }
     if mode == 77 {
@@ -526,6 +526,51 @@ async fn pending_check_post(state: ServerState, body: Value) -> (StatusCode, Jso
     (StatusCode::CREATED, Json(response))
 }
 
+async fn cancel_pending_check_patch(
+    State(state): State<ServerState>,
+    Path(check_id): Path<u64>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["conclusion"], "cancelled");
+    assert_eq!(body["output"]["title"], "Staging CI verification cancelled");
+    assert!(
+        body["output"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("does not authorize a merge")
+    );
+    let mut value = pending_check_stub().lock().unwrap().clone().unwrap();
+    assert_eq!(value["id"], check_id);
+    value["status"] = body["status"].clone();
+    value["conclusion"] = body["conclusion"].clone();
+    value["output"] = body["output"].clone();
+    *pending_check_stub().lock().unwrap() = Some(value.clone());
+    state.permissions.fetch_add(1, Ordering::SeqCst);
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 135 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ambiguous"})),
+        );
+    }
+    if mode == 136 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.mode.load(Ordering::SeqCst) == 136 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancellation race must release sender");
+    }
+    if mode == 137 {
+        value["conclusion"] = json!("success");
+    }
+    (StatusCode::OK, Json(value))
+}
+
 async fn failed_check_get(
     State(state): State<ServerState>,
     Path(check_id): Path<u64>,
@@ -534,6 +579,16 @@ async fn failed_check_get(
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
     if check_id >= 555 {
+        if mode == 138 {
+            state.pulls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while state.mode.load(Ordering::SeqCst) == 138 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("provider-read race must release reader");
+        }
         let stored = pending_check_stub().lock().unwrap().clone();
         let mut value = stored.unwrap_or_else(|| json!({"id":check_id,"name":"unknown"}));
         if value["id"].as_u64() != Some(check_id) {
@@ -1714,7 +1769,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .route("/repos/owner/repo/check-runs/333", get(verified_check))
         .route(
             "/repos/owner/repo/check-runs/{check_id}",
-            get(failed_check_get),
+            get(failed_check_get).patch(cancel_pending_check_patch),
         )
         .route("/repos/owner/repo/check-runs", post(failed_check_post))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
@@ -3909,6 +3964,505 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .unwrap();
     assert!(pending_report.status.success());
     assert!(String::from_utf8_lossy(&pending_report.stdout).contains("no CI attestation"));
+    let pristine_pending = pending_check_stub().lock().unwrap().clone().unwrap();
+    let before_current_cancel = posts.load(Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut pending,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Journal(
+            sluss::landing::LandingError::PendingCheckNotStale
+        ))
+    ));
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut pending,
+                (&fixture_token, &fixture_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Scope)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_current_cancel);
+    let pending_conn = rusqlite::Connection::open(&pending_db).unwrap();
+    let cancel_db = data.path().join("pending-cancel-cli.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [cancel_db.to_str().unwrap()])
+        .unwrap();
+    let mut cancel_inbox = Inbox::open(&cancel_db).unwrap();
+    cancel_inbox
+        .record("cancel-review", "pull_request_review", &[71; 32], 42, 7)
+        .unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    let cancel_db_arg = cancel_db.clone();
+    let config_arg = config.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let cancelled = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(cancel_db_arg)
+            .args(["cancel-stale-staged-check", "--batch-id", id, "--config"])
+            .arg(config_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        cancelled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cancelled.stdout).contains("Cancelled(555)"));
+    let mut cancel_journal = sluss::landing::LandingJournal::open(&cancel_db).unwrap();
+    assert!(matches!(
+        cancel_journal.pending_ci_cancellation(id).unwrap(),
+        Some(sluss::landing::PendingCiCancellationState::Cancelled {
+            check_id: 555,
+            direct: true,
+            recovered: false,
+            ..
+        })
+    ));
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut cancel_journal,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Ok(sluss::github::PendingCancellationOutcome::AlreadyCancelled(
+            555
+        ))
+    ));
+    let cancelled_report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&cancel_db)
+        .args(["staged-check", "--batch-id", id])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&cancelled_report.stdout).contains("cancellation: Cancelled"));
+    assert_eq!(
+        pending_check_stub().lock().unwrap().as_ref().unwrap()["conclusion"],
+        "cancelled"
+    );
+    assert!(
+        observer_app
+            .start_staged_check(
+                &mut cancel_journal,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .is_err()
+    );
+    // A lost cancellation response is resolved by a read, never a second PATCH.
+    let cancel_lost_db = data.path().join("pending-cancel-lost.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [cancel_lost_db.to_str().unwrap()])
+        .unwrap();
+    let mut cancel_lost_inbox = Inbox::open(&cancel_lost_db).unwrap();
+    cancel_lost_inbox
+        .record(
+            "cancel-lost-review",
+            "pull_request_review",
+            &[72; 32],
+            42,
+            7,
+        )
+        .unwrap();
+    let mut cancel_lost = sluss::landing::LandingJournal::open(&cancel_lost_db).unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(135, Ordering::SeqCst);
+    let before_cancel_lost = posts.load(Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut cancel_lost,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    assert!(matches!(
+        cancel_lost.pending_ci_cancellation(id).unwrap(),
+        Some(sluss::landing::PendingCiCancellationState::Sending { check_id: 555, .. })
+    ));
+    drop(cancel_lost);
+    let mut cancel_lost = sluss::landing::LandingJournal::open(&cancel_lost_db).unwrap();
+    mode.store(73, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut cancel_lost,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_cancel_lost + 1);
+    mode.store(131, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .recover_cancelled_staged_check(&mut cancel_lost, &fixture_token, ("owner", "repo"), id)
+            .await,
+        Err(sluss::github::PendingCheckError::CandidateMismatch)
+    ));
+    mode.store(130, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .recover_cancelled_staged_check(&mut cancel_lost, &fixture_token, ("owner", "repo"), id)
+            .await,
+        Err(sluss::github::PendingCheckError::CandidateMismatch)
+    ));
+    mode.store(73, Ordering::SeqCst);
+    let cancel_lost_arg = cancel_lost_db.clone();
+    let config_arg = config.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let recovered_cancel = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(cancel_lost_arg)
+            .args([
+                "recover-cancelled-staged-check",
+                "--batch-id",
+                id,
+                "--config",
+            ])
+            .arg(config_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        recovered_cancel.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered_cancel.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&recovered_cancel.stdout).contains("does not prove request origin")
+    );
+    assert!(matches!(
+        cancel_lost.pending_ci_cancellation(id).unwrap(),
+        Some(sluss::landing::PendingCiCancellationState::Cancelled {
+            direct: false,
+            recovered: true,
+            ..
+        })
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_cancel_lost + 1);
+    // A recovered cancellation may receive the matching direct response later.
+    let cancel_late_db = data.path().join("pending-cancel-late.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [cancel_late_db.to_str().unwrap()])
+        .unwrap();
+    let mut cancel_late_inbox = Inbox::open(&cancel_late_db).unwrap();
+    cancel_late_inbox
+        .record(
+            "cancel-late-review",
+            "pull_request_review",
+            &[73; 32],
+            42,
+            7,
+        )
+        .unwrap();
+    let mut cancel_sender = sluss::landing::LandingJournal::open(&cancel_late_db).unwrap();
+    let mut cancel_recovery = sluss::landing::LandingJournal::open(&cancel_late_db).unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(136, Ordering::SeqCst);
+    let before_cancel_late = posts.load(Ordering::SeqCst);
+    let (sent, recovered) = tokio::join!(
+        observer_app.cancel_stale_staged_check(
+            &mut cancel_sender,
+            (&fixture_token, &check_token),
+            ("owner", "repo"),
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while posts.load(Ordering::SeqCst) == before_cancel_late {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let outcome = observer_app
+                .recover_cancelled_staged_check(
+                    &mut cancel_recovery,
+                    &fixture_token,
+                    ("owner", "repo"),
+                    id,
+                )
+                .await;
+            mode.store(73, Ordering::SeqCst);
+            outcome
+        }
+    );
+    assert!(matches!(
+        sent,
+        Ok(sluss::github::PendingCancellationOutcome::Cancelled(555))
+    ));
+    assert!(matches!(
+        recovered,
+        Ok(sluss::github::PendingCancellationOutcome::Recovered(555))
+    ));
+    assert!(matches!(
+        cancel_sender.pending_ci_cancellation(id).unwrap(),
+        Some(sluss::landing::PendingCiCancellationState::Cancelled {
+            direct: true,
+            recovered: true,
+            ..
+        })
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_cancel_late + 1);
+    // A newly reverified candidate must prevent an obsolete cancellation.
+    let cancel_race_db = data.path().join("pending-cancel-race.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [cancel_race_db.to_str().unwrap()])
+        .unwrap();
+    let mut cancel_race_inbox = Inbox::open(&cancel_race_db).unwrap();
+    cancel_race_inbox
+        .record(
+            "cancel-race-review",
+            "pull_request_review",
+            &[74; 32],
+            42,
+            7,
+        )
+        .unwrap();
+    let event = cancel_race_inbox.pending().unwrap().remove(0);
+    let mut cancel_race_store = Store::open(&cancel_race_db).unwrap();
+    sluss::reconcile::reconcile_once(
+        &observer_app,
+        &fixture_token,
+        &mut cancel_race_store,
+        &event,
+        &observer_policy,
+    )
+    .await
+    .unwrap();
+    let mut cancel_race = sluss::landing::LandingJournal::open(&cancel_race_db).unwrap();
+    let mut refresh_race = sluss::landing::LandingJournal::open(&cancel_race_db).unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(138, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let before_cancel_race = posts.load(Ordering::SeqCst);
+    let (cancelled, refreshed) = tokio::join!(
+        observer_app.cancel_stale_staged_check(
+            &mut cancel_race,
+            (&fixture_token, &check_token),
+            ("owner", "repo"),
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while reads.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = observer_app
+                .verify_staged_ci(
+                    &mut refresh_race,
+                    (&fixture_token, &security_token),
+                    &observer_policy,
+                    &selected_trust,
+                    id,
+                )
+                .await;
+            mode.store(73, Ordering::SeqCst);
+            result
+        }
+    );
+    assert!(refreshed.is_ok(), "{refreshed:?}");
+    assert!(matches!(
+        cancelled,
+        Err(sluss::github::PendingCheckError::Journal(
+            sluss::landing::LandingError::PendingCheckNotStale
+        ))
+    ));
+    assert!(cancel_race.pending_ci_cancellation(id).unwrap().is_none());
+    assert_eq!(posts.load(Ordering::SeqCst), before_cancel_race);
+    // Concurrent callers cannot send two cancellation requests.
+    let concurrent_db = data.path().join("pending-cancel-concurrent.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [concurrent_db.to_str().unwrap()])
+        .unwrap();
+    let mut concurrent_inbox = Inbox::open(&concurrent_db).unwrap();
+    concurrent_inbox
+        .record("concurrent-review", "pull_request_review", &[79; 32], 42, 7)
+        .unwrap();
+    let mut first = sluss::landing::LandingJournal::open(&concurrent_db).unwrap();
+    let mut second = sluss::landing::LandingJournal::open(&concurrent_db).unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(136, Ordering::SeqCst);
+    let before_concurrent = posts.load(Ordering::SeqCst);
+    let (first_result, second_result) = tokio::join!(
+        observer_app.cancel_stale_staged_check(
+            &mut first,
+            (&fixture_token, &check_token),
+            ("owner", "repo"),
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while posts.load(Ordering::SeqCst) == before_concurrent {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = observer_app
+                .cancel_stale_staged_check(
+                    &mut second,
+                    (&fixture_token, &check_token),
+                    ("owner", "repo"),
+                    id,
+                )
+                .await;
+            mode.store(73, Ordering::SeqCst);
+            result
+        }
+    );
+    assert!(matches!(
+        first_result,
+        Ok(sluss::github::PendingCancellationOutcome::Cancelled(555))
+    ));
+    assert!(matches!(
+        second_result,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_concurrent + 1);
+
+    // A fully acknowledged event still invalidates the in-flight observation.
+    let event_race_db = data.path().join("pending-cancel-event-race.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [event_race_db.to_str().unwrap()])
+        .unwrap();
+    let mut event_inbox = Inbox::open(&event_race_db).unwrap();
+    event_inbox
+        .record("event-race-first", "pull_request_review", &[75; 32], 42, 7)
+        .unwrap();
+    let event = event_inbox.pending().unwrap().remove(0);
+    let mut event_store = Store::open(&event_race_db).unwrap();
+    sluss::reconcile::reconcile_once(
+        &observer_app,
+        &fixture_token,
+        &mut event_store,
+        &event,
+        &observer_policy,
+    )
+    .await
+    .unwrap();
+    let mut event_journal = sluss::landing::LandingJournal::open(&event_race_db).unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(138, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let before_event_race = posts.load(Ordering::SeqCst);
+    let (result, ()) = tokio::join!(
+        observer_app.cancel_stale_staged_check(
+            &mut event_journal,
+            (&fixture_token, &check_token),
+            ("owner", "repo"),
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while reads.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            event_inbox
+                .record("event-race-second", "pull_request_review", &[76; 32], 42, 7)
+                .unwrap();
+            let event = event_inbox.pending().unwrap().remove(0);
+            sluss::reconcile::reconcile_once(
+                &observer_app,
+                &fixture_token,
+                &mut event_store,
+                &event,
+                &observer_policy,
+            )
+            .await
+            .unwrap();
+            mode.store(73, Ordering::SeqCst);
+        }
+    );
+    assert!(matches!(
+        result,
+        Err(sluss::github::PendingCheckError::Journal(
+            sluss::landing::LandingError::StaleBatch
+        ))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_event_race);
+    assert!(event_journal.pending_ci_cancellation(id).unwrap().is_none());
+
+    // A forged success response is uncertain and cannot trigger a retry.
+    let forged_db = data.path().join("pending-cancel-forged.sqlite");
+    pending_conn
+        .execute("VACUUM INTO ?1", [forged_db.to_str().unwrap()])
+        .unwrap();
+    let mut forged_inbox = Inbox::open(&forged_db).unwrap();
+    forged_inbox
+        .record("forged-review", "pull_request_review", &[77; 32], 42, 7)
+        .unwrap();
+    let mut forged = sluss::landing::LandingJournal::open(&forged_db).unwrap();
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
+    mode.store(137, Ordering::SeqCst);
+    let before_forged = posts.load(Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut forged,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    mode.store(73, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut forged,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    assert!(matches!(
+        observer_app
+            .recover_cancelled_staged_check(&mut forged, &fixture_token, ("owner", "repo"), id)
+            .await,
+        Ok(sluss::github::PendingCancellationOutcome::Recovered(555))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_forged + 1);
+
+    *pending_check_stub().lock().unwrap() = Some(pristine_pending.clone());
     let lost_db = data.path().join("pending-check-lost.sqlite");
     candidate_conn
         .execute("VACUUM INTO ?1", [lost_db.to_str().unwrap()])
@@ -4006,6 +4560,25 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             )
             .await,
         Ok(sluss::github::PendingCheckOutcome::Recovered(556))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), after_lost);
+    // A recovered creation is not proof that our request created the check.
+    let mut lost_inbox = Inbox::open(&lost_db).unwrap();
+    lost_inbox
+        .record("lost-review", "pull_request_review", &[78; 32], 42, 7)
+        .unwrap();
+    assert!(matches!(
+        observer_app
+            .cancel_stale_staged_check(
+                &mut lost,
+                (&fixture_token, &check_token),
+                ("owner", "repo"),
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Journal(
+            sluss::landing::LandingError::PendingCheckConflict
+        ))
     ));
     assert_eq!(posts.load(Ordering::SeqCst), after_lost);
     for race_mode in [127, 132, 133] {

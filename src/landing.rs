@@ -77,6 +77,8 @@ pub enum LandingError {
     TrustPolicy,
     #[error("pending check receipt is inconsistent or belongs to another intent")]
     PendingCheckConflict,
+    #[error("the staging check still matches current local evidence")]
+    PendingCheckNotStale,
     #[error("could not read operator CI trust policy")]
     TrustPolicyRead,
     #[error("invalid operator CI trust policy TOML")]
@@ -317,6 +319,27 @@ pub enum PendingCiCheckState {
         other_suite_id: u64,
     },
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingCiCancellationState {
+    Sending {
+        check_id: u64,
+        suite_id: u64,
+    },
+    Cancelled {
+        check_id: u64,
+        suite_id: u64,
+        direct: bool,
+        recovered: bool,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StalePendingCiCheck {
+    pub intent: PendingCiCheckIntent,
+    pub check_id: u64,
+    pub suite_id: u64,
+    pub delivery_revision: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingCiCheckClaim {
     Send(PendingCiCheckIntent),
@@ -562,6 +585,9 @@ impl LandingJournal {
             candidate_digest: record.digest.clone(),
         };
         if let Some((existing, state)) = pending_ci_check_from_conn(&tx, batch)? {
+            if pending_ci_cancellation_from_conn(&tx, batch)?.is_some() {
+                return Err(LandingError::PendingCheckConflict);
+            }
             if existing != intent {
                 return Err(LandingError::PendingCheckConflict);
             }
@@ -631,6 +657,93 @@ impl LandingJournal {
         Ok(new_state)
     }
 
+    /// Inspect the historical nonpassing-check cancellation journal.
+    pub fn pending_ci_cancellation(
+        &self,
+        id: &str,
+    ) -> Result<Option<PendingCiCancellationState>, LandingError> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_ci_cancellations_v1')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        pending_ci_cancellation_from_conn(&self.conn, id)
+    }
+
+    /// Return a directly received check only when its local evidence is no
+    /// longer current. Read-only provider verification must follow.
+    pub(crate) fn stale_pending_ci_check(
+        &mut self,
+        id: &str,
+    ) -> Result<StalePendingCiCheck, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let target = stale_pending_ci_check_from_conn(&tx, id)?;
+        tx.commit()?;
+        Ok(target)
+    }
+
+    /// Claim one cancellation after provider reads, rechecking local staleness,
+    /// receipt identity and the monotonic delivery revision transactionally.
+    pub(crate) fn claim_pending_ci_cancellation(
+        &mut self,
+        expected: &StalePendingCiCheck,
+    ) -> Result<bool, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            stale_pending_ci_check_from_conn(&tx, &expected.intent.candidate.plan.batch_id)?;
+        if current != *expected {
+            return Err(LandingError::StaleBatch);
+        }
+        if pending_ci_cancellation_from_conn(&tx, &expected.intent.candidate.plan.batch_id)?
+            .is_some()
+        {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute("INSERT INTO pending_ci_cancellations_v1(batch_id,check_id,suite_id,state) VALUES(?1,?2,?3,'sending')", params![expected.intent.candidate.plan.batch_id,expected.check_id.to_string(),expected.suite_id.to_string()])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Record only a provider-confirmed cancelled conclusion. A lost reply
+    /// remains uncertain until independently read back.
+    pub(crate) fn record_pending_ci_cancellation(
+        &mut self,
+        id: &str,
+        check_id: u64,
+        suite_id: u64,
+        direct: bool,
+    ) -> Result<PendingCiCancellationState, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = pending_ci_cancellation_from_conn(&tx, id)?
+            .ok_or(LandingError::PendingCheckConflict)?;
+        match state {
+            PendingCiCancellationState::Sending {
+                check_id: known,
+                suite_id: suite,
+            } if known == check_id && suite == suite_id => {
+                tx.execute("UPDATE pending_ci_cancellations_v1 SET state='cancelled',direct=?2,recovered=?3 WHERE batch_id=?1 AND state='sending'", params![id,direct,!direct])?;
+            }
+            PendingCiCancellationState::Cancelled {
+                check_id: known,
+                suite_id: suite,
+                ..
+            } if known == check_id && suite == suite_id => {
+                tx.execute("UPDATE pending_ci_cancellations_v1 SET direct=MAX(direct,?2),recovered=MAX(recovered,?3) WHERE batch_id=?1", params![id,direct,!direct])?;
+            }
+            _ => return Err(LandingError::PendingCheckConflict),
+        }
+        let saved = pending_ci_cancellation_from_conn(&tx, id)?
+            .ok_or(LandingError::PendingCheckConflict)?;
+        tx.commit()?;
+        Ok(saved)
+    }
+
     /// Compare a frozen local batch to an operator policy without creating a
     /// journal intent or querying the provider. The database is opened read-only.
     pub fn inspect_trusted_batch(
@@ -668,6 +781,7 @@ impl LandingJournal {
         CREATE TABLE IF NOT EXISTS pending_ci_checks_v1 (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','created')), check_id TEXT, suite_id TEXT, direct INTEGER NOT NULL DEFAULT 0 CHECK(direct IN (0,1)), recovered INTEGER NOT NULL DEFAULT 0 CHECK(recovered IN (0,1)));
         CREATE UNIQUE INDEX IF NOT EXISTS pending_ci_check_unique_id_v1 ON pending_ci_checks_v1(check_id) WHERE check_id IS NOT NULL;
         CREATE TABLE IF NOT EXISTS pending_ci_check_conflicts_v1 (batch_id TEXT PRIMARY KEY NOT NULL, other_check_id TEXT NOT NULL, other_suite_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pending_ci_cancellations_v1 (batch_id TEXT PRIMARY KEY NOT NULL, check_id TEXT NOT NULL, suite_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','cancelled')), direct INTEGER NOT NULL DEFAULT 0 CHECK(direct IN (0,1)), recovered INTEGER NOT NULL DEFAULT 0 CHECK(recovered IN (0,1)));
         CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
         CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);",
         )?;
@@ -1106,6 +1220,90 @@ impl LandingJournal {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn stale_pending_ci_check_from_conn(
+    conn: &Connection,
+    id: &str,
+) -> Result<StalePendingCiCheck, LandingError> {
+    let (intent, state) =
+        pending_ci_check_from_conn(conn, id)?.ok_or(LandingError::PendingCheckConflict)?;
+    let (check_id, suite_id) = match state {
+        PendingCiCheckState::Created {
+            check_id,
+            suite_id,
+            direct: true,
+            ..
+        } => (check_id, suite_id),
+        _ => return Err(LandingError::PendingCheckConflict),
+    };
+    let policy_digest = intent.candidate.policy.digest()?;
+    let head: Option<String> = conn.query_row("SELECT digest FROM ci_evidence_candidate_heads_v1 WHERE batch_id=?1 AND policy_digest=?2", params![id,policy_digest], |r| r.get(0)).optional()?;
+    if head.as_deref() == Some(intent.candidate_digest.as_str()) {
+        return Err(LandingError::PendingCheckNotStale);
+    }
+    Ok(StalePendingCiCheck {
+        intent,
+        check_id,
+        suite_id,
+        delivery_revision: delivery_revision_from_conn(conn)?,
+    })
+}
+
+fn pending_ci_cancellation_from_conn(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<PendingCiCancellationState>, LandingError> {
+    let row: Option<(String,String,String,bool,bool)> = conn.query_row("SELECT check_id,suite_id,state,direct,recovered FROM pending_ci_cancellations_v1 WHERE batch_id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    let Some((check, suite, state, direct, recovered)) = row else {
+        return Ok(None);
+    };
+    let parse = |s: String| {
+        s.parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0 && n.to_string() == s)
+            .ok_or(LandingError::Corrupt)
+    };
+    let check_id = parse(check)?;
+    let suite_id = parse(suite)?;
+    let (_, pending) = pending_ci_check_from_conn(conn, id)?.ok_or(LandingError::Corrupt)?;
+    let has_direct: bool = conn.query_row(
+        "SELECT direct FROM pending_ci_checks_v1 WHERE batch_id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !has_direct {
+        return Err(LandingError::Corrupt);
+    }
+    match pending {
+        PendingCiCheckState::Created {
+            check_id: known,
+            suite_id: suite,
+            direct: true,
+            ..
+        } if known == check_id && suite == suite_id => {}
+        PendingCiCheckState::Conflict {
+            check_id: Some(known),
+            suite_id: Some(suite),
+            ..
+        } if known == check_id && suite == suite_id => {}
+        _ => return Err(LandingError::Corrupt),
+    }
+    match (state.as_str(), direct, recovered) {
+        ("sending", false, false) => Ok(Some(PendingCiCancellationState::Sending {
+            check_id,
+            suite_id,
+        })),
+        ("cancelled", direct, recovered) if direct || recovered => {
+            Ok(Some(PendingCiCancellationState::Cancelled {
+                check_id,
+                suite_id,
+                direct,
+                recovered,
+            }))
+        }
+        _ => Err(LandingError::Corrupt),
     }
 }
 
