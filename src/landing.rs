@@ -898,6 +898,26 @@ impl LandingJournal {
             .optional()?;
         row.map(|row| decode_row(id, row)).transpose()
     }
+    /// List recent unresolved intents without creating or migrating a database.
+    /// The flag indicates more than 100 were found.
+    pub fn unresolved_intents(
+        &self,
+    ) -> Result<(Vec<(LandingPlan, IntentState)>, bool), LandingError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,plan,state,repository_id,target_ref FROM landing_intents_v1 WHERE state IN ('prepared','sending') ORDER BY rowid DESC LIMIT 101"
+        )?;
+        let mut rows = statement.query([])?;
+        let mut intents = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let item = decode_row(&id, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))?;
+            intents.push(item);
+        }
+        let more = intents.len() > 100;
+        intents.truncate(100);
+        Ok((intents, more))
+    }
+
     /// Retrieve the last historical observation and detect corrupted or
     /// rebound intent data. This does not change the unresolved intent.
     pub fn last_recovery_observation(

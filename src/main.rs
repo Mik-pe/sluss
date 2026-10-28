@@ -168,6 +168,29 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Freeze a trusted batch and generate a unique experimental landing ID.
+    PrepareLandingMarker {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Create the frozen marker once with the GitHub App; no landing is sent.
+    CreateLandingMarker {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Cancel a landing intent only before its landing send is claimed.
+    CancelLanding {
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// List unresolved landing intents from an existing database.
+    LandingIntents,
     /// Read an uncertain landing's GitHub refs without retrying the mutation.
     ObserveLandingRecovery {
         #[arg(long)]
@@ -1251,6 +1274,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if let Command::PrepareLandingMarker { batch_id, policy } = &cli.command {
+        let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
+        // Open read-only first: a typo must not create an empty queue database.
+        sluss::landing::LandingJournal::inspect_trusted_batch(&cli.db, batch_id, &trust)?;
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let id = hex::encode(random);
+        let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+        let plan = journal.prepare_trusted_batch_with_marker(&id, batch_id, &trust)?;
+        println!(
+            "prepared landing {} for batch {}; marker {}",
+            plan.operation_id,
+            plan.batch_id,
+            plan.marker_ref
+                .as_deref()
+                .ok_or("marker missing from plan")?
+        );
+        println!("Local intent only; no GitHub ref, CI attestation or merge was created.");
+        return Ok(());
+    }
+    if let Command::CreateLandingMarker {
+        operation_id,
+        config,
+        policy,
+    } = &cli.command
+    {
+        let config = sluss::config::Config::load(config)?;
+        let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
+        let read_only = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        let (plan, _) = read_only
+            .get(operation_id)?
+            .ok_or("unknown landing intent")?;
+        if (plan.installation_id, plan.repository_id)
+            != (config.github.installation_id, config.github.repository_id)
+            || plan.target_ref != format!("refs/heads/{}", config.queue.target)
+            || plan.marker_ref.is_none()
+        {
+            return Err("repository, target or marker does not match the landing intent".into());
+        }
+        let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let app = sluss::github::App::new(
+            config.github.app_client_id.clone(),
+            &std::fs::read(key_path)?,
+            &config.github.api,
+        )?;
+        let read = app
+            .read_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let write = app
+            .staging_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+        let state = app
+            .create_landing_marker(
+                &mut journal,
+                &read,
+                &write,
+                &config.policy(),
+                &trust,
+                operation_id,
+            )
+            .await?;
+        println!("marker creation for {operation_id}: {state:?}");
+        println!("No landing mutation, CI attestation or merge authorization was issued.");
+        return Ok(());
+    }
+    if let Command::CancelLanding { operation_id } = &cli.command {
+        let inspect = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        inspect.get(operation_id)?.ok_or("unknown landing intent")?;
+        let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+        if !journal.cancel(operation_id)? {
+            return Err("landing was already claimed or is no longer prepared".into());
+        }
+        println!("cancelled prepared landing {operation_id}; no landing mutation was sent");
+        println!(
+            "A marker-creation attempt may still need inspection or cleanup; it will not be retried."
+        );
+        return Ok(());
+    }
+    if let Command::LandingIntents = &cli.command {
+        let journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        let (intents, more) = journal.unresolved_intents()?;
+        println!("{} unresolved landing intents shown", intents.len());
+        for (plan, state) in intents {
+            println!(
+                "{}: {:?}, batch {}, target {}, marker {}",
+                plan.operation_id,
+                state,
+                plan.batch_id,
+                plan.target_ref,
+                plan.marker_ref.as_deref().unwrap_or("none")
+            );
+        }
+        if more {
+            println!("Showing the 100 most recent unresolved intents.");
+        }
+        println!("Local journal only; no CI attestation or merge authorization.");
+        return Ok(());
+    }
     if let Command::LandingRecovery { operation_id } = &cli.command {
         let journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
         let (plan, state) = journal.get(operation_id)?.ok_or("unknown landing intent")?;
@@ -1258,6 +1387,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "landing {}: {:?}; target {}, base {}, staged {}",
             plan.operation_id, state, plan.target_ref, plan.base_sha, plan.staged_sha
         );
+        if plan.marker_ref.is_some() {
+            println!(
+                "marker creation: {:?}",
+                journal.marker_creation_state(operation_id)?
+            );
+        }
         if let Some(observed) = journal.last_recovery_observation(operation_id)? {
             println!(
                 "last historical observation: target {} ({}), staging {} at {} ms",
@@ -1339,6 +1474,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve { .. } => unreachable!(),
         Command::Reconcile(_) => unreachable!(),
         Command::FindDispatchRuns { .. } => unreachable!(),
+        Command::PrepareLandingMarker { .. } => unreachable!(),
+        Command::CreateLandingMarker { .. } => unreachable!(),
+        Command::LandingIntents => unreachable!(),
+        Command::CancelLanding { .. } => unreachable!(),
         Command::Select {
             policy,
             source,

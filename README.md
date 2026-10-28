@@ -8,7 +8,18 @@ Sluss is intended to be a small, open-source CI orchestrator and merge queue for
 
 The current development preview contains a durable SQLite queue, batch state machine, physical-host reservations, a Git integration builder, authenticated GitHub App reconciliation, and optional workers for planning, staging, dispatch and observation. These paths have not been validated end-to-end against a real GitHub App and runner. The service and CLI do not establish trusted CI attestation or update target branches, and the project is not ready for production or a pilot. A `Verified` state is not merge authorization; `doctor` exits unsuccessfully until the required checks exist. The writable SQLite connections require WAL and `synchronous=FULL`; they fail if WAL cannot be enabled. Use a filesystem that supports SQLite WAL and preserves sync semantics. Power-loss behavior has not been tested on a target deployment.
 
-The experimental landing library can freeze and create a per-operation receipt ref, then record its observed SHA after an uncertain landing. Creation uses a separately scoped App token and a durable one-shot journal; an ambiguous result is not retried. These App paths are tested with a stub only and are not exposed by the CLI or service. Sluss does not send a landing mutation, resolve uncertain sends or authorize a merge based on the marker. See the [protocol](docs/protocol.md).
+The experimental landing journal can freeze and create a per-operation receipt ref, then record its observed SHA after an uncertain landing. Creation uses a separately scoped App token and a durable one-shot journal; an ambiguous result is not retried. These App paths are tested with a stub only. Sluss does not send a landing mutation, resolve uncertain sends or authorize a merge based on the marker. See the [protocol](docs/protocol.md).
+
+Operators experimenting with a recorded successful batch and a separately reviewed trusted policy can use:
+
+```sh
+sluss --db sluss.sqlite prepare-landing-marker --batch-id <batch-id> --policy /path/to/trusted-ci-policy.toml
+sluss --db sluss.sqlite landing-intents
+sluss --db sluss.sqlite create-landing-marker --operation-id <id> --config /path/to/sluss.toml --policy /path/to/trusted-ci-policy.toml
+sluss --db sluss.sqlite landing-recovery --operation-id <id>
+```
+
+Preparation generates and prints a random ID; `landing-intents` recovers it if output is lost. Creation makes a GitHub branch and may trigger workflows. Configure `SLUSS_GITHUB_PRIVATE_KEY_PATH` and protect the reserved marker namespace from other writers. If creation remains uncertain, the attempt will not be resent or automatically resolved. `cancel-landing --operation-id <id>` releases only an unclaimed landing intent; a marker creation may still have succeeded and requires inspection or cleanup. These commands do not enable automatic landing.
 
 For an experimental installation, `sluss app-registration-url --name "My Sluss Preview"` creates a GitHub registration link with read-only permissions and webhooks disabled. It does not create an App. See [GitHub App setup](docs/github-app-setup.md) for the separately opted-in CI permissions, webhook setup and key isolation.
 

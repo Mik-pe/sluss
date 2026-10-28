@@ -452,3 +452,57 @@ fn offline_recovery_inspection_does_not_create_or_migrate_a_database() {
         .unwrap();
     assert!(!exists);
 }
+
+#[test]
+fn unresolved_intent_listing_is_read_only_and_includes_uncertain_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("journal.sqlite");
+    let mut journal = LandingJournal::open(&db).unwrap();
+    let first = plan("land-first");
+    let mut second = plan("land-second");
+    second.target_ref = "refs/heads/release".into();
+    journal.prepare(&first).unwrap();
+    journal.prepare(&second).unwrap();
+    journal.claim("land-first").unwrap();
+    drop(journal);
+    let inspect = LandingJournal::open_read_only(&db).unwrap();
+    let (listed, more) = inspect.unresolved_intents().unwrap();
+    assert!(!more);
+    assert_eq!(
+        listed,
+        vec![
+            (second, IntentState::Prepared),
+            (first, IntentState::Sending)
+        ]
+    );
+    drop(inspect);
+    let missing = dir.path().join("missing.sqlite");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&missing)
+        .arg("landing-intents")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!missing.exists());
+    let cancelled = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["cancel-landing", "--operation-id", "land-first"])
+        .output()
+        .unwrap();
+    assert!(!cancelled.status.success());
+    let still_open = LandingJournal::open_read_only(&db).unwrap();
+    assert_eq!(
+        still_open.get("land-first").unwrap().unwrap().1,
+        IntentState::Sending
+    );
+    let cancelled = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&missing)
+        .args(["cancel-landing", "--operation-id", "missing"])
+        .output()
+        .unwrap();
+    assert!(!cancelled.status.success());
+    assert!(!missing.exists());
+}

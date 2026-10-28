@@ -5735,6 +5735,16 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     )
     .await
     .unwrap();
+    Box::pin(exercise_marker_cli(
+        &db,
+        &data,
+        &config,
+        &trust_file,
+        &key_dir,
+        id,
+        &mode,
+    ))
+    .await;
     let frozen_landing = landing
         .prepare_trusted_batch_with_marker("123456789abcdef0123456789abcdef0", id, &selected_trust)
         .unwrap();
@@ -7341,9 +7351,13 @@ async fn create_landing_marker_stub(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
-    assert_eq!(
-        body["ref"],
-        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+    let marker = body["ref"].as_str().unwrap();
+    let suffix = marker.strip_prefix("refs/heads/sluss/receipts/").unwrap();
+    assert!(
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
     );
     assert_eq!(body["sha"], "b".repeat(40));
     MARKER_POSTS.fetch_add(1, Ordering::SeqCst);
@@ -7361,7 +7375,7 @@ async fn create_landing_marker_stub(
     let name = if mode == 208 {
         "refs/heads/sluss/receipts/other"
     } else {
-        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+        marker
     };
     (
         StatusCode::CREATED,
@@ -7479,4 +7493,120 @@ async fn exercise_marker_creation(
         MarkerCreationState::Created
     );
     assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+}
+
+async fn exercise_marker_cli(
+    db: &std::path::Path,
+    data: &tempfile::TempDir,
+    config: &std::path::Path,
+    policy: &std::path::Path,
+    key_dir: &tempfile::TempDir,
+    batch: &str,
+    mode: &AtomicU8,
+) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut previous_id = String::new();
+    for fail in [false, true] {
+        let copy = data.path().join(format!("marker-cli-{fail}.sqlite"));
+        conn.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+            .unwrap();
+        let launch = |args: Vec<String>| {
+            let copy = copy.clone();
+            let key = key_dir.path().join("test-key.pem");
+            tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_sluss"))
+                    .arg("--db")
+                    .arg(copy)
+                    .args(args)
+                    .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+                    .output()
+                    .unwrap()
+            })
+        };
+        let prepared = launch(vec![
+            "prepare-landing-marker".into(),
+            "--batch-id".into(),
+            batch.into(),
+            "--policy".into(),
+            policy.to_str().unwrap().into(),
+        ])
+        .await
+        .unwrap();
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
+        let text = String::from_utf8(prepared.stdout).unwrap();
+        let id = text.split_whitespace().nth(2).unwrap().to_string();
+        assert!(
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        );
+        assert_ne!(id, previous_id);
+        previous_id = id.clone();
+        let listed = launch(vec!["landing-intents".into()]).await.unwrap();
+        assert!(listed.status.success() && String::from_utf8_lossy(&listed.stdout).contains(&id));
+        let create = || {
+            vec![
+                "create-landing-marker".into(),
+                "--operation-id".into(),
+                id.clone(),
+                "--config".into(),
+                config.to_str().unwrap().into(),
+                "--policy".into(),
+                policy.to_str().unwrap().into(),
+            ]
+        };
+        mode.store(if fail { 206 } else { 0 }, Ordering::SeqCst);
+        let before = MARKER_POSTS.load(Ordering::SeqCst);
+        let first = launch(create()).await.unwrap();
+        assert_eq!(
+            first.status.success(),
+            !fail,
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+        mode.store(0, Ordering::SeqCst);
+        let second = launch(create()).await.unwrap();
+        assert_eq!(
+            second.status.success(),
+            !fail,
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+        let inspected = launch(vec![
+            "landing-recovery".into(),
+            "--operation-id".into(),
+            id.clone(),
+        ])
+        .await
+        .unwrap();
+        assert!(inspected.status.success());
+        assert!(
+            String::from_utf8_lossy(&inspected.stdout).contains(if fail {
+                "Creating"
+            } else {
+                "Created"
+            })
+        );
+        if fail {
+            let cancelled = launch(vec![
+                "cancel-landing".into(),
+                "--operation-id".into(),
+                id.clone(),
+            ])
+            .await
+            .unwrap();
+            assert!(cancelled.status.success());
+            let listed = launch(vec!["landing-intents".into()]).await.unwrap();
+            assert!(!String::from_utf8_lossy(&listed.stdout).contains(&id));
+            assert!(!launch(create()).await.unwrap().status.success());
+            assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), before + 1);
+        }
+    }
 }
