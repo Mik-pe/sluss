@@ -252,6 +252,7 @@ impl App {
         if !response.status().is_success() {
             return Err(GitHubError::Status(response.status().as_u16()));
         }
+        let headers = response.headers().clone();
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
             if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
@@ -261,12 +262,8 @@ impl App {
         }
         let result: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)?;
-        if result
-            .get("errors")
-            .is_some_and(|errors| !errors.as_array().is_some_and(|v| v.is_empty()))
-        {
-            return Err(GitHubError::UnstableObservation);
-        }
+        self.check_graphql_errors(result.get("errors"), &headers)
+            .await?;
         let names = |path: &str| -> Option<std::collections::BTreeSet<&str>> {
             let entries = result.pointer(path)?.as_array()?;
             let mut names = std::collections::BTreeSet::new();
@@ -452,6 +449,44 @@ impl App {
                 .map_err(|_| GitHubError::RateLimitStore)?;
         }
         Ok(())
+    }
+
+    async fn check_graphql_errors(
+        &self,
+        errors: Option<&serde_json::Value>,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<(), GitHubError> {
+        let Some(errors) = errors else {
+            return Ok(());
+        };
+        let Some(errors) = errors.as_array() else {
+            return Err(GitHubError::UnstableObservation);
+        };
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let limited = errors.iter().any(|error| {
+            error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .is_some_and(|message| message.to_ascii_lowercase().contains("rate limit"))
+                || error.get("type").and_then(|value| value.as_str()) == Some("RATE_LIMITED")
+                || error
+                    .pointer("/extensions/code")
+                    .and_then(|value| value.as_str())
+                    == Some("RATE_LIMITED")
+        });
+        if limited {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            let delay = rate_limit_delay(reqwest::StatusCode::FORBIDDEN, headers, true, now)
+                .ok_or(GitHubError::UnstableObservation)?;
+            self.defer_requests(delay).await?;
+            return Err(GitHubError::RateLimited);
+        }
+        Err(GitHubError::UnstableObservation)
     }
     fn jwt(&self, now: u64) -> Result<String, GitHubError> {
         let claims = Claims {
@@ -2649,6 +2684,7 @@ impl App {
             if !response.status().is_success() {
                 return Err(GitHubError::Status(response.status().as_u16()));
             }
+            let headers = response.headers().clone();
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
                 if bytes.len().saturating_add(chunk.len()) > 65536 {
@@ -2658,12 +2694,8 @@ impl App {
             }
             let result: Response =
                 serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)?;
-            if result
-                .errors
-                .is_some_and(|errors| !errors.as_array().is_some_and(|e| e.is_empty()))
-            {
-                return Err(GitHubError::UnstableObservation);
-            }
+            app.check_graphql_errors(result.errors.as_ref(), &headers)
+                .await?;
             let repo = result
                 .data
                 .and_then(|data| data.repository)

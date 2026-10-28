@@ -512,6 +512,29 @@ async fn graphql_schema(
         json!({"data":{"__schema":{"mutationType":{"fields":[{"name":"updateRefs"}]}},"refUpdate":{"inputFields":fields},"updateInput":{"inputFields":[{"name":"repositoryId"},{"name":"refUpdates"},{"name":"clientMutationId"}]}}}),
     )
 }
+
+async fn graphql_rate_error(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    state.pulls.fetch_add(1, Ordering::SeqCst);
+    let mode = state.mode.load(Ordering::SeqCst);
+    let error = match mode {
+        220 | 224 => json!({"message":"You have exceeded a secondary rate limit"}),
+        222 => json!({"message":"try later", "type":"RATE_LIMITED"}),
+        223 => json!({"message":"try later", "extensions":{"code":"RATE_LIMITED"}}),
+        _ => json!({"message":"field not available"}),
+    };
+    let body = Json(json!({"data":null,"errors":[error]}));
+    if mode == 224 {
+        body.into_response()
+    } else {
+        ([("retry-after", "1")], body).into_response()
+    }
+}
 async fn doctor_workflow(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
@@ -1050,6 +1073,93 @@ fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     let a = std::fs::read(private).unwrap();
     let b = std::fs::read(public).unwrap();
     (dir, a, b)
+}
+
+#[tokio::test]
+async fn graphql_rate_errors_share_the_durable_gate_without_masking_other_errors() {
+    let (_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(220));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let graph_calls = Arc::new(AtomicUsize::new(0));
+    let api = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/graphql", post(graphql_rate_error))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: graph_calls.clone(),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let _inbox = sluss::webhook::Inbox::open(&db).unwrap();
+    let origin = format!("http://{addr}/");
+    let client = App::new("app-client-id".into(), &private, &origin).unwrap();
+    client.enable_shared_rate_limits(&db).unwrap();
+    let token = client.read_token(42, 7).await.unwrap();
+    assert!(matches!(
+        client.inspect_ref_update_schema(&token).await,
+        Err(GitHubError::RateLimited)
+    ));
+    let other = App::new("app-client-id".into(), &private, &origin).unwrap();
+    other.enable_shared_rate_limits(&db).unwrap();
+    assert!(matches!(
+        other.read_token(42, 7).await,
+        Err(GitHubError::RateLimited)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(graph_calls.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    mode.store(221, Ordering::SeqCst);
+    assert!(matches!(
+        client.inspect_ref_update_schema(&token).await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    assert!(
+        other.read_token(42, 7).await.is_ok(),
+        "ordinary GraphQL errors must not close the gate"
+    );
+    mode.store(222, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_review_decision(&token, "owner", "repo", "R_repo", 19)
+            .await,
+        Err(GitHubError::RateLimited)
+    ));
+    assert!(matches!(
+        other.read_token(42, 7).await,
+        Err(GitHubError::RateLimited)
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    mode.store(223, Ordering::SeqCst);
+    assert!(matches!(
+        client.inspect_ref_update_schema(&token).await,
+        Err(GitHubError::RateLimited)
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    mode.store(224, Ordering::SeqCst);
+    assert!(matches!(
+        client.inspect_ref_update_schema(&token).await,
+        Err(GitHubError::RateLimited)
+    ));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let duration: i64 = conn
+        .query_row(
+            "SELECT until_ms-observed_ms FROM github_rate_limit_gate WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        duration >= 60_000,
+        "secondary limits without guidance require at least one minute"
+    );
+    server.abort();
 }
 
 #[tokio::test]
