@@ -1,0 +1,21 @@
+# Keep this policy outside PR-controlled paths. Directory rules end in '/'.
+version = 1
+full_suites = ["core-tests", "api-tests", "ui-tests"]
+always_full = ["ci/"]
+
+[[components]]
+name = "core"
+paths = ["crates/core/"]
+suites = ["core-tests"]
+
+[[components]]
+name = "api"
+paths = ["crates/api/"]
+depends_on = ["core"]
+suites = ["api-tests"]
+
+[[components]]
+name = "ui"
+paths = ["apps/ui/"]
+depends_on = ["api"]
+suites = ["ui-tests"]

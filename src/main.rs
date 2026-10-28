@@ -35,6 +35,17 @@ enum Command {
     },
     /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
     Reconcile(ReconcileArgs),
+    /// Select suites from an operator-controlled policy and a Git diff.
+    Select {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        base_sha: String,
+        #[arg(long)]
+        head_sha: String,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -333,6 +344,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Serve { .. } => unreachable!(),
         Command::Reconcile(_) => unreachable!(),
+        Command::Select {
+            policy,
+            source,
+            base_sha,
+            head_sha,
+        } => {
+            let policy = sluss::selective::Policy::load(&policy)?;
+            match policy.select_git(&source, &base_sha, &head_sha)? {
+                sluss::selective::Selection::Full { suites, reason } => {
+                    println!("full verification: {reason}");
+                    for suite in suites {
+                        println!("{suite}");
+                    }
+                }
+                sluss::selective::Selection::Selected { suites, components } => {
+                    println!(
+                        "selected components: {}",
+                        components.into_iter().collect::<Vec<_>>().join(", ")
+                    );
+                    for suite in suites {
+                        println!("{suite}");
+                    }
+                }
+            }
+            println!("selection is not CI evidence or merge authorization");
+        }
         Command::Plan {
             id,
             base_sha,
