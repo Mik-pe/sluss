@@ -101,6 +101,56 @@ async fn reviews(
     }
     Json(json!(items))
 }
+
+async fn conditional_pull(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 217 {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    let Json(value) = pull(State(state.clone()), headers.clone()).await;
+    conditional_response(&state, &headers, value, mode != 219)
+}
+
+async fn conditional_reviews(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    query: Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    let mode = state.mode.load(Ordering::SeqCst);
+    let Json(value) = reviews(State(state.clone()), headers.clone(), query).await;
+    conditional_response(&state, &headers, value, mode != 219)
+}
+
+fn conditional_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    value: Value,
+    use_etag: bool,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use sha2::{Digest, Sha256};
+    let tag = format!(
+        "\"{}\"",
+        hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()))
+    );
+    if use_etag
+        && headers
+            .get("if-none-match")
+            .is_some_and(|h| h.as_bytes() == tag.as_bytes())
+    {
+        state.permissions.fetch_add(1, Ordering::SeqCst);
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    if use_etag {
+        (StatusCode::OK, [("etag", tag)], Json(value)).into_response()
+    } else {
+        (StatusCode::OK, Json(value)).into_response()
+    }
+}
 async fn open_pulls(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -900,6 +950,90 @@ fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     let b = std::fs::read(public).unwrap();
     (dir, a, b)
 }
+
+#[tokio::test]
+async fn pr_observation_uses_conditional_reads_without_hiding_changes() {
+    let (_key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let unchanged = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo/pulls/19", get(conditional_pull))
+        .route(
+            "/repos/owner/repo/pulls/19/reviews",
+            get(conditional_reviews),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: pulls.clone(),
+            permissions: unchanged.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let token = client.read_token(42, 7).await.unwrap();
+    let snapshot = client
+        .observe_pull(&token, "owner", "repo", 19)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.reviews.len(), 1);
+    assert_eq!(pulls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        unchanged.load(Ordering::SeqCst),
+        3,
+        "two PR and one review reads use 304"
+    );
+
+    pulls.store(0, Ordering::SeqCst);
+    unchanged.store(0, Ordering::SeqCst);
+    mode.store(6, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .observe_pull(&token, "owner", "repo", 19)
+            .await
+            .unwrap()
+            .reviews
+            .len(),
+        101
+    );
+    assert_eq!(
+        unchanged.load(Ordering::SeqCst),
+        4,
+        "each review page has its own cache entry"
+    );
+
+    pulls.store(0, Ordering::SeqCst);
+    mode.store(5, Ordering::SeqCst);
+    assert!(matches!(
+        client.observe_pull(&token, "owner", "repo", 19).await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    mode.store(217, Ordering::SeqCst);
+    assert!(matches!(
+        client.observe_pull(&token, "owner", "repo", 19).await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    mode.store(219, Ordering::SeqCst);
+    pulls.store(0, Ordering::SeqCst);
+    unchanged.store(0, Ordering::SeqCst);
+    assert!(
+        client
+            .observe_pull(&token, "owner", "repo", 19)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        unchanged.load(Ordering::SeqCst),
+        0,
+        "missing ETags fall back to full reads"
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let (key_dir, private, public) = keys();

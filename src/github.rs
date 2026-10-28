@@ -494,6 +494,40 @@ pub struct PullSnapshot {
     pub reviews: Vec<ReviewObservation>,
 }
 
+/// Lives only for one PR observation, never across tokens or scans.
+#[derive(Default)]
+struct PullReadCache {
+    entries: BTreeMap<String, (reqwest::header::HeaderValue, Vec<u8>)>,
+    bytes: usize,
+}
+impl PullReadCache {
+    fn replace(&mut self, key: String, etag: Option<reqwest::header::HeaderValue>, body: Vec<u8>) {
+        const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+        if let Some((_, old)) = self.entries.remove(&key) {
+            self.bytes -= old.len();
+        }
+        let Some(etag) =
+            etag.filter(|value| value.len() <= 256 && value.to_str().is_ok_and(valid_entity_tag))
+        else {
+            return;
+        };
+        if body.len() <= MAX_CACHE_BYTES.saturating_sub(self.bytes) {
+            self.bytes += body.len();
+            self.entries.insert(key, (etag, body));
+        }
+    }
+}
+
+fn valid_entity_tag(value: &str) -> bool {
+    let quoted = value.strip_prefix("W/").unwrap_or(value);
+    let Some(inner) = quoted.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+        return false;
+    };
+    inner
+        .bytes()
+        .all(|byte| byte == b'!' || (b'#'..=b'~').contains(&byte))
+}
+
 impl App {
     /// Read a bounded, double-checked snapshot using a repository-scoped token.
     /// GitHub does not provide an atomic PR/review snapshot; matching reads do
@@ -509,11 +543,18 @@ impl App {
             return Err(GitHubError::InvalidConfiguration);
         }
         let path = format!("repos/{owner}/{repository}/pulls/{number}");
-        let first: PullObservation = self.get_json(token, &path, None).await?;
-        let reviews1 = self.get_reviews(token, &path).await?;
-        let middle: PullObservation = self.get_json(token, &path, None).await?;
-        let reviews2 = self.get_reviews(token, &path).await?;
-        let last: PullObservation = self.get_json(token, &path, None).await?;
+        let mut cache = PullReadCache::default();
+        let first: PullObservation = self
+            .get_json_cached(token, &path, None, Some(&mut cache))
+            .await?;
+        let reviews1 = self.get_reviews(token, &path, &mut cache).await?;
+        let middle: PullObservation = self
+            .get_json_cached(token, &path, None, Some(&mut cache))
+            .await?;
+        let reviews2 = self.get_reviews(token, &path, &mut cache).await?;
+        let last: PullObservation = self
+            .get_json_cached(token, &path, None, Some(&mut cache))
+            .await?;
         if first != middle
             || middle != last
             || reviews1 != reviews2
@@ -539,11 +580,12 @@ impl App {
         &self,
         token: &InstallationToken,
         path: &str,
+        cache: &mut PullReadCache,
     ) -> Result<Vec<ReviewObservation>, GitHubError> {
         let mut result = Vec::new();
         for page in 1..=100u32 {
             let rows: Vec<ReviewObservation> = self
-                .get_json(token, &format!("{path}/reviews"), Some(page))
+                .get_json_cached(token, &format!("{path}/reviews"), Some(page), Some(cache))
                 .await?;
             if rows.len() > 100 {
                 return Err(GitHubError::UnstableObservation);
@@ -566,6 +608,16 @@ impl App {
         path: &str,
         page: Option<u32>,
     ) -> Result<T, GitHubError> {
+        self.get_json_cached(token, path, page, None).await
+    }
+
+    async fn get_json_cached<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+        page: Option<u32>,
+        mut cache: Option<&mut PullReadCache>,
+    ) -> Result<T, GitHubError> {
         if token.app_client_id != self.client_id || token.api_origin != self.api.as_str() {
             return Err(GitHubError::InvalidConfiguration);
         }
@@ -578,18 +630,36 @@ impl App {
                 .append_pair("per_page", "100")
                 .append_pair("page", &page.to_string());
         }
-        let mut response = self
+        let cache_key = url.as_str().to_owned();
+        let cached_etag = cache
+            .as_ref()
+            .and_then(|cache| cache.entries.get(&cache_key))
+            .map(|(etag, _)| etag.clone());
+        let mut request = self
             .client
             .get(url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(token.secret())
-            .send()
-            .await
-            .map_err(|_| GitHubError::Request)?;
+            .bearer_auth(token.secret());
+        if let Some(etag) = &cached_etag {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag.clone());
+        }
+        let mut response = request.send().await.map_err(|_| GitHubError::Request)?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if cached_etag.is_none() {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let body = cache
+                .as_ref()
+                .and_then(|cache| cache.entries.get(&cache_key))
+                .map(|(_, body)| body)
+                .ok_or(GitHubError::UnstableObservation)?;
+            return serde_json::from_slice(body).map_err(|_| GitHubError::UnstableObservation);
+        }
         if !response.status().is_success() {
             return Err(GitHubError::Status(response.status().as_u16()));
         }
+        let etag = response.headers().get(reqwest::header::ETAG).cloned();
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
             if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
@@ -597,7 +667,11 @@ impl App {
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)
+        let value = serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)?;
+        if let Some(cache) = cache.as_mut() {
+            cache.replace(cache_key, etag, bytes);
+        }
+        Ok(value)
     }
 }
 pub(crate) fn valid_name(value: &str) -> bool {
@@ -4687,6 +4761,38 @@ impl App {
             }
             _ => Ok(StaleCancellation::Uncertain),
         }
+    }
+}
+
+#[cfg(test)]
+mod pull_cache_tests {
+    use super::{PullReadCache, valid_entity_tag};
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn accepts_only_single_entity_tags_and_bounds_cached_bodies() {
+        for tag in ["\"abc\"", "W/\"abc\"", "\"\""] {
+            assert!(valid_entity_tag(tag));
+        }
+        for tag in ["*", "abc", "\"abc\", \"def\"", "w/\"abc\"", "\"bad space\""] {
+            assert!(!valid_entity_tag(tag));
+        }
+        let mut cache = PullReadCache::default();
+        cache.replace(
+            "url".into(),
+            Some(HeaderValue::from_static("\"a\"")),
+            vec![1, 2],
+        );
+        assert_eq!(cache.bytes, 2);
+        cache.replace("url".into(), Some(HeaderValue::from_static("*")), vec![3]);
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.entries.is_empty());
+        cache.replace(
+            "big".into(),
+            Some(HeaderValue::from_static("\"a\"")),
+            vec![0; 8 * 1024 * 1024 + 1],
+        );
+        assert!(cache.entries.is_empty());
     }
 }
 
