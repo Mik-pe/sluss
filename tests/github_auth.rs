@@ -186,7 +186,7 @@ async fn open_pulls(
     let branch = query.get("base").expect("base branch filter");
     let mode = state.mode.load(Ordering::SeqCst);
     let row = |number| json!({"number":number, "state":"open", "base":{"ref":if mode == 218 {"wrong"} else {branch}, "repo":{"id":7}}});
-    Json(if matches!(mode, 46 | 47) {
+    Json(if matches!(mode, 46 | 47 | 151 | 152) {
         json!([row(19), row(20)])
     } else if mode == 222 {
         json!([row(20)])
@@ -261,7 +261,9 @@ async fn dispatch_ref(
     use axum::response::IntoResponse;
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
-    let sha = if mode == 16 || (mode == 228 && STAGE_REF_READS.fetch_add(1, Ordering::SeqCst) > 0) {
+    let sha = if matches!(mode, 16 | 152)
+        || (mode == 228 && STAGE_REF_READS.fetch_add(1, Ordering::SeqCst) > 0)
+    {
         "b"
     } else {
         "a"
@@ -281,6 +283,12 @@ async fn dispatch_ref(
             .into_response();
     }
     body.into_response()
+}
+async fn stale_pinned_ref(State(_state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    Json(
+        json!({"ref":"refs/heads/sluss/batch-0000000000000000","object":{"sha":"b".repeat(40),"type":"commit"}}),
+    )
 }
 async fn dispatched_run(
     State(state): State<ServerState>,
@@ -826,9 +834,9 @@ async fn repository_runners(
     assert_eq!(query["page"], "1");
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    if matches!(mode, 44..=47 | 66) {
+    if matches!(mode, 44..=47 | 66 | 151 | 152) {
         return Json(json!({"total_count":2,"runners":[
-            {"id":2,"name":"busy-runner","status":"online","busy":true,"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
+            {"id":2,"name":"busy-runner","status":"online","busy":!matches!(mode,151 | 152),"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
             {"id":1,"name":"runner","status":"online","busy":mode == 45 || mode == 47,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}
         ]}));
     }
@@ -3337,6 +3345,10 @@ async fn cli_dispatches_fixture() {
             get(dispatch_ref),
         )
         .route(
+            "/repos/owner/repo/git/ref/heads/sluss/batch-0000000000000000",
+            get(stale_pinned_ref),
+        )
+        .route(
             "/repos/owner/repo/actions/workflows/17/dispatches",
             post(dispatch_post),
         )
@@ -4689,6 +4701,88 @@ async fn cli_dispatches_fixture() {
         && item.state == sluss::scheduler::DispatchState::Prepared));
     assert!(pending.iter().any(|item| item.reservation.id == id
         && item.state == (sluss::scheduler::DispatchState::Accepted { run_id: 123 })));
+    // A changed ref in the first batch cannot block an unrelated batch. Both
+    // prepared reservations remain pinned until their normal recovery paths.
+    posts.store(0, Ordering::SeqCst);
+    mode.store(151, Ordering::SeqCst);
+    let stale_db = data.path().join("stale-ref-no-head-of-line.sqlite");
+    let mut stale_inbox = Inbox::open(&stale_db).unwrap();
+    let mut stale_store = Store::open(&stale_db).unwrap();
+    stale_inbox
+        .record("stale-queue", "pull_request", &[9; 32], 42, 7)
+        .unwrap();
+    let stale_event = stale_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut stale_store,
+        &stale_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    for batch_id in [pinned_id, id] {
+        stale_store
+            .plan_batch(batch_id, &"b".repeat(40), 1, 2)
+            .unwrap()
+            .unwrap();
+        stale_store
+            .bind_policy_paths(batch_id, &[".github/workflows/ci.yml".into()])
+            .unwrap();
+        stale_store.start_integration(batch_id).unwrap();
+        stale_store
+            .finish_integration(batch_id, &"a".repeat(40), &"e".repeat(64))
+            .unwrap();
+    }
+    // If every ref is stale, surface the error and send no workflow.
+    mode.store(152, Ordering::SeqCst);
+    let error = sluss::worker::dispatch_once(
+        &fixture_app,
+        &stale_db,
+        &fixture_policy,
+        &independent_capacity,
+        &settings,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("changed staging ref"), "{error}");
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    let stale_scheduler =
+        sluss::scheduler::Scheduler::open(&stale_db, independent_capacity.clone()).unwrap();
+    assert_eq!(stale_scheduler.pending_dispatches().unwrap().len(), 2);
+    assert!(
+        stale_scheduler
+            .pending_dispatches()
+            .unwrap()
+            .iter()
+            .all(|item| item.state == sluss::scheduler::DispatchState::Prepared)
+    );
+    // Once the second ref is sound, only its reserved host is used.
+    mode.store(151, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::dispatch_once(
+            &fixture_app,
+            &stale_db,
+            &fixture_policy,
+            &independent_capacity,
+            &settings
+        )
+        .await
+        .unwrap(),
+        Some(sluss::dispatch::Outcome::Sent {
+            run: 123,
+            host: "sluss-host-test".into()
+        })
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert!(
+        stale_scheduler
+            .pending_dispatches()
+            .unwrap()
+            .iter()
+            .any(|item| item.reservation.id == pinned_id
+                && item.state == sluss::scheduler::DispatchState::Prepared)
+    );
     posts.store(0, Ordering::SeqCst);
     mode.store(0, Ordering::SeqCst);
     reads.store(0, Ordering::SeqCst);

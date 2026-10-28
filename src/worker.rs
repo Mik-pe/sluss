@@ -608,16 +608,25 @@ pub async fn dispatch_once(
                 })
         });
     let mut no_capacity = false;
+    let mut stale_ref = None;
     for batch in batches {
-        match crate::dispatch::batch(db, app, policy, capacity, settings, &batch.id)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            sent @ crate::dispatch::Outcome::Sent { .. } => return Ok(Some(sent)),
-            crate::dispatch::Outcome::NoCapacity => no_capacity = true,
+        match crate::dispatch::batch(db, app, policy, capacity, settings, &batch.id).await {
+            Ok(sent @ crate::dispatch::Outcome::Sent { .. }) => return Ok(Some(sent)),
+            Ok(crate::dispatch::Outcome::NoCapacity) => no_capacity = true,
             // Another worker claimed this batch between selection and dispatch.
-            crate::dispatch::Outcome::AlreadyStarted => {}
+            Ok(crate::dispatch::Outcome::AlreadyStarted) => {}
+            Err(crate::dispatch::Error::Dispatch(crate::github::DispatchError::StaleRef)) => {
+                // The mismatch belongs to this staging ref, not the repository or
+                // another batch. Its prepared reservation remains held for repair.
+                let error = format!("batch {} has a changed staging ref", batch.id);
+                eprintln!("automatic dispatch skipped: {error}");
+                stale_ref.get_or_insert(error);
+            }
+            Err(error) => return Err(error.to_string()),
         }
+    }
+    if let Some(error) = stale_ref {
+        return Err(error);
     }
     Ok(no_capacity.then_some(crate::dispatch::Outcome::NoCapacity))
 }
