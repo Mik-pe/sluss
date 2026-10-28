@@ -390,3 +390,175 @@ pub fn check_release_topology(
     }
     Ok(())
 }
+
+/// Findings from provider-visible settings only. Absence of findings is not
+/// proof of exclusive writers, immutable policy, trusted CI or merge permission.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BranchPolicyFinding {
+    #[error("no visible ruleset restricts direct branch updates")]
+    NoUpdateRestriction,
+    #[error("ruleset {0} permits an upstream fetch-and-merge or does not expose that setting")]
+    UpstreamUpdateUnclear(u64),
+    #[error("ruleset {0} does not show an always-allowed bypass for the configured App")]
+    AppBypassMissing(u64),
+    #[error("ruleset {0} has an additional bypass actor or bypass mode")]
+    OtherBypass(u64),
+    #[error("ruleset {0} requires linear history and an App bypass is not visible")]
+    LinearRuleMayBlock(u64),
+    #[error("ruleset {0} requires signed commits and an App bypass is not visible")]
+    SignedRuleMayBlock(u64),
+    #[error("classic branch protection does not enforce restrictions for administrators")]
+    ClassicAdminsExempt,
+    #[error("classic branch protection allows force pushes")]
+    ClassicForcePush,
+    #[error("classic branch protection allows branch deletion")]
+    ClassicDeletion,
+    #[error(
+        "classic branch protection requires linear history; merge-commit compatibility needs verification"
+    )]
+    ClassicLinearHistory,
+    #[error(
+        "classic branch protection requires signed commits; signing or bypass needs verification"
+    )]
+    ClassicSignatures,
+    #[error("classic branch protection locks the branch; direct landing needs verification")]
+    ClassicLocked,
+    #[error("classic pull-request protection may block direct landing; verify the App's bypass")]
+    ClassicPullRequestProtection,
+    #[error("classic branch protection restricts pushers; verify the configured App is allowed")]
+    ClassicPushRestrictions,
+    #[error("classic required checks need independent App and policy verification")]
+    ClassicRequiredChecks,
+}
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BranchPolicyError {
+    #[error("App identity or visible branch protection is incomplete")]
+    Incomplete,
+}
+/// Report conservative compatibility findings. The caller must authenticate the
+/// provider observations and App ID. Even an empty result is not authorization.
+pub fn assess_visible_branch_policy(
+    security: &crate::github::BranchSecurityObservation,
+    app_id: u64,
+) -> Result<Vec<BranchPolicyFinding>, BranchPolicyError> {
+    use crate::github::ProtectionObservation;
+    if app_id == 0 || security.digest().is_err() {
+        return Err(BranchPolicyError::Incomplete);
+    }
+    let ProtectionObservation::Present(protection) = &security.protection else {
+        return Err(BranchPolicyError::Incomplete);
+    };
+    let mut findings = Vec::new();
+    if protection
+        .pointer("/enforce_admins/enabled")
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        findings.push(BranchPolicyFinding::ClassicAdminsExempt);
+    }
+    if protection
+        .pointer("/allow_force_pushes/enabled")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        findings.push(BranchPolicyFinding::ClassicForcePush);
+    }
+    if protection
+        .pointer("/allow_deletions/enabled")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        findings.push(BranchPolicyFinding::ClassicDeletion);
+    }
+    if protection
+        .pointer("/required_linear_history/enabled")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        findings.push(BranchPolicyFinding::ClassicLinearHistory);
+    }
+    if protection
+        .pointer("/required_signatures/enabled")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        findings.push(BranchPolicyFinding::ClassicSignatures);
+    }
+    if protection
+        .pointer("/lock_branch/enabled")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        findings.push(BranchPolicyFinding::ClassicLocked);
+    }
+    if !protection["required_pull_request_reviews"].is_null() {
+        findings.push(BranchPolicyFinding::ClassicPullRequestProtection);
+    }
+    if !protection["restrictions"].is_null() {
+        findings.push(BranchPolicyFinding::ClassicPushRestrictions);
+    }
+    if !protection["required_status_checks"].is_null() {
+        findings.push(BranchPolicyFinding::ClassicRequiredChecks);
+    }
+    let mut update_found = false;
+    for ruleset in &security.rulesets {
+        let actors = ruleset.detail["bypass_actors"]
+            .as_array()
+            .ok_or(BranchPolicyError::Incomplete)?;
+        let direct_app = actors.iter().any(|actor| {
+            actor["actor_type"] == "Integration"
+                && actor["actor_id"].as_u64() == Some(app_id)
+                && actor["bypass_mode"] == "always"
+        });
+        if actors.iter().any(|actor| {
+            !(actor["actor_type"] == "Integration"
+                && actor["actor_id"].as_u64() == Some(app_id)
+                && actor["bypass_mode"] == "always")
+        }) {
+            findings.push(BranchPolicyFinding::OtherBypass(ruleset.id));
+        }
+        let visible: Vec<_> = security
+            .rules
+            .rules
+            .iter()
+            .filter(|rule| rule["ruleset_id"].as_u64() == Some(ruleset.id))
+            .collect();
+        let has_update = visible.iter().any(|rule| rule["type"] == "update");
+        let has_pr = visible.iter().any(|rule| rule["type"] == "pull_request");
+        if has_update {
+            update_found = true;
+            if visible
+                .iter()
+                .filter(|rule| rule["type"] == "update")
+                .any(|rule| {
+                    rule.pointer("/parameters/update_allows_fetch_and_merge")
+                        .and_then(|v| v.as_bool())
+                        != Some(false)
+                })
+            {
+                findings.push(BranchPolicyFinding::UpstreamUpdateUnclear(ruleset.id));
+            }
+        }
+        if (has_update || has_pr) && !direct_app {
+            findings.push(BranchPolicyFinding::AppBypassMissing(ruleset.id));
+        }
+        if visible
+            .iter()
+            .any(|rule| rule["type"] == "required_linear_history")
+            && !direct_app
+        {
+            findings.push(BranchPolicyFinding::LinearRuleMayBlock(ruleset.id));
+        }
+        if visible
+            .iter()
+            .any(|rule| rule["type"] == "required_signatures")
+            && !direct_app
+        {
+            findings.push(BranchPolicyFinding::SignedRuleMayBlock(ruleset.id));
+        }
+    }
+    if !update_found {
+        findings.push(BranchPolicyFinding::NoUpdateRestriction);
+    }
+    Ok(findings)
+}

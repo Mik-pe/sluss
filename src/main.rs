@@ -460,6 +460,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key = std::fs::read(key_path)?;
             let app =
                 sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app_identity = match app.observe_app_identity().await {
+                Ok(identity) => {
+                    println!(
+                        "authenticated GitHub App: {} (ID {})",
+                        identity.slug, identity.id
+                    );
+                    Some(identity)
+                }
+                Err(_) => {
+                    eprintln!("authenticated GitHub App identity could not be verified");
+                    None
+                }
+            };
             let installation = config.github.installation_id as u64;
             let repository_id = config.github.repository_id as u64;
             let read = app.read_token(installation, repository_id).await?;
@@ -520,6 +533,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(Vec::len)
                         .sum();
                     println!("visible ruleset bypass actors: {visible_actors}");
+                    if let Some(identity) = &app_identity {
+                        match sluss::verification::assess_visible_branch_policy(
+                            &security,
+                            identity.id,
+                        ) {
+                            Ok(findings) if findings.is_empty() => println!(
+                                "no contradictions found in visible branch settings; this is not authorization"
+                            ),
+                            Ok(findings) => {
+                                for finding in findings {
+                                    eprintln!("branch policy: {finding}");
+                                }
+                            }
+                            Err(_) => eprintln!(
+                                "branch policy assessment incomplete because protection or bypass visibility is missing"
+                            ),
+                        }
+                    }
                     match security.protection {
                         sluss::github::ProtectionObservation::Present(protection) => {
                             println!("classic branch protection: readable");

@@ -32,6 +32,13 @@ pub struct App {
     client: reqwest::Client,
     api: reqwest::Url,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppIdentity {
+    pub id: u64,
+    pub client_id: String,
+    pub slug: String,
+    pub node_id: String,
+}
 /// The token is deliberately not printable or serializable.
 pub struct InstallationToken {
     secret: String,
@@ -88,6 +95,61 @@ struct TokenResponse {
 }
 
 impl App {
+    /// Identify the configured App using its signed JWT. No installation
+    /// token can substitute for this identity, and the response is not proof
+    /// that its installation may bypass any repository rules.
+    pub async fn observe_app_identity(&self) -> Result<AppIdentity, GitHubError> {
+        async fn once(app: &App) -> Result<AppIdentity, GitHubError> {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| GitHubError::Clock)?
+                .as_secs();
+            let jwt = app.jwt(now)?;
+            let url = app
+                .api
+                .join("app")
+                .map_err(|_| GitHubError::InvalidConfiguration)?;
+            let mut response = app
+                .client
+                .get(url)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .bearer_auth(jwt)
+                .send()
+                .await
+                .map_err(|_| GitHubError::Request)?;
+            if !response.status().is_success() {
+                return Err(GitHubError::Status(response.status().as_u16()));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
+                if bytes.len().saturating_add(chunk.len()) > 65536 {
+                    return Err(GitHubError::InvalidResponse);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let identity: AppIdentity =
+                serde_json::from_slice(&bytes).map_err(|_| GitHubError::InvalidResponse)?;
+            if identity.id == 0
+                || identity.client_id != app.client_id
+                || !valid_name(&identity.slug)
+                || identity.node_id.is_empty()
+                || identity.node_id.len() > 200
+                || !identity.node_id.bytes().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'+' | b'/' | b'=')
+                })
+            {
+                return Err(GitHubError::InvalidResponse);
+            }
+            Ok(identity)
+        }
+        let first = once(self).await?;
+        let last = once(self).await?;
+        if first != last {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(last)
+    }
     /// Read-only schema discovery. A positive result does not prove that the
     /// installation can update protected refs or that provider semantics are
     /// safe for landing; it only checks the presence of the documented fields.
@@ -1176,6 +1238,8 @@ pub enum LandingRefreshError {
     Scope,
     #[error("Actions run changed while it was being observed")]
     Changed,
+    #[error("visible branch settings contain contradictions or remain incomplete")]
+    UnsafeBranchPolicy,
     #[error(transparent)]
     GitHub(#[from] GitHubError),
     #[error(transparent)]
@@ -1215,6 +1279,7 @@ impl App {
         }
         let target = journal.refresh_target(operation_id)?;
         let plan = &target.plan;
+        let app_identity = self.observe_app_identity().await?;
         if i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
             || i64::try_from(token.installation_id).ok() != Some(plan.installation_id)
             || policy.installation != plan.installation_id
@@ -1252,6 +1317,10 @@ impl App {
             || Some(security.digest()?) != plan.branch_security_digest
         {
             return Err(LandingRefreshError::Changed);
+        }
+        if !matches!(crate::verification::assess_visible_branch_policy(&security,app_identity.id),Ok(findings) if findings.is_empty())
+        {
+            return Err(LandingRefreshError::UnsafeBranchPolicy);
         }
         let short_ref = plan
             .staging_ref
@@ -1307,6 +1376,7 @@ impl App {
             .observe_target_branch(token, owner, repository, &policy.target_branch)
             .await?;
         let last_repo: Identity = self.get_json(token, &root, None).await?;
+        let last_app = self.observe_app_identity().await?;
         if first_repo != last_repo
             || first != last
             || last != snapshot.run
@@ -1314,6 +1384,7 @@ impl App {
             || last_base != base
             || last_rules != rules
             || last_security != security
+            || last_app != app_identity
             || last_stage.reference != plan.staging_ref
             || last_stage.object.kind != "commit"
             || last_stage.object.sha != plan.staged_sha

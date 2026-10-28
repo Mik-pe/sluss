@@ -307,7 +307,7 @@ async fn doctor_rules(
     let different = mode == 64
         || (matches!(mode, 65 | 66) && state.token_calls.fetch_add(1, Ordering::SeqCst) % 2 == 1);
     Json(
-        json!([{"type":if different {"required_linear_history"} else {"pull_request"},"ruleset_id":10,"ruleset_source_type":"Repository","ruleset_source":"owner/repo"}]),
+        json!([{"type":if different {"required_linear_history"} else {"pull_request"},"ruleset_id":10,"ruleset_source_type":"Repository","ruleset_source":"owner/repo"},{"type":"update","parameters":{"update_allows_fetch_and_merge":false},"ruleset_id":10,"ruleset_source_type":"Repository","ruleset_source":"owner/repo"}]),
     )
 }
 async fn doctor_protection(
@@ -328,7 +328,7 @@ async fn doctor_protection(
 async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
-    let mut body = json!({"id":10,"target":"branch","enforcement":"active","source_type":"Repository","source":if mode == 74 {"owner/other"} else {"owner/repo"},"rules":[{"type":if mode == 71 {"deletion"} else {"pull_request"}}],"bypass_actors":[{"actor_type":"Integration","actor_id":17,"bypass_mode":"always"}]});
+    let mut body = json!({"id":10,"target":"branch","enforcement":"active","source_type":"Repository","source":if mode == 74 {"owner/other"} else {"owner/repo"},"rules":[{"type":if mode == 71 {"deletion"} else {"pull_request"}},{"type":"update","parameters":{"update_allows_fetch_and_merge":false}}],"bypass_actors":[{"actor_type":"Integration","actor_id":17,"bypass_mode":"always"}]});
     if mode == 67 {
         body.as_object_mut().unwrap().remove("bypass_actors");
     }
@@ -346,6 +346,32 @@ async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) ->
         body["bypass_actors"][0]["actor_id"] = json!(18);
     }
     Json(body)
+}
+async fn authenticated_app(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    let jwt = headers["authorization"]
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap();
+    let claims = decode::<Claims>(
+        jwt,
+        &DecodingKey::from_rsa_pem(&state.public_key).unwrap(),
+        &Validation::new(Algorithm::RS256),
+    )
+    .unwrap()
+    .claims;
+    assert_eq!(claims.iss, "app-client-id");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let id = if mode == 80 {
+        0
+    } else if mode == 81 && state.token_calls.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+        18
+    } else {
+        17
+    };
+    Json(
+        json!({"id":id,"client_id":if mode == 82 {"wrong"} else {"app-client-id"},"slug":"sluss-test","node_id":"A_app"}),
+    )
 }
 async fn repository_runners(
     State(state): State<ServerState>,
@@ -1473,6 +1499,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let mode = Arc::new(AtomicU8::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
+        .route("/app", get(authenticated_app))
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/graphql", post(graphql_schema))
         .route("/repos/owner/repo", get(dispatch_repo))
@@ -1542,6 +1569,12 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let event = inbox.pending().unwrap().remove(0);
     let fixture_app =
         App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    assert_eq!(fixture_app.observe_app_identity().await.unwrap().id, 17);
+    for invalid in [80, 81, 82] {
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(fixture_app.observe_app_identity().await.is_err());
+    }
+    mode.store(0, Ordering::SeqCst);
     let fixture_token = fixture_app.read_token(42, 7).await.unwrap();
     let security_token = fixture_app.runner_inventory_token(42, 7).await.unwrap();
     assert!(
@@ -1848,6 +1881,75 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         hidden_journal.prepare_observed_batch("hidden-land", id, "R_repo"),
         Err(sluss::landing::LandingError::StaleBatch)
     ));
+    posts.store(0, Ordering::SeqCst);
+    // A stable snapshot is still insufficient if a different App is the
+    // visible bypass actor. The signed App identity must reject the claim.
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let foreign_db = data.path().join("foreign-bypass.sqlite");
+    let mut foreign_inbox = Inbox::open(&foreign_db).unwrap();
+    let mut foreign_store = Store::open(&foreign_db).unwrap();
+    foreign_inbox
+        .record("foreign", "pull_request", &[10; 32], 42, 7)
+        .unwrap();
+    let foreign_event = foreign_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut foreign_store,
+        &foreign_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    foreign_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    foreign_store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    foreign_store.start_integration(id).unwrap();
+    foreign_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    mode.store(77, Ordering::SeqCst);
+    assert!(matches!(
+        sluss::dispatch::batch(
+            &foreign_db,
+            &fixture_app,
+            &fixture_policy,
+            &one_host,
+            &settings,
+            id
+        )
+        .await
+        .unwrap(),
+        sluss::dispatch::Outcome::Sent { run: 123, .. }
+    ));
+    sluss::worker::observe_dispatches_once(&fixture_app, &foreign_db, &one_host, &fixture_policy)
+        .await
+        .unwrap();
+    let mut foreign_journal = sluss::landing::LandingJournal::open(&foreign_db).unwrap();
+    foreign_journal
+        .prepare_observed_batch("foreign-land", id, "R_repo")
+        .unwrap();
+    assert!(matches!(
+        fixture_app
+            .refresh_and_claim_observed_landing(
+                &mut foreign_journal,
+                &fixture_token,
+                &security_token,
+                &fixture_policy,
+                "foreign-land"
+            )
+            .await,
+        Err(sluss::github::LandingRefreshError::UnsafeBranchPolicy)
+    ));
+    assert_eq!(
+        foreign_journal.get("foreign-land").unwrap().unwrap().1,
+        sluss::landing::IntentState::Prepared
+    );
     posts.store(0, Ordering::SeqCst);
     // A previously prepared intent is pinned to a now-busy host. A second
     // batch must still reach the other idle host, without resending the first.
@@ -2276,7 +2378,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .prepare_observed_batch("land-refresh", id, "R_repo")
         .unwrap();
     for invalid in [
-        5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77,
+        5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77, 80, 81, 82,
     ] {
         reads.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
@@ -2508,7 +2610,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(!doctor.status.success());
     let info = String::from_utf8_lossy(&doctor.stdout);
     assert!(info.contains("target: main"));
-    assert!(info.contains("active branch rules returned: 1"));
+    assert!(info.contains("active branch rules returned: 2"));
+    assert!(info.contains("authenticated GitHub App: sluss-test (ID 17)"));
     assert!(info.contains("active rulesets inspected: 1; bypass lists unavailable: 0"));
     assert!(info.contains("classic branch protection: readable"));
     assert!(info.contains("GraphQL updateRefs and expected-old fields appear in the schema"));
