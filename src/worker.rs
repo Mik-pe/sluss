@@ -377,6 +377,7 @@ pub async fn prepare_once(
     db: &std::path::Path,
     policy: &RepositoryPolicy,
     policy_paths: &[String],
+    verification_policy: Option<&std::path::Path>,
 ) -> Result<Option<crate::coordinator::PreparedIntegration>, String> {
     let store = Store::open(db).map_err(|e| e.to_string())?;
     let batch = store
@@ -392,10 +393,17 @@ pub async fn prepare_once(
     let Some(batch) = batch else {
         return Ok(None);
     };
-    crate::coordinator::prepare_github_from_provider(db, app, policy, &batch.id, policy_paths)
-        .await
-        .map(Some)
-        .map_err(|e| e.to_string())
+    crate::coordinator::prepare_github_from_provider(
+        db,
+        app,
+        policy,
+        &batch.id,
+        policy_paths,
+        verification_policy,
+    )
+    .await
+    .map(Some)
+    .map_err(|e| e.to_string())
 }
 
 pub async fn supervise_preparation(
@@ -403,11 +411,20 @@ pub async fn supervise_preparation(
     db: PathBuf,
     policy: RepositoryPolicy,
     policy_paths: Vec<String>,
+    verification_policy: Option<PathBuf>,
     poll: Duration,
 ) {
     let mut delay = poll;
     loop {
-        match prepare_once(&app, &db, &policy, &policy_paths).await {
+        match prepare_once(
+            &app,
+            &db,
+            &policy,
+            &policy_paths,
+            verification_policy.as_deref(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 eprintln!(
                     "prepared staging ref {} for batch {}",

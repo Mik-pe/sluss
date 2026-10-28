@@ -47,8 +47,8 @@ enum Command {
         /// Resource request as pool=count; repeat as needed.
         #[arg(long, requires = "auto_dispatch")]
         pool: Vec<String>,
-        /// Operator-owned selective policy if a batch already has a selection.
-        #[arg(long, requires = "auto_dispatch")]
+        /// Operator-owned selective policy for staging and dispatch.
+        #[arg(long, requires = "config")]
         verification_policy: Option<PathBuf>,
         /// Cancel known runs when their batch is invalidated.
         #[arg(long, requires_all = ["config", "capacity"])]
@@ -263,6 +263,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         capacity,
     } = cli.command
     {
+        if verification_policy.is_some() && !auto_stage && !auto_dispatch {
+            return Err("--verification-policy requires --auto-stage or --auto-dispatch".into());
+        }
         let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
         let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
         let worker = if let Some(path) = config {
@@ -293,7 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(listen).await?;
         if let Some((app, policy, planning, poll, rescan)) = worker {
             if auto_plan {
-                eprintln!("automatic batch planning enabled; staging and dispatch remain manual");
+                eprintln!("automatic batch planning enabled; landing remains disabled");
                 tokio::spawn(sluss::worker::supervise_planning(
                     app.clone(),
                     cli.db.clone(),
@@ -309,6 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.db.clone(),
                     policy.clone(),
                     policy_file,
+                    verification_policy.clone(),
                     poll,
                 ));
             }

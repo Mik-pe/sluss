@@ -1438,6 +1438,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             &fixture_policy,
             id,
             &[".github/workflows/ci.yml".into()],
+            None,
         )
         .await,
         Err(sluss::coordinator::ProviderPrepareError::UnsupportedProvider)

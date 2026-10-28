@@ -16,6 +16,8 @@ pub enum PrepareError {
     #[error(transparent)]
     Policy(#[from] PolicyError),
     #[error(transparent)]
+    Selection(#[from] crate::selective::SelectionError),
+    #[error(transparent)]
     Stage(#[from] StageError),
     #[error(transparent)]
     GitHubStage(#[from] StagingError),
@@ -29,6 +31,27 @@ pub struct PreparedIntegration {
     pub reference: String,
     pub policy_digest: String,
 }
+pub struct StagingOptions<'a> {
+    pub policy_paths: &'a [String],
+    pub verification_policy: Option<&'a crate::selective::Policy>,
+}
+fn selection_for(
+    integration: &integration::Integration,
+    base: &str,
+    policy: Option<&crate::selective::Policy>,
+) -> Result<Option<crate::selective::FrozenSelection>, PrepareError> {
+    policy
+        .map(|policy| {
+            Ok(crate::selective::FrozenSelection {
+                base_sha: base.into(),
+                integration_sha: integration.sha().into(),
+                policy_digest: policy.digest()?,
+                selection: policy.select_git(&integration.repository(), base, integration.sha())?,
+            })
+        })
+        .transpose()
+}
+
 /// Prepare a batch using an explicit local source and local staging repository.
 /// Repeating after a crash is safe if the integration and policy are unchanged.
 /// The caller must establish that the source, target base, policy and remote
@@ -40,7 +63,32 @@ pub fn prepare_local(
     staging_remote: &Path,
     policy_paths: &[String],
 ) -> Result<PreparedIntegration, PrepareError> {
+    prepare_local_with_options(
+        store,
+        batch_id,
+        source,
+        staging_remote,
+        StagingOptions {
+            policy_paths,
+            verification_policy: None,
+        },
+    )
+}
+
+pub fn prepare_local_with_options(
+    store: &mut Store,
+    batch_id: &str,
+    source: &Path,
+    staging_remote: &Path,
+    options: StagingOptions<'_>,
+) -> Result<PreparedIntegration, PrepareError> {
+    let policy_paths = options.policy_paths;
+    let digest = options
+        .verification_policy
+        .map(|policy| policy.digest())
+        .transpose()?;
     store.bind_policy_paths(batch_id, policy_paths)?;
+    store.bind_staging_selection(batch_id, digest.as_deref())?;
     let batch = store.start_integration(batch_id)?;
     let heads: Vec<String> = batch
         .candidates
@@ -56,14 +104,25 @@ pub fn prepare_local(
         Err(error) => return Err(error.into()),
     };
     let policy = integration.check_policy(&batch.base_sha, policy_paths)?;
+    let selection = selection_for(&integration, &batch.base_sha, options.verification_policy)?;
     // Recheck after the potentially long Git operation. If an earlier attempt
     // already completed, validate both frozen values before touching the ref.
     let current = store.start_integration(batch_id)?;
     if matches!(current.state, crate::batch::State::Testing { .. }) {
-        store.finish_integration(batch_id, integration.sha(), &policy.digest)?;
+        store.finish_integration_with_selection(
+            batch_id,
+            integration.sha(),
+            &policy.digest,
+            selection.as_ref(),
+        )?;
     }
     let staged = integration.stage_local(staging_remote, batch_id)?;
-    store.finish_integration(batch_id, &staged.sha, &policy.digest)?;
+    store.finish_integration_with_selection(
+        batch_id,
+        &staged.sha,
+        &policy.digest,
+        selection.as_ref(),
+    )?;
     Ok(PreparedIntegration {
         batch_id: batch_id.into(),
         sha: staged.sha,
@@ -90,10 +149,36 @@ pub fn prepare_local_from_remote(
     target: &str,
     policy_paths: &[String],
 ) -> Result<PreparedIntegration, LocalPrepareError> {
-    store.bind_policy_paths(batch_id, policy_paths)?;
+    prepare_local_from_remote_with_options(
+        store,
+        batch_id,
+        remote,
+        target,
+        StagingOptions {
+            policy_paths,
+            verification_policy: None,
+        },
+    )
+}
+
+pub fn prepare_local_from_remote_with_options(
+    store: &mut Store,
+    batch_id: &str,
+    remote: &Path,
+    target: &str,
+    options: StagingOptions<'_>,
+) -> Result<PreparedIntegration, LocalPrepareError> {
+    let digest = options
+        .verification_policy
+        .map(|policy| policy.digest())
+        .transpose()
+        .map_err(PrepareError::from)?;
+    store.bind_policy_paths(batch_id, options.policy_paths)?;
+    store.bind_staging_selection(batch_id, digest.as_deref())?;
     let batch = store.start_integration(batch_id)?;
     let inputs = crate::integration::fetch_local(remote, target, &batch)?;
-    prepare_local(store, batch_id, &inputs.repository(), remote, policy_paths).map_err(Into::into)
+    prepare_local_with_options(store, batch_id, &inputs.repository(), remote, options)
+        .map_err(Into::into)
 }
 
 pub struct GitHubRepository<'a> {
@@ -113,10 +198,40 @@ pub async fn prepare_github(
     source: &Path,
     policy_paths: &[String],
 ) -> Result<PreparedIntegration, PrepareError> {
+    prepare_github_with_options(
+        store,
+        app,
+        token,
+        target,
+        batch_id,
+        source,
+        StagingOptions {
+            policy_paths,
+            verification_policy: None,
+        },
+    )
+    .await
+}
+
+pub async fn prepare_github_with_options(
+    store: &mut Store,
+    app: &App,
+    token: &InstallationToken,
+    target: GitHubRepository<'_>,
+    batch_id: &str,
+    source: &Path,
+    options: StagingOptions<'_>,
+) -> Result<PreparedIntegration, PrepareError> {
+    let policy_paths = options.policy_paths;
     if store.repository_scope()? != (App::installation_id(token), App::repository_id(token)) {
         return Err(StoreError::RepositoryMismatch.into());
     }
+    let digest = options
+        .verification_policy
+        .map(|policy| policy.digest())
+        .transpose()?;
     store.bind_policy_paths(batch_id, policy_paths)?;
+    store.bind_staging_selection(batch_id, digest.as_deref())?;
     let batch = store.start_integration(batch_id)?;
     let heads: Vec<String> = batch
         .candidates
@@ -126,14 +241,16 @@ pub async fn prepare_github(
     let base = batch.base_sha.clone();
     let source = source.to_owned();
     let paths = policy_paths.to_vec();
+    let verification_policy = options.verification_policy.cloned();
     let built = tokio::task::spawn_blocking(move || -> Result<_, PrepareError> {
         let integration = integration::build(&source, &base, &heads)?;
         let policy = integration.check_policy(&base, &paths)?;
-        Ok((integration, policy))
+        let selection = selection_for(&integration, &base, verification_policy.as_ref())?;
+        Ok((integration, policy, selection))
     })
     .await
     .map_err(|_| PrepareError::Worker)?;
-    let (integration, policy) = match built {
+    let (integration, policy, selection) = match built {
         Ok(result) => result,
         Err(PrepareError::Integration(
             error @ (IntegrationError::Conflict | IntegrationError::AlreadyIntegrated),
@@ -145,7 +262,12 @@ pub async fn prepare_github(
     };
     let current = store.start_integration(batch_id)?;
     if matches!(current.state, crate::batch::State::Testing { .. }) {
-        store.finish_integration(batch_id, integration.sha(), &policy.digest)?;
+        store.finish_integration_with_selection(
+            batch_id,
+            integration.sha(),
+            &policy.digest,
+            selection.as_ref(),
+        )?;
     }
     let staged = app
         .stage_integration(
@@ -156,7 +278,12 @@ pub async fn prepare_github(
             batch_id,
         )
         .await?;
-    store.finish_integration(batch_id, &staged.sha, &policy.digest)?;
+    store.finish_integration_with_selection(
+        batch_id,
+        &staged.sha,
+        &policy.digest,
+        selection.as_ref(),
+    )?;
     Ok(PreparedIntegration {
         batch_id: batch_id.into(),
         sha: staged.sha,
@@ -197,6 +324,7 @@ pub async fn prepare_github_from_provider(
     policy: &crate::reconcile::RepositoryPolicy,
     batch_id: &str,
     policy_paths: &[String],
+    verification_policy: Option<&Path>,
 ) -> Result<PreparedIntegration, ProviderPrepareError> {
     if policy_paths.is_empty() {
         return Err(ProviderPrepareError::MissingPolicy);
@@ -217,7 +345,17 @@ pub async fn prepare_github_from_provider(
         .read_token(policy.installation as u64, policy.repository as u64)
         .await?;
     crate::reconcile::reconcile_once(app, &read_token, &mut store, &job, policy).await?;
+    let selection_policy = verification_policy
+        .map(crate::selective::Policy::load)
+        .transpose()
+        .map_err(PrepareError::from)?;
+    let digest = selection_policy
+        .as_ref()
+        .map(|p| p.digest())
+        .transpose()
+        .map_err(PrepareError::from)?;
     store.bind_policy_paths(batch_id, policy_paths)?;
+    store.bind_staging_selection(batch_id, digest.as_deref())?;
     let batch = store.start_integration(batch_id)?;
     let inputs = match app
         .fetch_batch_inputs(
@@ -241,7 +379,7 @@ pub async fn prepare_github_from_provider(
     let write_token = app
         .staging_token(policy.installation as u64, policy.repository as u64)
         .await?;
-    prepare_github(
+    prepare_github_with_options(
         &mut store,
         app,
         &write_token,
@@ -251,7 +389,10 @@ pub async fn prepare_github_from_provider(
         },
         batch_id,
         &inputs.repository(),
-        policy_paths,
+        StagingOptions {
+            policy_paths,
+            verification_policy: selection_policy.as_ref(),
+        },
     )
     .await
     .map_err(Into::into)

@@ -684,3 +684,145 @@ fn fetches_frozen_provider_refs_and_rejects_moved_inputs() {
     drop(fetched);
     assert!(!repo.exists());
 }
+
+#[test]
+fn selective_staging_freezes_suites_atomically_and_recovers_after_publication() {
+    use sluss::{
+        batch::{Candidate, State},
+        coordinator::{StagingOptions, prepare_local_from_remote_with_options},
+        selective::{FrozenSelection, Policy, Selection},
+        store::{AdmissionCandidate, Store, StoreError},
+        webhook::Inbox,
+    };
+    let (source, base, one, _) = fixture();
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        source.path(),
+        &[
+            "push",
+            remote.path().to_str().unwrap(),
+            "main:refs/heads/main",
+            "one:refs/pull/1/head",
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let policy_path = dir.path().join("verification.toml");
+    std::fs::write(&policy_path, "version=1\nfull_suites=['fast','other']\n[[components]]\nname='one'\npaths=['one']\nsuites=['fast']\n").unwrap();
+    let policy = Policy::load(&policy_path).unwrap();
+    let digest = policy.digest().unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[5; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: Candidate {
+                    number: 1,
+                    head_sha: one.clone(),
+                },
+                evidence_digest: "e".repeat(64),
+            }],
+        )
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store.plan_batch(id, &base, 1, 1).unwrap().unwrap();
+    store.bind_policy_paths(id, &["shared".into()]).unwrap();
+    store.bind_staging_selection(id, Some(&digest)).unwrap();
+    store.start_integration(id).unwrap();
+    let built = build(source.path(), &base, std::slice::from_ref(&one)).unwrap();
+    let snapshot = built.check_policy(&base, &["shared".into()]).unwrap();
+    let invalid = FrozenSelection {
+        base_sha: base.clone(),
+        integration_sha: built.sha().into(),
+        policy_digest: digest.clone(),
+        selection: Selection::Selected {
+            suites: Default::default(),
+            components: ["one".into()].into(),
+        },
+    };
+    assert!(matches!(
+        store.finish_integration(id, built.sha(), &snapshot.digest),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        store.finish_integration_with_selection(id, built.sha(), &snapshot.digest, Some(&invalid)),
+        Err(StoreError::InvalidBatch)
+    ));
+    let wrong_base = FrozenSelection {
+        base_sha: "0".repeat(40),
+        integration_sha: built.sha().into(),
+        policy_digest: digest.clone(),
+        selection: Selection::Selected {
+            suites: ["fast".into()].into(),
+            components: ["one".into()].into(),
+        },
+    };
+    assert!(matches!(
+        store.finish_integration_with_selection(
+            id,
+            built.sha(),
+            &snapshot.digest,
+            Some(&wrong_base)
+        ),
+        Err(StoreError::StaleBatch)
+    ));
+    assert_eq!(store.batch(id).unwrap().unwrap().0.state, State::Building);
+    assert!(store.batch_selection(id).unwrap().is_none());
+    assert!(store.batch_policy_digest(id).unwrap().is_none());
+    // Simulate interruption after publishing the staging ref but before saving Testing.
+    let published = built.stage_local(remote.path(), id).unwrap();
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    let prepared = prepare_local_from_remote_with_options(
+        &mut store,
+        id,
+        remote.path(),
+        "main",
+        StagingOptions {
+            policy_paths: &["shared".into()],
+            verification_policy: Some(&policy),
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.sha, published.sha);
+    let repeated = prepare_local_from_remote_with_options(
+        &mut store,
+        id,
+        remote.path(),
+        "main",
+        StagingOptions {
+            policy_paths: &["shared".into()],
+            verification_policy: Some(&policy),
+        },
+    )
+    .unwrap();
+    assert_eq!(repeated, prepared);
+    assert_eq!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Testing {
+            integration_sha: published.sha.clone()
+        }
+    );
+    let frozen = store.batch_selection(id).unwrap().unwrap();
+    assert_eq!(frozen.base_sha, base);
+    assert_eq!(frozen.integration_sha, published.sha);
+    assert_eq!(frozen.policy_digest, digest);
+    assert_eq!(
+        frozen.selection.suites(),
+        &["fast".to_string()].into_iter().collect()
+    );
+    let mut changed = policy.clone();
+    changed.full_suites.push("new-suite".into());
+    assert!(matches!(
+        store.bind_staging_selection(id, Some(&changed.digest().unwrap())),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert_eq!(store.batch_selection(id).unwrap().unwrap(), frozen);
+}

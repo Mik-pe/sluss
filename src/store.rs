@@ -84,6 +84,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS planning_config (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS staging_selection_config (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -1020,23 +1021,7 @@ impl Store {
         id: &str,
         selection: &crate::selective::FrozenSelection,
     ) -> Result<(), StoreError> {
-        let digest = &selection.policy_digest;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || selection.selection.suites().is_empty()
-            || selection.selection.suites().len() > 100
-            || selection.selection.suites().iter().any(|name| {
-                name.is_empty()
-                    || name.len() > 100
-                    || !name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-            })
-        {
-            return Err(StoreError::InvalidBatch);
-        }
+        validate_selection(selection)?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1049,24 +1034,7 @@ impl Store {
         {
             return Err(StoreError::StaleBatch);
         }
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT body FROM batch_selection WHERE batch_id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(body) = existing {
-            let old: crate::selective::FrozenSelection = serde_json::from_str(&body)?;
-            if old != *selection {
-                return Err(StoreError::Conflict);
-            }
-        } else {
-            tx.execute(
-                "INSERT INTO batch_selection(batch_id,body) VALUES(?1,?2)",
-                params![id, serde_json::to_string(selection)?],
-            )?;
-        }
+        save_selection(&tx, id, selection)?;
         tx.commit()?;
         Ok(())
     }
@@ -1109,6 +1077,42 @@ impl Store {
                 r.get(0)
             })?;
         if existing != encoded {
+            return Err(StoreError::PolicyMismatch);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind automatic staging to full verification or one operator policy.
+    pub fn bind_staging_selection(
+        &mut self,
+        batch_id: &str,
+        policy_digest: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mode = policy_digest.unwrap_or("full");
+        if mode != "full" && !valid_hex(mode, 64) {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (batch, _) = checked_batch(&tx, batch_id)?;
+        if !matches!(
+            batch.state,
+            State::Planned | State::Building | State::Testing { .. }
+        ) {
+            return Err(StoreError::StaleBatch);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO staging_selection_config(id,mode) VALUES(1,?1)",
+            [mode],
+        )?;
+        let old: String = tx.query_row(
+            "SELECT mode FROM staging_selection_config WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if old != mode {
             return Err(StoreError::PolicyMismatch);
         }
         tx.commit()?;
@@ -1178,18 +1182,45 @@ impl Store {
         sha: &str,
         policy_digest: &str,
     ) -> Result<Batch, StoreError> {
-        let valid = |s: &str, n: usize| {
-            s.len() == n
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        if !valid(sha, 40) || !valid(policy_digest, 64) {
+        self.finish_integration_with_selection(id, sha, policy_digest, None)
+    }
+
+    /// Commit the staged SHA, policy snapshot and optional suite selection atomically.
+    pub fn finish_integration_with_selection(
+        &mut self,
+        id: &str,
+        sha: &str,
+        policy_digest: &str,
+        selection: Option<&crate::selective::FrozenSelection>,
+    ) -> Result<Batch, StoreError> {
+        if !valid_hex(sha, 40) || !valid_hex(policy_digest, 64) {
             return Err(StoreError::InvalidBatch);
         }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (mut batch, version) = checked_batch(&tx, id)?;
+        let mode: Option<String> = tx
+            .query_row(
+                "SELECT mode FROM staging_selection_config WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(mode) = mode {
+            match (mode.as_str(), selection) {
+                ("full", None) => {}
+                (expected, Some(value)) if expected == value.policy_digest => {}
+                _ => return Err(StoreError::PolicyMismatch),
+            }
+        }
+        if let Some(value) = selection {
+            validate_selection(value)?;
+            if value.base_sha != batch.base_sha || value.integration_sha != sha {
+                return Err(StoreError::StaleBatch);
+            }
+            save_selection(&tx, id, value)?;
+        }
         match &batch.state {
             State::Building => {
                 batch
@@ -1256,6 +1287,53 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn valid_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn validate_selection(selection: &crate::selective::FrozenSelection) -> Result<(), StoreError> {
+    if !valid_hex(&selection.policy_digest, 64)
+        || selection.selection.suites().is_empty()
+        || selection.selection.suites().len() > 100
+        || selection.selection.suites().iter().any(|name| {
+            name.is_empty()
+                || name.len() > 100
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(())
+}
+fn save_selection(
+    tx: &Transaction<'_>,
+    id: &str,
+    selection: &crate::selective::FrozenSelection,
+) -> Result<(), StoreError> {
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT body FROM batch_selection WHERE batch_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(body) = existing {
+        if serde_json::from_str::<crate::selective::FrozenSelection>(&body)? != *selection {
+            return Err(StoreError::Conflict);
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO batch_selection(batch_id,body) VALUES(?1,?2)",
+            params![id, serde_json::to_string(selection)?],
+        )?;
+    }
+    Ok(())
 }
 
 fn valid_transition(previous: &State, next: &State) -> bool {
