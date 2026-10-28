@@ -68,6 +68,176 @@ fn numbers(batch: &sluss::batch::Batch) -> Vec<u64> {
 }
 
 #[test]
+fn ci_policy_file_migration_requires_drain_and_rejects_stale_revisions() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let db = dir.path().join("queue.sqlite");
+    let root = plan(&mut store, 1).unwrap();
+    let old = vec![
+        ".github/workflows/ci.yml".to_string(),
+        ".github/workflows/other.yml".to_string(),
+    ];
+    let next = vec![
+        ".github/workflows/ci.yml".to_string(),
+        "ci/check.sh".to_string(),
+    ];
+    store.bind_policy_paths(&root.id, &old).unwrap();
+    assert!(matches!(
+        store.migrate_staging_policy_paths(0, &next, 1, 2, "main"),
+        Err(StoreError::StagingPolicyMigrationNeedsPause)
+    ));
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_staging_policy_paths(0, &next, 1, 2, "main"),
+        Err(StoreError::StagingPolicyMigrationBusy)
+    ));
+    store.set_paused(false).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "success");
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_staging_policy_paths(0, &next, 1, 3, "main"),
+        Err(StoreError::RepositoryMismatch)
+    ));
+    assert!(matches!(
+        store.migrate_staging_policy_paths(0, &next, 1, 2, "other"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE landing_intents_v1(state TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO landing_intents_v1 VALUES('sending')", [])
+        .unwrap();
+    assert!(matches!(
+        store.migrate_staging_policy_paths(0, &next, 1, 2, "main"),
+        Err(StoreError::StagingPolicyMigrationBusy)
+    ));
+    conn.execute("UPDATE landing_intents_v1 SET state='cancelled'", [])
+        .unwrap();
+    assert!(
+        store
+            .migrate_staging_policy_paths(0, &next, 1, 2, "main")
+            .unwrap()
+    );
+    assert_eq!(
+        store.staging_policy_paths().unwrap(),
+        Some((next.clone(), 1))
+    );
+    assert!(
+        !store
+            .migrate_staging_policy_paths(1, &next, 1, 2, "main")
+            .unwrap()
+    );
+    assert!(
+        store
+            .migrate_staging_policy_paths(1, &old, 1, 2, "main")
+            .unwrap()
+    );
+    assert!(matches!(
+        store.migrate_staging_policy_paths(0, &next, 1, 2, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        store.migrate_staging_policy_paths(2, &["../bad".into()], 1, 2, "main"),
+        Err(StoreError::InvalidBatch)
+    ));
+    conn.execute("DELETE FROM staging_policy_revision", [])
+        .unwrap();
+    drop(conn);
+    drop(store);
+    let mut reopened = Store::open(&db).unwrap();
+    assert!(matches!(
+        reopened.staging_policy_paths(),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        reopened.migrate_staging_policy_paths(0, &next, 1, 2, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+}
+
+#[test]
+fn ci_policy_file_migration_cli_reports_the_new_revision() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let db = dir.path().join("queue.sqlite");
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "success");
+    store.set_paused(true).unwrap();
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config, "version=1\n[github]\napp_client_id='test'\ninstallation_id=1\nrepository_id=2\nowner='owner'\nrepository='repo'\n[queue]\ntarget='main'\nmax_batch_size=4\nmax_active_batches=1\ndebounce_seconds=0\nbatch_window_seconds=0\n[checks]\nrequired_reviews=1\n").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "migrate-policy-files",
+            "--expected-revision",
+            "0",
+            "--policy-file",
+            ".github/workflows/ci.yml",
+            "--policy-file",
+            "ci/check.sh",
+            "--config",
+        ])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(
+        String::from_utf8_lossy(&status.stdout)
+            .contains("CI policy files: .github/workflows/ci.yml, ci/check.sh; revision: 1")
+    );
+    assert!(store.paused().unwrap());
+}
+
+#[test]
+fn concurrent_ci_policy_file_migrations_have_one_winner() {
+    use std::sync::{Arc, Barrier};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let db = dir.path().join("queue.sqlite");
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "success");
+    store.set_paused(true).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let workers: Vec<_> = ["ci/one.sh", "ci/two.sh"]
+        .into_iter()
+        .map(|path| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(db).unwrap();
+                barrier.wait();
+                store.migrate_staging_policy_paths(
+                    0,
+                    &[".github/workflows/ci.yml".into(), path.into()],
+                    1,
+                    2,
+                    "main",
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(StoreError::PolicyMismatch)))
+            .count(),
+        1
+    );
+    assert_eq!(store.staging_policy_paths().unwrap().unwrap().1, 1);
+}
+
+#[test]
 fn released_capacity_can_only_expand_while_paused_and_drained() {
     use sluss::scheduler::SchedulerError;
     let (dir, mut store, _inbox, mut scheduler) = setup();

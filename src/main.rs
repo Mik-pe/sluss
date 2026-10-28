@@ -131,6 +131,18 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Change declared CI policy files after stopping and draining workers.
+    MigratePolicyFiles {
+        /// Current CI policy file revision from `sluss status`.
+        #[arg(long)]
+        expected_revision: i64,
+        /// Configuration identifying the bound repository and target.
+        #[arg(long)]
+        config: PathBuf,
+        /// Complete new policy-file list; repeat for each file.
+        #[arg(long, required = true)]
+        policy_file: Vec<String>,
+    },
     /// Change CI bisection after stopping workers and draining investigations.
     MigrateCiBisection {
         /// Current CI bisection revision from `sluss status`.
@@ -1873,6 +1885,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("admission policy already matches; Sluss remains paused");
             }
         }
+        Command::MigratePolicyFiles {
+            expected_revision,
+            config,
+            policy_file,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let mut store = store;
+            if store.migrate_staging_policy_paths(
+                expected_revision,
+                &policy_file,
+                config.github.installation_id,
+                config.github.repository_id,
+                &config.queue.target,
+            )? {
+                println!(
+                    "CI policy files migrated; old evidence retired and CI holds cleared; Sluss remains paused"
+                );
+            } else {
+                println!("CI policy files already match; Sluss remains paused");
+            }
+        }
         Command::MigrateCiBisection {
             expected_revision,
             config,
@@ -2177,6 +2210,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 println!("admission policy: unbound");
+            }
+            if let Some((paths, revision)) = store.staging_policy_paths()? {
+                println!(
+                    "CI policy files: {}; revision: {revision}",
+                    paths.join(", ")
+                );
+            } else {
+                println!("CI policy files: unbound");
             }
             println!(
                 "selection mode: {}",

@@ -1650,6 +1650,31 @@ fn observed_plan(
         )
         .optional()?;
     let paths: Vec<String> = serde_json::from_str(&paths.ok_or(LandingError::StaleBatch)?)?;
+    // Legacy batches predate epoch recording and belong only to epoch zero.
+    // A migration must not revive them, even if the same path list returns.
+    let epoch = crate::store::staging_policy_epoch(tx)?;
+    let has_epochs: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch_staging_policy_epoch')", [], |r| r.get(0))?;
+    let frozen_epoch: i64 = if has_epochs {
+        tx.query_row(
+            "SELECT revision FROM batch_staging_policy_epoch WHERE batch_id=?1",
+            [batch_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    let current_paths: Option<String> = tx
+        .query_row("SELECT paths FROM staging_config WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if frozen_epoch != epoch
+        || current_paths.as_deref() != Some(serde_json::to_string(&paths)?.as_str())
+    {
+        return Err(LandingError::StaleBatch);
+    }
     let current_selection: Option<String> = tx
         .query_row(
             "SELECT mode FROM staging_selection_config WHERE id=1",

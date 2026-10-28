@@ -763,6 +763,82 @@ fn successful_ci_evidence_survives_completion_and_bounded_capacity_release() {
 }
 
 #[test]
+fn policy_file_migration_cannot_revive_old_ci_evidence_after_reversion() {
+    let mut f = setup();
+    let trust = trusted_policy();
+    // Batches saved before the epoch schema remain usable only in epoch zero.
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute(
+        "DELETE FROM batch_staging_policy_epoch WHERE batch_id=?1",
+        [BATCH],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(LandingJournal::inspect_trusted_batch(&f.db, BATCH, &trust).is_ok());
+    let budgets = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &f.db,
+        Capacity {
+            pools: budgets.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: BTreeSet::from([7]),
+                    pools: budgets,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    scheduler.complete_ci_only(BATCH).unwrap();
+    scheduler.release_completed_ci_only(BATCH, 42).unwrap();
+    drop(scheduler);
+    let old = vec![".github/workflows/ci.yml".to_string()];
+    let changed = vec![
+        ".github/workflows/ci.yml".to_string(),
+        "ci/check.sh".to_string(),
+    ];
+    f.store.set_paused(true).unwrap();
+    assert!(
+        f.store
+            .migrate_staging_policy_paths(0, &changed, 1, 2, "main")
+            .unwrap()
+    );
+    assert_eq!(f.store.staging_policy_paths().unwrap(), Some((changed, 1)));
+    assert!(f.store.ci_only_completions().unwrap().is_empty());
+    f.store.set_paused(false).unwrap();
+    assert!(LandingJournal::inspect_trusted_batch(&f.db, BATCH, &trust).is_err());
+    f.store.set_paused(true).unwrap();
+    assert!(
+        f.store
+            .migrate_staging_policy_paths(1, &old, 1, 2, "main")
+            .unwrap()
+    );
+    assert!(matches!(
+        f.store.migrate_staging_policy_paths(0, &old, 1, 2, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    f.store.set_paused(false).unwrap();
+    assert!(LandingJournal::inspect_trusted_batch(&f.db, BATCH, &trust).is_err());
+    let next = "batch-0000000000000002";
+    f.store
+        .plan_batch(next, &"a".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    f.store.bind_policy_paths(next, &old).unwrap();
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT revision FROM batch_staging_policy_epoch WHERE batch_id=?1",
+            [next],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch, 2);
+}
+
+#[test]
 fn completed_ci_requires_consistent_run_and_terminal_reservation_state() {
     for mode in [
         "wrong-run",

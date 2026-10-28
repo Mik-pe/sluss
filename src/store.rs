@@ -54,9 +54,15 @@ pub enum StoreError {
     #[error("pause Sluss before migrating admission policy")]
     AdmissionMigrationNeedsPause,
     #[error(
-        "admission migration requires no active batches, reservations or unresolved dispatches"
+        "admission migration requires no active batches, reservations or unresolved dispatches or landings"
     )]
     AdmissionMigrationBusy,
+    #[error("pause Sluss before migrating CI policy files")]
+    StagingPolicyMigrationNeedsPause,
+    #[error(
+        "CI policy file migration requires no active batches, reservations or unresolved dispatches or landings"
+    )]
+    StagingPolicyMigrationBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -177,6 +183,10 @@ impl Store {
             CREATE INDEX IF NOT EXISTS adaptive_split_root_v1 ON adaptive_split_costs_v1(root_id);
             CREATE TABLE IF NOT EXISTS planning_migrations (id INTEGER PRIMARY KEY, previous_digest TEXT NOT NULL, next_digest TEXT NOT NULL, previous_body TEXT, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS staging_policy_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision >= 0));
+            CREATE TABLE IF NOT EXISTS staging_policy_migrations (revision INTEGER PRIMARY KEY, previous_paths TEXT NOT NULL, next_paths TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS batch_staging_policy_epoch (batch_id TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision >= 0));
+            INSERT OR IGNORE INTO staging_policy_revision(id,revision) SELECT 1,0 WHERE NOT EXISTS(SELECT 1 FROM staging_policy_migrations);
             CREATE TABLE IF NOT EXISTS staging_selection_config (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS selection_migrations (id INTEGER PRIMARY KEY, previous_mode TEXT NOT NULL, next_mode TEXT NOT NULL, migrated_ms INTEGER NOT NULL, cleared_holds INTEGER NOT NULL, discarded_batches INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
@@ -409,6 +419,7 @@ impl Store {
         for (table, predicate) in [
             ("capacity_reservations", "1"),
             ("dispatch_intents", "state NOT IN ('finished','cancelled')"),
+            ("landing_intents_v1", "state IN ('prepared','sending')"),
         ] {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -1778,6 +1789,7 @@ impl Store {
         ) {
             return Err(StoreError::StaleBatch);
         }
+        let revision = staging_policy_epoch(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO staging_config(id,paths) VALUES(1,?1)",
             [&encoded],
@@ -1789,8 +1801,152 @@ impl Store {
         if existing != encoded {
             return Err(StoreError::PolicyMismatch);
         }
+        tx.execute(
+            "INSERT OR IGNORE INTO batch_staging_policy_epoch(batch_id,revision) VALUES(?1,?2)",
+            params![batch_id, revision],
+        )?;
+        let frozen: i64 = tx.query_row(
+            "SELECT revision FROM batch_staging_policy_epoch WHERE batch_id=?1",
+            [batch_id],
+            |r| r.get(0),
+        )?;
+        if frozen != revision {
+            return Err(StoreError::PolicyMismatch);
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Bound policy paths and their monotonic configuration revision.
+    pub fn staging_policy_paths(&self) -> Result<Option<(Vec<String>, i64)>, StoreError> {
+        let revision = staging_policy_epoch(&self.conn)?;
+        let paths: Option<String> = self
+            .conn
+            .query_row("SELECT paths FROM staging_config WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        paths
+            .map(|body| Ok((serde_json::from_str(&body)?, revision)))
+            .transpose()
+    }
+
+    /// Migrate policy files only while stopped, paused and fully drained.
+    pub fn migrate_staging_policy_paths(
+        &mut self,
+        expected_revision: i64,
+        paths: &[String],
+        installation: i64,
+        repository: i64,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        if expected_revision < 0
+            || paths.is_empty()
+            || paths.len() > 128
+            || paths.windows(2).any(|w| w[0] == w[1])
+            || paths
+                .iter()
+                .any(|path| !crate::integration::valid_policy_path(path))
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let encoded = serde_json::to_string(&paths)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Err(StoreError::StagingPolicyMigrationNeedsPause);
+        }
+        let binding: Option<(i64,i64,String)> = tx.query_row(
+            "SELECT r.installation,r.repository,t.branch FROM repository_binding r JOIN observed_target t ON r.id=t.id WHERE r.id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        match binding {
+            Some((i, r, _)) if (i, r) != (installation, repository) => {
+                return Err(StoreError::RepositoryMismatch);
+            }
+            Some((_, _, branch)) if branch != target => return Err(StoreError::PolicyMismatch),
+            None => return Err(StoreError::Unbound),
+            _ => {}
+        }
+        if staging_policy_epoch(&tx)? != expected_revision {
+            return Err(StoreError::PolicyMismatch);
+        }
+        let old: Option<String> = tx
+            .query_row("SELECT paths FROM staging_config WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let old = old.ok_or(StoreError::Unbound)?;
+        {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let batch: Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    batch.state,
+                    State::Planned
+                        | State::Building
+                        | State::Testing { .. }
+                        | State::Verified { .. }
+                ) {
+                    return Err(StoreError::StagingPolicyMigrationBusy);
+                }
+            }
+        }
+        for (table, predicate) in [
+            ("capacity_reservations", "1"),
+            ("dispatch_intents", "state NOT IN ('finished','cancelled')"),
+            ("landing_intents_v1", "state IN ('prepared','sending')"),
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if exists
+                && tx.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"),
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                return Err(StoreError::StagingPolicyMigrationBusy);
+            }
+        }
+        if old == encoded {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let next = expected_revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidBatch)?;
+        clear_ci_candidate_heads(&tx)?;
+        tx.execute(
+            "UPDATE split_tasks SET state='stale' WHERE state='pending'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE ci_investigations SET state='stale' WHERE state!='stale'",
+            [],
+        )?;
+        tx.execute("DELETE FROM ci_candidate_completions", [])?;
+        tx.execute("DELETE FROM ci_capacity_waits WHERE ended_ms IS NULL", [])?;
+        tx.execute("DELETE FROM adaptive_batch_state_v1 WHERE id=1", [])?;
+        tx.execute("UPDATE staging_config SET paths=?1 WHERE id=1", [&encoded])?;
+        tx.execute(
+            "UPDATE staging_policy_revision SET revision=?1 WHERE id=1",
+            [next],
+        )?;
+        tx.execute("INSERT INTO staging_policy_migrations(revision,previous_paths,next_paths,migrated_ms) VALUES(?1,?2,?3,?4)", params![next,old,encoded,now_ms()?])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Bind automatic staging to full verification or one operator policy.
@@ -2221,6 +2377,39 @@ fn valid_transition(previous: &State, next: &State) -> bool {
 
 /// Remove only current pointers; immutable observations remain as history.
 /// Older databases may not yet have the experimental candidate tables.
+pub(crate) fn staging_policy_epoch(conn: &Connection) -> Result<i64, StoreError> {
+    let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('staging_policy_revision','staging_policy_migrations')", [], |r| r.get(0))?;
+    if tables == 0 {
+        return Ok(0);
+    }
+    if tables != 2 {
+        return Err(StoreError::PolicyMismatch);
+    }
+    let revision: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM staging_policy_revision WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let last: Option<(i64,String)> = conn.query_row("SELECT revision,next_paths FROM staging_policy_migrations ORDER BY revision DESC LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    match (revision, last) {
+        (Some(0), None) => Ok(0),
+        (Some(revision), Some((last, paths))) if revision > 0 && revision == last => {
+            let current: Option<String> = conn
+                .query_row("SELECT paths FROM staging_config WHERE id=1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if current.as_deref() != Some(paths.as_str()) {
+                return Err(StoreError::PolicyMismatch);
+            }
+            Ok(revision)
+        }
+        _ => Err(StoreError::PolicyMismatch),
+    }
+}
+
 fn clear_ci_candidate_heads(tx: &Transaction<'_>) -> Result<(), StoreError> {
     let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_evidence_candidate_heads_v1')", [], |r| r.get(0))?;
     if exists {

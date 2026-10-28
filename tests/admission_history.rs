@@ -300,6 +300,16 @@ fn admission_migration_requires_drained_batches_and_dispatches() {
     ));
     conn.execute("UPDATE dispatch_intents SET state='finished'", [])
         .unwrap();
+    conn.execute("CREATE TABLE landing_intents_v1(state TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO landing_intents_v1 VALUES('sending')", [])
+        .unwrap();
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::AdmissionMigrationBusy)
+    ));
+    conn.execute("UPDATE landing_intents_v1 SET state='cancelled'", [])
+        .unwrap();
     assert!(
         store
             .migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main")
