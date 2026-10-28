@@ -229,6 +229,84 @@ async fn dispatched_run(
         json!({"id":if path.0.path().contains("/runs/124") {124} else {123},"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":workflow_path,"event":event,"status":status,"conclusion":conclusion,"repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
 }
+
+async fn discovery_runs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(
+        query.get("branch").map(String::as_str),
+        Some("sluss/batch-0123456789abcdef")
+    );
+    assert_eq!(
+        query.get("event").map(String::as_str),
+        Some("workflow_dispatch")
+    );
+    assert_eq!(query.get("head_sha"), Some(&"a".repeat(40)));
+    assert_eq!(query.get("per_page").map(String::as_str), Some("100"));
+    let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let mode = state.mode.load(Ordering::SeqCst);
+    let run = |id: u64, attempt: u32, branch: &str, path: &str| json!({"id":id,"run_attempt":attempt,"workflow_id":17,"head_sha":"a".repeat(40),"head_branch":branch,"path":path,"event":"workflow_dispatch","status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":7}});
+    if mode == 225 {
+        let page = query.get("page").unwrap();
+        let rows: Vec<_> = if page == "1" {
+            (1..=100)
+                .map(|id| run(id, 1, "sluss/other", ".github/workflows/ci.yml"))
+                .collect()
+        } else {
+            assert_eq!(page, "2");
+            vec![run(
+                101,
+                1,
+                "sluss/batch-0123456789abcdef",
+                ".github/workflows/ci.yml",
+            )]
+        };
+        return Json(json!({"total_count":101,"workflow_runs":rows}));
+    }
+    assert_eq!(query.get("page").map(String::as_str), Some("1"));
+    if mode == 223 {
+        return Json(json!({"total_count":0,"workflow_runs":[]}));
+    }
+    if mode == 224 {
+        let mut item = run(
+            123,
+            1,
+            "sluss/batch-0123456789abcdef",
+            ".github/workflows/ci.yml",
+        );
+        if count % 2 == 0 {
+            item["status"] = json!("in_progress");
+            item["conclusion"] = Value::Null;
+        }
+        return Json(json!({"total_count":1,"workflow_runs":[item]}));
+    }
+    if mode == 222 {
+        return Json(json!({"total_count":1001,"workflow_runs":[]}));
+    }
+    if mode == 220 {
+        return Json(
+            json!({"total_count":2,"workflow_runs":[run(123,1,"sluss/batch-0123456789abcdef",".github/workflows/ci.yml"),run(123,1,"sluss/batch-0123456789abcdef",".github/workflows/ci.yml")]}),
+        );
+    }
+    if mode == 221 && count % 2 == 1 {
+        return Json(
+            json!({"total_count":1,"workflow_runs":[run(124,1,"sluss/batch-0123456789abcdef",".github/workflows/ci.yml")]}),
+        );
+    }
+    if mode == 221 {
+        return Json(
+            json!({"total_count":1,"workflow_runs":[run(123,1,"sluss/batch-0123456789abcdef",".github/workflows/ci.yml")]}),
+        );
+    }
+    Json(json!({"total_count":4,"workflow_runs":[
+        run(123,1,"sluss/batch-0123456789abcdef",".github/workflows/ci.yml"),
+        run(125,2,"sluss/batch-0123456789abcdef",".github/workflows/ci.yml"),
+        run(126,1,"sluss/other",".github/workflows/ci.yml"),
+        run(127,1,"sluss/batch-0123456789abcdef",".github/workflows/other.yml")]}))
+}
 async fn cancel_run(State(state): State<ServerState>, headers: HeaderMap) -> StatusCode {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     state.permissions.fetch_add(1, Ordering::SeqCst);
@@ -1335,6 +1413,223 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
             .is_empty()
     );
     api_task.abort();
+}
+
+#[tokio::test]
+async fn uncertain_dispatch_discovery_is_read_only_scoped_and_never_asserts_origin() {
+    use sluss::{
+        batch::Candidate,
+        scheduler::{Capacity, DispatchPlan, DispatchState, Host, Request, Scheduler},
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route(
+            "/repos/owner/repo/actions/workflows/17/runs",
+            get(discovery_runs),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: reads.clone(),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let read_token = client.read_token(42, 7).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("event", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: Candidate {
+                    number: 1,
+                    head_sha: "c".repeat(40),
+                },
+                evidence_digest: "d".repeat(64),
+            }],
+            &"b".repeat(40),
+            "main",
+        )
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &db,
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [7].into(),
+                    pools: pools.clone(),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    let plan = DispatchPlan {
+        installation_id: 42,
+        repository_id: 7,
+        workflow_id: 17,
+        integration_sha: "a".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "e".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    scheduler
+        .reserve_batch_dispatch(id, &Request { pools }, &plan)
+        .unwrap()
+        .unwrap();
+    scheduler
+        .claim_batch_dispatch(id, ".github/workflows/ci.yml")
+        .unwrap();
+    let frozen = Scheduler::inspect_uncertain_dispatch(&db, id).unwrap();
+    let candidates = client
+        .find_uncertain_dispatch_runs(&read_token, "owner", "repo", &frozen)
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|r| (r.id, r.run_attempt))
+            .collect::<Vec<_>>(),
+        vec![(123, 1), (125, 2)]
+    );
+    assert_eq!(
+        Scheduler::inspect_uncertain_dispatch(&db, id).unwrap(),
+        frozen
+    );
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Sending
+    );
+    assert_eq!(scheduler.receipt_source(id).unwrap(), None);
+    for bad in [220, 221, 222] {
+        mode.store(bad, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        assert!(
+            client
+                .find_uncertain_dispatch_runs(&read_token, "owner", "repo", &frozen)
+                .await
+                .is_err(),
+            "mode {bad}"
+        );
+    }
+    mode.store(223, Ordering::SeqCst);
+    assert!(
+        client
+            .find_uncertain_dispatch_runs(&read_token, "owner", "repo", &frozen)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    mode.store(224, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .find_uncertain_dispatch_runs(&read_token, "owner", "repo", &frozen)
+            .await
+            .unwrap()[0]
+            .status,
+        "completed"
+    );
+    mode.store(225, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .find_uncertain_dispatch_runs(&read_token, "owner", "repo", &frozen)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![101]
+    );
+    mode.store(0, Ordering::SeqCst);
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
+    let db_arg = db.clone();
+    let key = key_dir.path().join("test-key.pem");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db_arg)
+            .args(["find-dispatch-runs", "--batch-id", id, "--config"])
+            .arg(config)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("run 123: latest attempt 1"));
+    assert!(text.contains("absence does not prove"));
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Sending
+    );
+    // Earlier journals may not have the workflow-path table. Discovery must
+    // remain read-only and explicitly retain the weaker, unbound result.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TABLE dispatch_workflows", []).unwrap();
+    let legacy = Scheduler::inspect_uncertain_dispatch(&db, id).unwrap();
+    assert_eq!(legacy.workflow_path, None);
+    let legacy_runs = client
+        .find_uncertain_dispatch_runs(&read_token, "owner", "repo", &legacy)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![123, 125, 127]
+    );
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='dispatch_workflows')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!table_exists);
+    assert!(Scheduler::inspect_uncertain_dispatch(dir.path().join("missing.sqlite"), id).is_err());
+    assert!(!dir.path().join("missing.sqlite").exists());
+    server.abort();
 }
 
 #[tokio::test]

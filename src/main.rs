@@ -313,6 +313,13 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Find possible GitHub runs for a dispatch whose response was lost.
+    FindDispatchRuns {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Observe a dispatched run and check the reserved host's runner IDs.
     ObserveDispatch {
         #[arg(long)]
@@ -1266,10 +1273,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Command::FindDispatchRuns { batch_id, config } = &cli.command {
+        let config = sluss::config::Config::load(config)?;
+        let frozen = sluss::scheduler::Scheduler::inspect_uncertain_dispatch(&cli.db, batch_id)?;
+        if frozen.pending.plan.installation_id != config.github.installation_id as u64
+            || frozen.pending.plan.repository_id != config.github.repository_id as u64
+        {
+            return Err("repository does not match the uncertain dispatch".into());
+        }
+        let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let app = sluss::github::App::new(
+            config.github.app_client_id.clone(),
+            &std::fs::read(key_path)?,
+            &config.github.api,
+        )?;
+        let token = app
+            .read_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let runs = app
+            .find_uncertain_dispatch_runs(
+                &token,
+                &config.github.owner,
+                &config.github.repository,
+                &frozen,
+            )
+            .await?;
+        if sluss::scheduler::Scheduler::inspect_uncertain_dispatch(&cli.db, batch_id)? != frozen {
+            return Err("dispatch changed during discovery; repeat the read".into());
+        }
+        println!("{} possible workflow runs for {batch_id}", runs.len());
+        for run in runs {
+            println!(
+                "run {}: latest attempt {}, status {}, conclusion {}",
+                run.id,
+                run.run_attempt,
+                run.status,
+                run.conclusion.as_deref().unwrap_or("none")
+            );
+        }
+        if frozen.workflow_path.is_none() {
+            println!("workflow path was not frozen for this older dispatch");
+        }
+        println!(
+            "Matches do not prove request origin or input values; absence does not prove the request was not sent. No recovery or capacity release was performed."
+        );
+        println!(
+            "Recovery requires the latest run to still be attempt 1; rerun attempts need separate investigation."
+        );
+        return Ok(());
+    }
+
     let store = Store::open(&cli.db)?;
     match cli.command {
         Command::Serve { .. } => unreachable!(),
         Command::Reconcile(_) => unreachable!(),
+        Command::FindDispatchRuns { .. } => unreachable!(),
         Command::Select {
             policy,
             source,

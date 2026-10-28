@@ -712,7 +712,84 @@ pub struct PendingDispatch {
     pub plan: DispatchPlan,
     pub state: DispatchState,
 }
+/// A read-only snapshot of a batch-bound send whose result is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertainDispatch {
+    pub pending: PendingDispatch,
+    pub workflow_path: Option<String>,
+}
 impl Scheduler {
+    /// Inspect an existing uncertain batch without creating or migrating a DB.
+    pub fn inspect_uncertain_dispatch(
+        path: impl AsRef<Path>,
+        id: &str,
+    ) -> Result<UncertainDispatch, SchedulerError> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        type Row = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+        );
+        let has_workflows: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_workflows')", [], |r| r.get(0))?;
+        let workflow = if has_workflows {
+            "(SELECT path FROM dispatch_workflows w WHERE w.id=d.id)"
+        } else {
+            "NULL"
+        };
+        let query = format!(
+            "SELECT d.plan,d.state,d.run_id,r.host,r.request,{workflow},binding.installation,binding.repository FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id AND b.batch_id=d.id JOIN capacity_reservations r ON r.id=d.id JOIN repository_binding binding ON binding.id=1 WHERE d.id=?1"
+        );
+        let row: Option<Row> = conn
+            .query_row(&query, [id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .optional()?;
+        let (body, state, run, host, request, workflow, installation, repository) =
+            row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&body)?;
+        if !plan.valid()
+            || state != "sending"
+            || run.is_some()
+            || i64::try_from(plan.installation_id).ok() != Some(installation)
+            || i64::try_from(plan.repository_id).ok() != Some(repository)
+            || plan.staging_ref != format!("refs/heads/sluss/{id}")
+            || workflow
+                .as_deref()
+                .is_some_and(|p| !crate::integration::valid_policy_path(p))
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        Ok(UncertainDispatch {
+            pending: PendingDispatch {
+                reservation: Reservation {
+                    id: id.into(),
+                    host: host.ok_or(SchedulerError::Corrupt)?,
+                    request: serde_json::from_str(&request.ok_or(SchedulerError::Corrupt)?)?,
+                },
+                plan,
+                state: DispatchState::Sending,
+            },
+            workflow_path: workflow,
+        })
+    }
     /// Verify that a provider target check uses the frozen batch base and the
     /// branch from the latest bound reconciliation. Generic dispatches may
     /// only use the explicitly unbound API.

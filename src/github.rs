@@ -22,7 +22,7 @@ pub enum GitHubError {
     Status(u16),
     #[error("GitHub returned an invalid or unexpectedly scoped installation token")]
     InvalidResponse,
-    #[error("GitHub PR or review data is invalid, incomplete, or changed during observation")]
+    #[error("GitHub data is invalid, incomplete, or changed during observation")]
     UnstableObservation,
 }
 
@@ -806,7 +806,132 @@ struct ActionsJobsPage {
     total_count: usize,
     jobs: Vec<ActionsJob>,
 }
+#[derive(Deserialize)]
+struct ActionsRunsPage {
+    total_count: usize,
+    workflow_runs: Vec<ActionsRun>,
+}
 impl App {
+    /// Find possible identities for an uncertain send. A matching run does not
+    /// prove request origin, input values, CI trust or permission to release capacity.
+    pub async fn find_uncertain_dispatch_runs(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        intent: &crate::scheduler::UncertainDispatch,
+    ) -> Result<Vec<ActionsRun>, DispatchError> {
+        let pending = &intent.pending;
+        if !valid_name(owner)
+            || !valid_name(repository)
+            || token.repository_id != pending.plan.repository_id
+            || token.installation_id != pending.plan.installation_id
+            || pending.state != crate::scheduler::DispatchState::Sending
+        {
+            return Err(DispatchError::Invalid);
+        }
+        let branch = pending
+            .plan
+            .staging_ref
+            .strip_prefix("refs/heads/")
+            .ok_or(DispatchError::Invalid)?;
+        if branch != format!("sluss/{}", pending.reservation.id)
+            || !commit_sha(&pending.plan.integration_sha)
+            || pending.plan.workflow_id == 0
+        {
+            return Err(DispatchError::Invalid);
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let first_repo: Repository = self.get_json(token, &root, None).await?;
+        if first_repo.id != pending.plan.repository_id {
+            return Err(DispatchError::Invalid);
+        }
+        // Branch and SHA are already validated and contain no query delimiters.
+        let path = format!(
+            "{root}/actions/workflows/{}/runs?branch={branch}&event=workflow_dispatch&head_sha={}",
+            pending.plan.workflow_id, pending.plan.integration_sha
+        );
+        let first = self.fetch_workflow_runs(token, &path).await?;
+        let last = self.fetch_workflow_runs(token, &path).await?;
+        let last_repo: Repository = self.get_json(token, &root, None).await?;
+        if first_repo.id != last_repo.id || first.len() != last.len() {
+            return Err(DispatchError::GitHub(GitHubError::UnstableObservation));
+        }
+        for (a, b) in first.iter().zip(&last) {
+            let mut comparable = a.clone();
+            comparable.status = b.status.clone();
+            comparable.conclusion = b.conclusion.clone();
+            if comparable != *b {
+                return Err(DispatchError::GitHub(GitHubError::UnstableObservation));
+            }
+        }
+        Ok(last
+            .into_iter()
+            .filter(|run| {
+                run.workflow_id == pending.plan.workflow_id
+                    && run.repository.id == pending.plan.repository_id
+                    && run.head_repository.as_ref().map(|r| r.id)
+                        == Some(pending.plan.repository_id)
+                    && run.head_sha == pending.plan.integration_sha
+                    && run.head_branch.as_deref() == Some(branch)
+                    && run.event == "workflow_dispatch"
+                    && intent
+                        .workflow_path
+                        .as_deref()
+                        .is_none_or(|p| workflow_path_matches(p, &run.path))
+            })
+            .collect())
+    }
+
+    async fn fetch_workflow_runs(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+    ) -> Result<Vec<ActionsRun>, GitHubError> {
+        let mut runs = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut total = None;
+        for page in 1..=10 {
+            let response: ActionsRunsPage = self.get_json(token, path, Some(page)).await?;
+            if response.total_count > 1000
+                || response.workflow_runs.len() > 100
+                || total.is_some_and(|count| count != response.total_count)
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            total = Some(response.total_count);
+            for run in response.workflow_runs {
+                let safe_status = |s: &str| {
+                    !s.is_empty()
+                        && s.len() <= 64
+                        && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                };
+                if run.id == 0
+                    || run.run_attempt == 0
+                    || !ids.insert(run.id)
+                    || run.repository.id != token.repository_id
+                    || !commit_sha(&run.head_sha)
+                    || !safe_status(&run.status)
+                    || run.conclusion.as_deref().is_some_and(|s| !safe_status(s))
+                {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                runs.push(run);
+            }
+            if runs.len() > response.total_count {
+                return Err(GitHubError::UnstableObservation);
+            }
+            if runs.len() == response.total_count {
+                runs.sort_by_key(|r| r.id);
+                return Ok(runs);
+            }
+            if runs.len() != page as usize * 100 {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        Err(GitHubError::UnstableObservation)
+    }
+
     /// Obtain two matching snapshots of one exact attempt, with bounded and
     /// complete job pagination. Values can still change immediately afterward.
     pub async fn observe_actions_attempt(
