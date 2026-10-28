@@ -396,3 +396,75 @@ pub async fn supervise_preparation(
         sleep(delay).await;
     }
 }
+
+/// Find one staged batch whose dispatch is absent or still safely prepared.
+/// Claimed, accepted and observed intents are never sent again.
+pub async fn dispatch_once(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+    capacity: &crate::scheduler::Capacity,
+    settings: &crate::dispatch::Settings,
+) -> Result<Option<crate::dispatch::Outcome>, String> {
+    use crate::{batch::State, scheduler::DispatchState};
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    if store.paused().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let inbox = Inbox::open(db).map_err(|e| e.to_string())?;
+    if inbox
+        .pending_for(policy.installation, policy.repository)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let scheduler =
+        crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
+    let intents = scheduler.pending_dispatches().map_err(|e| e.to_string())?;
+    let batch = store
+        .active_batches()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|batch| {
+            matches!(batch.state, State::Testing { .. })
+                && !intents.iter().any(|intent| {
+                    intent.reservation.id == batch.id
+                        && !matches!(intent.state, DispatchState::Prepared)
+                })
+        });
+    let Some(batch) = batch else {
+        return Ok(None);
+    };
+    crate::dispatch::batch(db, app, policy, capacity, settings, &batch.id)
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Automatic dispatch remains explicit opt-in and never authorizes landing.
+pub async fn supervise_dispatch(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    capacity: crate::scheduler::Capacity,
+    settings: crate::dispatch::Settings,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(10));
+    let mut delay = minimum;
+    loop {
+        match dispatch_once(&app, &db, &policy, &capacity, &settings).await {
+            Ok(Some(crate::dispatch::Outcome::Sent { run, host })) => {
+                eprintln!("dispatched run {run} to reserved host {host}");
+                delay = minimum;
+            }
+            Ok(_) => delay = minimum,
+            Err(error) => {
+                eprintln!("automatic dispatch failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}

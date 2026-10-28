@@ -1749,5 +1749,111 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(!unstable_doctor.status.success());
     assert!(String::from_utf8_lossy(&unstable_doctor.stderr).contains("UnstableObservation"));
     assert_eq!(posts.load(Ordering::SeqCst), 2);
+
+    let settings = sluss::dispatch::Settings {
+        workflow_id: 17,
+        required_jobs: ["job-1-0".into()].into(),
+        request: sluss::scheduler::Request {
+            pools: [("rust".into(), 1)].into(),
+        },
+        verification_policy: None,
+    };
+    for (name, fail_after_post) in [("uncertain", true), ("successful", false)] {
+        mode.store(0, Ordering::SeqCst);
+        let auto_db = data.path().join(format!("{name}.sqlite"));
+        let mut inbox = Inbox::open(&auto_db).unwrap();
+        let mut auto_store = Store::open(&auto_db).unwrap();
+        inbox
+            .record(&format!("{name}-initial"), "pull_request", &[43; 32], 42, 7)
+            .unwrap();
+        let event = inbox.pending().unwrap().remove(0);
+        sluss::reconcile::reconcile_once(
+            &fixture_app,
+            &fixture_token,
+            &mut auto_store,
+            &event,
+            &fixture_policy,
+        )
+        .await
+        .unwrap();
+        auto_store
+            .plan_batch(id, &"b".repeat(40), 1, 1)
+            .unwrap()
+            .unwrap();
+        auto_store.start_integration(id).unwrap();
+        auto_store
+            .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+            .unwrap();
+        let before = posts.load(Ordering::SeqCst);
+        auto_store.set_paused(true).unwrap();
+        assert!(
+            sluss::worker::dispatch_once(
+                &fixture_app,
+                &auto_db,
+                &fixture_policy,
+                &observer_capacity,
+                &settings
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), before);
+        auto_store.set_paused(false).unwrap();
+        if fail_after_post {
+            mode.store(17, Ordering::SeqCst);
+            assert!(
+                sluss::worker::dispatch_once(
+                    &fixture_app,
+                    &auto_db,
+                    &fixture_policy,
+                    &observer_capacity,
+                    &settings
+                )
+                .await
+                .is_err()
+            );
+        } else {
+            let (a, b) = tokio::join!(
+                sluss::worker::dispatch_once(
+                    &fixture_app,
+                    &auto_db,
+                    &fixture_policy,
+                    &observer_capacity,
+                    &settings
+                ),
+                sluss::worker::dispatch_once(
+                    &fixture_app,
+                    &auto_db,
+                    &fixture_policy,
+                    &observer_capacity,
+                    &settings
+                ),
+            );
+            assert!(
+                matches!(a, Ok(Some(sluss::dispatch::Outcome::Sent { .. })))
+                    || matches!(b, Ok(Some(sluss::dispatch::Outcome::Sent { .. })))
+            );
+        }
+        assert_eq!(posts.load(Ordering::SeqCst), before + 1);
+        mode.store(0, Ordering::SeqCst);
+        assert!(
+            sluss::worker::dispatch_once(
+                &fixture_app,
+                &auto_db,
+                &fixture_policy,
+                &observer_capacity,
+                &settings
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            before + 1,
+            "a restarted worker must not retry an accepted or uncertain POST"
+        );
+    }
     server.abort();
 }

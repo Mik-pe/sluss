@@ -35,6 +35,21 @@ enum Command {
         /// Complete operator-selected list of tracked CI policy files; repeat as needed.
         #[arg(long, requires = "auto_stage")]
         policy_file: Vec<String>,
+        /// Automatically dispatch staged batches to the configured workflow.
+        #[arg(long, requires_all = ["config", "capacity", "workflow_id", "required_job", "pool"])]
+        auto_dispatch: bool,
+        /// GitHub Actions workflow ID for automatic dispatch.
+        #[arg(long, requires = "auto_dispatch")]
+        workflow_id: Option<u64>,
+        /// Required workflow job name; repeat as needed.
+        #[arg(long, requires = "auto_dispatch")]
+        required_job: Vec<String>,
+        /// Resource request as pool=count; repeat as needed.
+        #[arg(long, requires = "auto_dispatch")]
+        pool: Vec<String>,
+        /// Operator-owned selective policy if a batch already has a selection.
+        #[arg(long, requires = "auto_dispatch")]
+        verification_policy: Option<PathBuf>,
         /// Cancel known runs when their batch is invalidated.
         #[arg(long, requires_all = ["config", "capacity"])]
         cancel_stale: bool,
@@ -45,7 +60,7 @@ enum Command {
         #[arg(long, requires = "config")]
         capacity: Option<PathBuf>,
     },
-    /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
+    /// Reconcile one pending repository wakeup without starting CI.
     Reconcile(ReconcileArgs),
     /// Select suites from an operator-controlled policy and a Git diff.
     Select {
@@ -214,6 +229,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auto_plan,
         auto_stage,
         policy_file,
+        auto_dispatch,
+        workflow_id,
+        required_job,
+        pool,
+        verification_policy,
         cancel_stale,
         observe_dispatches,
         capacity,
@@ -259,14 +279,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             if auto_stage {
-                eprintln!(
-                    "automatic staging enabled; CI dispatch remains manual and landing is disabled"
-                );
+                eprintln!("automatic staging enabled; landing is disabled");
                 tokio::spawn(sluss::worker::supervise_preparation(
                     app.clone(),
                     cli.db.clone(),
                     policy.clone(),
                     policy_file,
+                    poll,
+                ));
+            }
+            if auto_dispatch {
+                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                let settings = sluss::dispatch::Settings {
+                    workflow_id: workflow_id.ok_or("workflow ID is required")?,
+                    required_jobs: required_job.into_iter().collect(),
+                    request: sluss::scheduler::Request {
+                        pools: parse_pools(&pool)?,
+                    },
+                    verification_policy,
+                };
+                eprintln!("automatic dispatch enabled; landing remains disabled");
+                tokio::spawn(sluss::worker::supervise_dispatch(
+                    app.clone(),
+                    cli.db.clone(),
+                    policy.clone(),
+                    capacity,
+                    settings,
                     poll,
                 ));
             }
@@ -297,9 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             tokio::spawn(sluss::worker::supervise(app, cli.db, policy, poll, rescan));
-            eprintln!(
-                "webhook listener on {listen}; automatic observations enabled, automatic dispatch and landing disabled"
-            );
+            eprintln!("webhook listener on {listen}; configured workers enabled, landing disabled");
         } else {
             eprintln!("webhook listener on {listen}; reconciliation worker is not enabled");
         }
@@ -336,7 +372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut store = Store::open(&cli.db)?;
         sluss::reconcile::reconcile_once(&app, &token, &mut store, &job, &config).await?;
         println!(
-            "repository observations updated; automatic CI dispatch and landing remain disabled"
+            "repository observations updated; this command does not start CI or authorize landing"
         );
         return Ok(());
     }
@@ -563,67 +599,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             verification_policy,
         } => {
             let config = sluss::config::Config::load(&config)?;
-            if store.repository_scope()?
-                != (
-                    config.github.installation_id as u64,
-                    config.github.repository_id as u64,
-                )
-            {
-                return Err("repository does not match the reconciled queue".into());
-            }
-            let (batch, _) = store.batch(&batch_id)?.ok_or("unknown batch")?;
-            let base_sha = batch.base_sha.clone();
-            let sha = match batch.state {
-                sluss::batch::State::Testing { integration_sha } => integration_sha,
-                _ => return Err("batch has not been staged for testing".into()),
-            };
-            let policy_digest = store
-                .batch_policy_digest(&batch_id)?
-                .ok_or("batch has no policy snapshot")?;
-            let (suites, selection_policy_digest) =
-                match (store.batch_selection(&batch_id)?, verification_policy) {
-                    (Some(frozen), Some(path)) => {
-                        let policy = sluss::selective::Policy::load(&path)?;
-                        if policy.digest()? != frozen.policy_digest {
-                            return Err("verification policy changed after selection".into());
-                        }
-                        (
-                            frozen.selection.suites().clone(),
-                            Some(frozen.policy_digest),
-                        )
-                    }
-                    (Some(_), None) => {
-                        return Err("the frozen selection requires --verification-policy".into());
-                    }
-                    (None, Some(_)) => {
-                        return Err(
-                            "run select-batch before supplying a verification policy".into()
-                        );
-                    }
-                    (None, None) => (std::collections::BTreeSet::from(["full".into()]), None),
-                };
-            let plan = sluss::scheduler::DispatchPlan {
-                installation_id: config.github.installation_id as u64,
-                repository_id: config.github.repository_id as u64,
+            let limits = load_capacity(&capacity)?;
+            let settings = sluss::dispatch::Settings {
                 workflow_id,
-                integration_sha: sha,
-                staging_ref: format!("refs/heads/sluss/{batch_id}"),
-                policy_digest,
                 required_jobs: required_job.into_iter().collect(),
-                suites,
-                selection_policy_digest,
+                request: sluss::scheduler::Request {
+                    pools: parse_pools(&pool)?,
+                },
+                verification_policy,
             };
-            let request = sluss::scheduler::Request {
-                pools: parse_pools(&pool)?,
-            };
-            let capacity = load_capacity(&capacity)?;
-            if capacity
-                .hosts
-                .keys()
-                .any(|name| !sluss::github::valid_runner_label(name))
-            {
-                return Err("each host must use a unique sluss-host-* runner label".into());
-            }
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
@@ -632,62 +616,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &key,
                 &config.github.api,
             )?;
-            // Refresh all admission inputs using the bound policy before reserving capacity.
-            // Concurrent webhook delivery or another worker makes the scan fail closed.
-            let policy = config.policy();
-            let mut inbox = sluss::webhook::Inbox::open(&cli.db)?;
-            inbox.schedule_if_idle(policy.installation, policy.repository)?;
-            let job = inbox
-                .pending_for(policy.installation, policy.repository)?
-                .ok_or("reconciliation was consumed concurrently; retry dispatch")?;
-            let read_token = app
-                .read_token(plan.installation_id, plan.repository_id)
-                .await?;
-            let mut store = store;
-            sluss::reconcile::reconcile_once(&app, &read_token, &mut store, &job, &policy).await?;
-            let current = store.batch(&batch_id)?.ok_or("unknown batch")?.0;
-            if current.base_sha != base_sha
-                || current.state
-                    != (sluss::batch::State::Testing {
-                        integration_sha: plan.integration_sha.clone(),
-                    })
+            match sluss::dispatch::batch(
+                &cli.db,
+                &app,
+                &config.policy(),
+                &limits,
+                &settings,
+                &batch_id,
+            )
+            .await?
             {
-                return Err("batch changed during pre-dispatch reconciliation".into());
+                sluss::dispatch::Outcome::Sent { run, host } => {
+                    println!("dispatched run {run} to reserved host {host}; awaiting observation")
+                }
+                sluss::dispatch::Outcome::NoCapacity => {
+                    println!("no compatible capacity available")
+                }
+                sluss::dispatch::Outcome::AlreadyStarted => {
+                    println!("dispatch already started or uncertain; reconcile before retrying")
+                }
             }
-            let inventory_token = app
-                .runner_inventory_token(plan.installation_id, plan.repository_id)
-                .await?;
-            let runners = app
-                .observe_repository_runners(
-                    &inventory_token,
-                    &config.github.owner,
-                    &config.github.repository,
-                )
-                .await?;
-            sluss::verification::check_repository_runner_inventory(&capacity, &runners)?;
-            let token = app
-                .dispatch_token(plan.installation_id, plan.repository_id)
-                .await?;
-            let mut scheduler = sluss::scheduler::Scheduler::open(&cli.db, capacity)?;
-            let Some(reservation) = scheduler.reserve_batch_dispatch(&batch_id, &request, &plan)?
-            else {
-                println!("no compatible capacity available");
-                return Ok(());
-            };
-            let run = app
-                .issue_batch_dispatch(
-                    &mut scheduler,
-                    &token,
-                    &config.github.owner,
-                    &config.github.repository,
-                    &batch_id,
-                    (&config.queue.target, &base_sha),
-                )
-                .await?;
-            println!(
-                "dispatched run {run} to reserved host {}; awaiting observation",
-                reservation.host
-            );
         }
         Command::ObserveDispatch {
             batch_id,
@@ -806,7 +754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Status => {
             println!(
-                "paused: {}\nqueued observations: {}\nautomatic CI dispatch: unavailable\nmanual dispatch: experimental\nlanding: disabled",
+                "paused: {}\nqueued observations: {}\nCI dispatch: experimental (manual or optional worker)\nlanding: disabled",
                 store.paused()?,
                 store.candidates()?.len()
             );
@@ -851,7 +799,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Resume => {
             store.set_paused(false)?;
-            println!("resumed (CI dispatch and landing are unavailable)");
+            println!("resumed (landing remains disabled)");
         }
         Command::Doctor { .. } => unreachable!(),
     }
