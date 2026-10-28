@@ -529,3 +529,130 @@ impl App {
         token.installation_id
     }
 }
+
+/// Provider data only. This is not an attestation or evidence that workflow
+/// code, runner environment, or a later merge is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ActionsRun {
+    pub id: u64,
+    pub run_attempt: u32,
+    pub workflow_id: u64,
+    pub head_sha: String,
+    pub head_branch: Option<String>,
+    pub path: String,
+    pub event: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub repository: ActionsRepository,
+    pub head_repository: Option<ActionsRepository>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ActionsRepository {
+    pub id: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ActionsJob {
+    pub id: u64,
+    pub run_id: u64,
+    pub head_sha: String,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub runner_id: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionsSnapshot {
+    pub run: ActionsRun,
+    pub jobs: Vec<ActionsJob>,
+}
+#[derive(Deserialize)]
+struct ActionsJobsPage {
+    total_count: usize,
+    jobs: Vec<ActionsJob>,
+}
+impl App {
+    /// Obtain two matching snapshots of one exact attempt, with bounded and
+    /// complete job pagination. Values can still change immediately afterward.
+    pub async fn observe_actions_attempt(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        run_id: u64,
+        attempt: u32,
+    ) -> Result<ActionsSnapshot, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) || run_id == 0 || attempt == 0 {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let path = format!("repos/{owner}/{repository}/actions/runs/{run_id}/attempts/{attempt}");
+        let first = self
+            .fetch_actions_attempt(token, &path, run_id, attempt)
+            .await?;
+        let second = self
+            .fetch_actions_attempt(token, &path, run_id, attempt)
+            .await?;
+        if first != second {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(second)
+    }
+    async fn fetch_actions_attempt(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+        run_id: u64,
+        attempt: u32,
+    ) -> Result<ActionsSnapshot, GitHubError> {
+        let run: ActionsRun = self.get_json(token, path, None).await?;
+        if run.id != run_id
+            || run.run_attempt != attempt
+            || run.workflow_id == 0
+            || run.repository.id != token.repository_id
+            || !commit_sha(&run.head_sha)
+            || run.path.is_empty()
+            || run.event.is_empty()
+            || run.status.is_empty()
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut jobs = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut expected_total = None;
+        for page in 1..=100u32 {
+            let response: ActionsJobsPage = self
+                .get_json(token, &format!("{path}/jobs"), Some(page))
+                .await?;
+            if response.jobs.len() > 100
+                || response.total_count > 10000
+                || expected_total.is_some_and(|n| n != response.total_count)
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            expected_total = Some(response.total_count);
+            for job in response.jobs {
+                if job.id == 0
+                    || job.run_id != run_id
+                    || job.head_sha != run.head_sha
+                    || job.name.is_empty()
+                    || job.status.is_empty()
+                    || !ids.insert(job.id)
+                {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                jobs.push(job);
+            }
+            if jobs.len() > response.total_count {
+                return Err(GitHubError::UnstableObservation);
+            }
+            if jobs.len() == response.total_count {
+                return Ok(ActionsSnapshot { run, jobs });
+            }
+            if jobs.len() != page as usize * 100 {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        Err(GitHubError::UnstableObservation)
+    }
+}

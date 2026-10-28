@@ -84,6 +84,35 @@ async fn open_pulls(
     assert_eq!(query.get("page").map(String::as_str), Some("1"));
     Json(json!([{"number":19}]))
 }
+async fn actions_run(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let sha = if mode == 12 && count > 0 { "b" } else { "a" };
+    Json(
+        json!({"id":123,"run_attempt":2,"workflow_id":17,"head_sha":sha.repeat(40),"head_branch":"sluss/test","path":".github/workflows/ci.yml@refs/heads/sluss/test","event":"push","status":"completed","conclusion":"success","repository":{"id":if mode == 11 { 8 } else { 7 }},"head_repository":{"id":7}}),
+    )
+}
+async fn actions_jobs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query.get("per_page").map(String::as_str), Some("100"));
+    let page: u64 = query["page"].parse().unwrap();
+    let mode = state.mode.load(Ordering::SeqCst);
+    let count = if mode == 15 && page == 1 { 100 } else { 1 };
+    let total = if mode == 15 {
+        101
+    } else if mode == 14 {
+        2
+    } else {
+        1
+    };
+    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
+    Json(json!({"total_count":total,"jobs":jobs}))
+}
 async fn token(
     State(state): State<ServerState>,
     Path(id): Path<u64>,
@@ -188,6 +217,14 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
         .route("/repos/owner/repo/pulls", get(open_pulls))
         .route(
+            "/repos/owner/repo/actions/runs/123/attempts/2",
+            get(actions_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/2/jobs",
+            get(actions_jobs),
+        )
+        .route(
             "/repos/owner/repo/collaborators/reviewer/permission",
             get(permission),
         )
@@ -205,6 +242,36 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let token = client.read_token(42, 7).await.unwrap();
     assert_eq!(token.secret(), "fake-installation-token");
     assert!(!format!("{token:?}").contains(token.secret()));
+    let actions = client
+        .observe_actions_attempt(&token, "owner", "repo", 123, 2)
+        .await
+        .unwrap();
+    assert_eq!(actions.run.head_sha, "a".repeat(40));
+    assert_eq!(actions.jobs.len(), 1);
+    mode.store(15, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .observe_actions_attempt(&token, "owner", "repo", 123, 2)
+            .await
+            .unwrap()
+            .jobs
+            .len(),
+        101
+    );
+    for failure in [11, 12, 13, 14] {
+        mode.store(failure, Ordering::SeqCst);
+        pulls.store(0, Ordering::SeqCst);
+        assert!(
+            matches!(
+                client
+                    .observe_actions_attempt(&token, "owner", "repo", 123, 2)
+                    .await,
+                Err(GitHubError::UnstableObservation)
+            ),
+            "mode {failure}"
+        );
+    }
+    mode.store(0, Ordering::SeqCst);
     let snapshot = client
         .observe_pull(&token, "owner", "repo", 19)
         .await
