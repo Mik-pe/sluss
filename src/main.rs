@@ -97,9 +97,6 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         capacity: PathBuf,
-        /// All GitHub runner IDs belonging to the reserved physical host.
-        #[arg(long, required = true)]
-        runner_id: Vec<u64>,
     },
     /// Release a reservation only if its dispatch has not been claimed.
     CancelDispatch {
@@ -360,6 +357,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key = std::fs::read(key_path)?;
             let app =
                 sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let inventory_token = app
+                .runner_inventory_token(plan.installation_id, plan.repository_id)
+                .await?;
+            let runners = app
+                .observe_repository_runners(
+                    &inventory_token,
+                    &config.github.owner,
+                    &config.github.repository,
+                )
+                .await?;
+            sluss::verification::check_repository_runner_inventory(&capacity, &runners)?;
             let token = app
                 .dispatch_token(plan.installation_id, plan.repository_id)
                 .await?;
@@ -387,7 +395,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_id,
             config,
             capacity,
-            runner_id,
         } => {
             let config = sluss::config::Config::load(&config)?;
             if store.repository_scope()?
@@ -398,8 +405,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Err("repository does not match the reconciled queue".into());
             }
-            let mut scheduler =
-                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let capacity = load_capacity(&capacity)?;
+            let mut scheduler = sluss::scheduler::Scheduler::open(&cli.db, capacity.clone())?;
+            let pending = scheduler
+                .pending_dispatches()?
+                .into_iter()
+                .find(|p| p.reservation.id == batch_id)
+                .ok_or("unknown or finished dispatch")?;
+            let runners = &capacity
+                .hosts
+                .get(&pending.reservation.host)
+                .ok_or("reserved host missing from capacity configuration")?
+                .runner_ids;
+            if runners.is_empty() {
+                return Err("reserved host has no configured runner IDs".into());
+            }
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
@@ -420,10 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &batch_id,
                 )
                 .await?;
-            let placement = sluss::verification::check_host_placement(
-                &snapshot,
-                &runner_id.into_iter().collect(),
-            )?;
+            let placement = sluss::verification::check_host_placement(&snapshot, runners)?;
             println!(
                 "run {}: status {}, conclusion {:?}, placement {:?}",
                 snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement

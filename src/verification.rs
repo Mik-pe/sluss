@@ -154,3 +154,90 @@ pub fn check_host_placement(
         None => Ok(Placement::Waiting),
     }
 }
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum InventoryError {
+    #[error("physical hosts need distinct, nonzero runner IDs and valid labels")]
+    InvalidConfiguration,
+    #[error("registered runners do not match the configured host labels and IDs")]
+    RunnerMismatch,
+    #[error("a physical host has fewer idle, online runners than its slot budget")]
+    InsufficientCapacity,
+}
+/// Compare repository-scoped runner registrations against the operator's
+/// declared physical hosts. Organization/enterprise runners are not covered.
+pub fn check_repository_runner_inventory(
+    capacity: &crate::scheduler::Capacity,
+    runners: &[crate::github::RepositoryRunner],
+) -> Result<(), InventoryError> {
+    let mut configured = BTreeSet::new();
+    for (label, host) in &capacity.hosts {
+        if !crate::github::valid_runner_label(label)
+            || host.slots == 0
+            || host.runner_ids.is_empty()
+            || host
+                .runner_ids
+                .iter()
+                .any(|id| *id == 0 || !configured.insert(*id))
+        {
+            return Err(InventoryError::InvalidConfiguration);
+        }
+    }
+    if capacity.hosts.is_empty() {
+        return Err(InventoryError::InvalidConfiguration);
+    }
+    let mut seen = BTreeSet::new();
+    for runner in runners {
+        if runner.id == 0 || !seen.insert(runner.id) {
+            return Err(InventoryError::RunnerMismatch);
+        }
+        let matching: Vec<_> = capacity
+            .hosts
+            .iter()
+            .filter(|(name, _)| {
+                runner
+                    .labels
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case(name))
+            })
+            .collect();
+        if matching.len() > 1 {
+            return Err(InventoryError::RunnerMismatch);
+        }
+        if let Some((_, host)) = matching.first() {
+            if !host.runner_ids.contains(&runner.id)
+                || !runner
+                    .labels
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case("self-hosted"))
+            {
+                return Err(InventoryError::RunnerMismatch);
+            }
+        } else if configured.contains(&runner.id) {
+            return Err(InventoryError::RunnerMismatch);
+        }
+    }
+    for (label, host) in &capacity.hosts {
+        let matches: Vec<_> = runners
+            .iter()
+            .filter(|runner| {
+                host.runner_ids.contains(&runner.id)
+                    && runner
+                        .labels
+                        .iter()
+                        .any(|l| l.name.eq_ignore_ascii_case(label))
+            })
+            .collect();
+        if matches.len() != host.runner_ids.len() {
+            return Err(InventoryError::RunnerMismatch);
+        }
+        let available = matches
+            .iter()
+            .filter(|runner| runner.status == "online" && !runner.busy)
+            .count();
+        if available < host.slots as usize {
+            return Err(InventoryError::InsufficientCapacity);
+        }
+    }
+    Ok(())
+}

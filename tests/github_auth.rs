@@ -159,6 +159,24 @@ async fn dispatched_run(
         json!({"id":123,"run_attempt":attempt,"workflow_id":workflow_id,"head_sha":sha.repeat(40),"head_branch":branch,"path":".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef","event":event,"status":"completed","conclusion":"success","repository":{"id":7},"head_repository":{"id":if mode == 19 { 8 } else { 7 }}}),
     )
 }
+async fn repository_runners(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(query["page"], "1");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    let id = if mode == 28 || (mode == 29 && count > 0) {
+        2
+    } else {
+        1
+    };
+    Json(
+        json!({"total_count":1,"runners":[{"id":id,"name":"runner","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}]}),
+    )
+}
 async fn dispatch_post(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -188,7 +206,10 @@ async fn token(
     assert_eq!(body["repository_ids"], json!([7]));
     let write = body["permissions"]["actions"] == "write";
     let staging = body["permissions"]["contents"] == "write";
-    if staging {
+    let inventory = body["permissions"]["administration"] == "read";
+    if inventory {
+        assert_eq!(body["permissions"], json!({"administration":"read"}));
+    } else if staging {
         assert_eq!(body["permissions"], json!({"contents":"write"}));
     } else if write {
         assert_eq!(
@@ -249,6 +270,9 @@ async fn token(
     }
     if staging {
         permissions = BTreeMap::from([("contents", "write"), ("metadata", "read")]);
+    }
+    if inventory {
+        permissions = BTreeMap::from([("administration", "read"), ("metadata", "read")]);
     }
     if mode == 3 {
         permissions.insert("contents", "write");
@@ -787,7 +811,14 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         db.path().join("db"),
         Capacity {
             pools: pools.clone(),
-            hosts: BTreeMap::from([("sluss-host-test".into(), Host { slots: 3, pools })]),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 3,
+                    runner_ids: Default::default(),
+                    pools,
+                },
+            )]),
         },
     )
     .unwrap();
@@ -1043,9 +1074,12 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     };
     let (key_dir, _private, public) = keys();
     let posts = Arc::new(AtomicUsize::new(0));
+    let mode = Arc::new(AtomicU8::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/actions/runners", get(repository_runners))
         .route(
             "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
             get(dispatch_ref),
@@ -1065,8 +1099,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         )
         .with_state(ServerState {
             public_key: Arc::new(public),
-            mode: Arc::new(AtomicU8::new(0)),
-            pulls: Arc::new(AtomicUsize::new(0)),
+            mode: mode.clone(),
+            pulls: reads.clone(),
             permissions: posts.clone(),
             token_calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -1078,7 +1112,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let config = data.path().join("sluss.toml");
     let capacity = data.path().join("capacity.toml");
     std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
-    std::fs::write(&capacity, "[pools]\nrust=1\n[hosts.sluss-host-test]\nslots=1\n[hosts.sluss-host-test.pools]\nrust=1\n").unwrap();
+    std::fs::write(&capacity, "[pools]\nrust=1\n[hosts.sluss-host-test]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-test.pools]\nrust=1\n").unwrap();
     let mut inbox = Inbox::open(&db).unwrap();
     let mut store = Store::open(&db).unwrap();
     inbox
@@ -1121,6 +1155,46 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 .unwrap()
         })
     };
+    mode.store(29, Ordering::SeqCst);
+    let unstable = launch(vec![
+        "dispatch-github".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--pool".into(),
+        "rust=1".into(),
+        "--workflow-id".into(),
+        "17".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(!unstable.status.success());
+    assert!(String::from_utf8_lossy(&unstable.stderr).contains("UnstableObservation"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    reads.store(0, Ordering::SeqCst);
+    mode.store(28, Ordering::SeqCst);
+    let rejected = launch(vec![
+        "dispatch-github".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--pool".into(),
+        "rust=1".into(),
+        "--workflow-id".into(),
+        "17".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("RunnerMismatch"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    mode.store(0, Ordering::SeqCst);
     let output = launch(vec![
         "dispatch-github".into(),
         "--batch-id".into(),
@@ -1153,8 +1227,6 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         config.to_str().unwrap().into(),
         "--capacity".into(),
         capacity.to_str().unwrap().into(),
-        "--runner-id".into(),
-        "1".into(),
     ])
     .await
     .unwrap();

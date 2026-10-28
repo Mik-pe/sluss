@@ -192,3 +192,79 @@ fn physical_host_observation_rejects_wrong_runners_and_multiple_jobs() {
         Err(PlacementError::InvalidHost)
     );
 }
+
+#[test]
+fn repository_runner_inventory_detects_aliases_missing_and_busy_capacity() {
+    use sluss::{
+        github::{RepositoryRunner, RunnerLabel},
+        scheduler::{Capacity, Host},
+        verification::{InventoryError, check_repository_runner_inventory},
+    };
+    use std::collections::BTreeMap;
+    let pools = BTreeMap::from([("rust".into(), 2)]);
+    let capacity = Capacity {
+        pools: pools.clone(),
+        hosts: BTreeMap::from([(
+            "sluss-host-box".into(),
+            Host {
+                slots: 2,
+                runner_ids: BTreeSet::from([1, 2]),
+                pools,
+            },
+        )]),
+    };
+    let runner = |id| RepositoryRunner {
+        id,
+        name: format!("runner-{id}"),
+        status: "online".into(),
+        busy: false,
+        labels: vec![
+            RunnerLabel {
+                name: "self-hosted".into(),
+            },
+            RunnerLabel {
+                name: "SLUSS-HOST-BOX".into(),
+            },
+        ],
+    };
+    let runners = vec![runner(1), runner(2)];
+    assert_eq!(
+        check_repository_runner_inventory(&capacity, &runners),
+        Ok(())
+    );
+    let mut busy = runners.clone();
+    busy[0].busy = true;
+    assert_eq!(
+        check_repository_runner_inventory(&capacity, &busy),
+        Err(InventoryError::InsufficientCapacity)
+    );
+    assert_eq!(
+        check_repository_runner_inventory(&capacity, &runners[..1]),
+        Err(InventoryError::RunnerMismatch)
+    );
+    let mut extra = runners.clone();
+    extra.push(runner(3));
+    assert_eq!(
+        check_repository_runner_inventory(&capacity, &extra),
+        Err(InventoryError::RunnerMismatch)
+    );
+    let mut duplicate = capacity.clone();
+    duplicate.hosts.insert(
+        "sluss-host-other".into(),
+        Host {
+            slots: 1,
+            runner_ids: BTreeSet::from([2]),
+            pools: BTreeMap::from([("rust".into(), 1)]),
+        },
+    );
+    assert_eq!(
+        check_repository_runner_inventory(&duplicate, &runners),
+        Err(InventoryError::InvalidConfiguration)
+    );
+    let mut wrong = runners.clone();
+    wrong[0].labels.retain(|label| label.name != "self-hosted");
+    assert_eq!(
+        check_repository_runner_inventory(&capacity, &wrong),
+        Err(InventoryError::RunnerMismatch)
+    );
+}

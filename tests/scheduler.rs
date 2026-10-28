@@ -14,6 +14,7 @@ fn capacity() -> Capacity {
             (
                 "linux".into(),
                 Host {
+                    runner_ids: Default::default(),
                     slots: 1,
                     pools: pools(&[("rust", 2)]),
                 },
@@ -21,6 +22,7 @@ fn capacity() -> Capacity {
             (
                 "mac".into(),
                 Host {
+                    runner_ids: Default::default(),
                     slots: 1,
                     pools: pools(&[("rust", 1), ("macos", 1), ("android", 1)]),
                 },

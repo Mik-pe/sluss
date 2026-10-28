@@ -5,11 +5,13 @@ macos = 1
 
 [hosts.sluss-host-linux]
 slots = 1
+runner_ids = [101] # Replace with this machine's GitHub runner IDs.
 [hosts.sluss-host-linux.pools]
 rust = 1
 
 [hosts.sluss-host-mac]
 slots = 1
+runner_ids = [201] # Replace with this machine's GitHub runner IDs.
 [hosts.sluss-host-mac.pools]
 rust = 1
 macos = 1

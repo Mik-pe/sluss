@@ -11,6 +11,9 @@ type Budgets = BTreeMap<String, u32>;
 pub struct Host {
     /// Maximum number of simultaneous jobs on this physical host.
     pub slots: u32,
+    /// GitHub runner IDs registered on this physical host, set by the operator.
+    #[serde(default)]
+    pub runner_ids: std::collections::BTreeSet<u64>,
     /// Maximum pool units simultaneously consumed on this host.
     pub pools: Budgets,
 }
@@ -333,7 +336,15 @@ fn validate_capacity(capacity: &Capacity) -> Result<(), SchedulerError> {
     {
         return Err(SchedulerError::Invalid);
     }
+    let mut runner_ids = std::collections::BTreeSet::new();
     for (name, host) in &capacity.hosts {
+        if host
+            .runner_ids
+            .iter()
+            .any(|id| *id == 0 || !runner_ids.insert(*id))
+        {
+            return Err(SchedulerError::Invalid);
+        }
         if name.is_empty()
             || host.slots == 0
             || host.pools.is_empty()

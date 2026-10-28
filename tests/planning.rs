@@ -190,6 +190,7 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
             hosts: BTreeMap::from([(
                 "host".into(),
                 Host {
+                    runner_ids: Default::default(),
                     slots: 1,
                     pools: pools.clone(),
                 },

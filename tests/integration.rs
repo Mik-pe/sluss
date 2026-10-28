@@ -465,6 +465,7 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
             hosts: BTreeMap::from([(
                 "host".into(),
                 Host {
+                    runner_ids: Default::default(),
                     slots: 1,
                     pools: pools.clone(),
                 },

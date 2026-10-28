@@ -40,6 +40,7 @@ pub struct InstallationToken {
     installation_id: u64,
     actions_write: bool,
     contents_write: bool,
+    runner_inventory_read: bool,
     app_client_id: String,
     api_origin: String,
 }
@@ -61,6 +62,7 @@ enum TokenPurpose {
     Read,
     Dispatch,
     Staging,
+    RunnerInventory,
 }
 #[derive(Serialize)]
 struct Claims<'a> {
@@ -161,6 +163,19 @@ impl App {
         self.mint_token(installation_id, repository_id, TokenPurpose::Staging)
             .await
     }
+    /// Read-only repository administration token for runner inventory.
+    pub async fn runner_inventory_token(
+        &self,
+        installation_id: u64,
+        repository_id: u64,
+    ) -> Result<InstallationToken, GitHubError> {
+        self.mint_token(
+            installation_id,
+            repository_id,
+            TokenPurpose::RunnerInventory,
+        )
+        .await
+    }
     async fn mint_token(
         &self,
         installation_id: u64,
@@ -178,6 +193,7 @@ impl App {
         let permissions = match purpose {
             TokenPurpose::Dispatch => BTreeMap::from([("actions", "write"), ("contents", "read")]),
             TokenPurpose::Staging => BTreeMap::from([("contents", "write")]),
+            TokenPurpose::RunnerInventory => BTreeMap::from([("administration", "read")]),
             TokenPurpose::Read => BTreeMap::from([
                 ("actions", "read"),
                 ("checks", "read"),
@@ -246,6 +262,7 @@ impl App {
             installation_id,
             actions_write: matches!(purpose, TokenPurpose::Dispatch),
             contents_write: matches!(purpose, TokenPurpose::Staging),
+            runner_inventory_read: matches!(purpose, TokenPurpose::RunnerInventory),
             app_client_id: self.client_id.clone(),
             api_origin: self.api.as_str().to_owned(),
         })
@@ -957,4 +974,93 @@ pub fn valid_runner_label(label: &str) -> bool {
         && label
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Repository-level runners only; organization and enterprise runners require
+/// separate inventory and are not included by this GitHub endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct RepositoryRunner {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    pub busy: bool,
+    pub labels: Vec<RunnerLabel>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct RunnerLabel {
+    pub name: String,
+}
+#[derive(Deserialize)]
+struct RunnersPage {
+    total_count: usize,
+    runners: Vec<RepositoryRunner>,
+}
+impl App {
+    /// Fetch a bounded and double-checked repository runner inventory.
+    /// A valid result does not include organization or enterprise runners.
+    pub async fn observe_repository_runners(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+    ) -> Result<Vec<RepositoryRunner>, GitHubError> {
+        if !token.runner_inventory_read || !valid_name(owner) || !valid_name(repository) {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let observed: Repository = self.get_json(token, &root, None).await?;
+        if observed.id != token.repository_id {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let path = format!("{root}/actions/runners");
+        let first = self.fetch_runners(token, &path).await?;
+        let second = self.fetch_runners(token, &path).await?;
+        if first != second {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(second)
+    }
+    async fn fetch_runners(
+        &self,
+        token: &InstallationToken,
+        path: &str,
+    ) -> Result<Vec<RepositoryRunner>, GitHubError> {
+        let mut result = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut expected_total = None;
+        for page in 1..=100u32 {
+            let data: RunnersPage = self.get_json(token, path, Some(page)).await?;
+            if data.runners.len() > 100
+                || data.total_count > 10000
+                || expected_total.is_some_and(|count| count != data.total_count)
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            expected_total = Some(data.total_count);
+            for runner in data.runners {
+                let mut labels = std::collections::BTreeSet::new();
+                if runner.id == 0
+                    || runner.name.is_empty()
+                    || !matches!(runner.status.as_str(), "online" | "offline")
+                    || !ids.insert(runner.id)
+                    || runner.labels.iter().any(|label| {
+                        label.name.is_empty() || !labels.insert(label.name.to_ascii_lowercase())
+                    })
+                {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                result.push(runner);
+            }
+            if result.len() > data.total_count {
+                return Err(GitHubError::UnstableObservation);
+            }
+            if result.len() == data.total_count {
+                return Ok(result);
+            }
+            if result.len() != page as usize * 100 {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        Err(GitHubError::UnstableObservation)
+    }
 }
