@@ -2467,6 +2467,124 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
 }
 
 #[tokio::test]
+async fn stale_cancellation_checks_repository_before_retiring_prepared_work() {
+    use sluss::{
+        batch::Candidate,
+        reconcile::RepositoryPolicy,
+        scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler},
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+        worker::cancel_stale_once,
+    };
+    use std::collections::BTreeSet;
+    let (_key_dir, private, _) = keys();
+    let app = App::new("app-client-id".into(), &private, "http://127.0.0.1:1/").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidate = AdmissionCandidate {
+        candidate: Candidate {
+            number: 1,
+            head_sha: "1".repeat(40),
+        },
+        evidence_digest: "e".repeat(64),
+    };
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &[candidate])
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store
+        .plan_batch(id, &"a".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let capacity = Capacity {
+        pools: pools.clone(),
+        hosts: BTreeMap::from([(
+            "host".into(),
+            Host {
+                runner_ids: Default::default(),
+                slots: 1,
+                pools: pools.clone(),
+            },
+        )]),
+    };
+    let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+    let request = Request { pools };
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: BTreeSet::from(["test".into()]),
+        suites: BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
+    };
+    assert!(
+        scheduler
+            .reserve_batch_dispatch(id, &request, &plan)
+            .unwrap()
+            .is_some()
+    );
+    inbox
+        .record("changed", "pull_request", &[2; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let changed = AdmissionCandidate {
+        candidate: Candidate {
+            number: 1,
+            head_sha: "2".repeat(40),
+        },
+        evidence_digest: "d".repeat(64),
+    };
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &[changed])
+        .unwrap();
+    let mut policy = RepositoryPolicy {
+        installation: 9,
+        repository: 2,
+        owner: "owner".into(),
+        name: "repo".into(),
+        target_branch: "main".into(),
+        required_reviews: 1,
+        block_labels: BTreeSet::new(),
+    };
+    assert!(
+        cancel_stale_once(&app, &db, &capacity, &policy)
+            .await
+            .unwrap_err()
+            .contains("repository does not match")
+    );
+    assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+    assert!(scheduler.reserve("other", &request).unwrap().is_none());
+    policy.installation = 1;
+    policy.repository = 9;
+    assert!(
+        cancel_stale_once(&app, &db, &capacity, &policy)
+            .await
+            .is_err()
+    );
+    assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+    policy.repository = 2;
+    cancel_stale_once(&app, &db, &capacity, &policy)
+        .await
+        .unwrap();
+    assert!(scheduler.pending_dispatches().unwrap().is_empty());
+    assert!(scheduler.reserve("other", &request).unwrap().is_some());
+}
+
+#[tokio::test]
 async fn github_staging_marks_changed_policy_as_a_deterministic_batch_failure() {
     use sluss::{
         batch::{Candidate, State},

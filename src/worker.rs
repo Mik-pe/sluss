@@ -121,8 +121,93 @@ pub async fn run(
     }
 }
 
-/// Optional stale-run cancellation loop. It cannot release capacity and never
-/// retries an ambiguous cancellation POST. Provider failures back off.
+/// Cancel invalidated work only after verifying that this worker is bound to
+/// the same installation and repository as the persisted queue.
+pub async fn cancel_stale_once(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+) -> Result<(), String> {
+    let db = db.to_owned();
+    let capacity = capacity.clone();
+    let installation = policy.installation;
+    let repository = policy.repository;
+    let (mut scheduler, ids) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let store = Store::open(&db).map_err(|e| e.to_string())?;
+        if installation <= 0
+            || repository <= 0
+            || store.repository_scope().map_err(|e| e.to_string())?
+                != (installation as u64, repository as u64)
+        {
+            return Err("repository does not match the reconciled queue".into());
+        }
+        let mut scheduler =
+            crate::scheduler::Scheduler::open(&db, capacity).map_err(|e| e.to_string())?;
+        scheduler
+            .cancel_invalidated_prepared()
+            .map_err(|e| e.to_string())?;
+        let ids = scheduler.stale_dispatches().map_err(|e| e.to_string())?;
+        Ok((scheduler, ids))
+    })
+    .await
+    .map_err(|_| "stale-run cancellation worker stopped unexpectedly".to_owned())??;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let token = app
+        .dispatch_token(policy.installation as u64, policy.repository as u64)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut failed = false;
+    for id in ids {
+        match scheduler.receipt_conflict(&id) {
+            Ok(Some((recovered, direct))) => {
+                for run_id in [recovered, direct] {
+                    match app
+                        .cancel_conflicting_run(
+                            &mut scheduler,
+                            &token,
+                            &policy.owner,
+                            &policy.name,
+                            &id,
+                            run_id,
+                        )
+                        .await
+                    {
+                        Ok(crate::github::StaleCancellation::Uncertain) | Err(_) => failed = true,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+        }
+        match app
+            .cancel_stale_run(&mut scheduler, &token, &policy.owner, &policy.name, &id)
+            .await
+        {
+            Ok(crate::github::StaleCancellation::Uncertain) => {
+                eprintln!("stale-run cancellation outcome is uncertain; capacity remains reserved");
+                failed = true;
+            }
+            Err(_) => failed = true,
+            _ => {}
+        }
+    }
+    if failed {
+        Err("one or more stale-run cancellations need another observation".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Optional stale-run cancellation loop. It cannot release running capacity
+/// and never retries an ambiguous cancellation POST. Provider failures back off.
 pub async fn supervise_stale_cancellation(
     app: Arc<App>,
     db: PathBuf,
@@ -133,81 +218,12 @@ pub async fn supervise_stale_cancellation(
     let minimum = poll.max(Duration::from_secs(60));
     let mut delay = minimum;
     loop {
-        let path = db.clone();
-        let limits = capacity.clone();
-        let scheduler =
-            tokio::task::spawn_blocking(move || crate::scheduler::Scheduler::open(path, limits))
-                .await;
-        let result = match scheduler {
-            Ok(Ok(mut scheduler)) => match scheduler
-                .cancel_invalidated_prepared()
-                .and_then(|_| scheduler.stale_dispatches())
-            {
-                Ok(ids) if ids.is_empty() => Ok(()),
-                Ok(ids) => match app
-                    .dispatch_token(policy.installation as u64, policy.repository as u64)
-                    .await
-                {
-                    Ok(token) => {
-                        let mut result = Ok(());
-                        for id in ids {
-                            match scheduler.receipt_conflict(&id) {
-                                Ok(Some((recovered, direct))) => {
-                                    for run_id in [recovered, direct] {
-                                        match app
-                                            .cancel_conflicting_run(
-                                                &mut scheduler,
-                                                &token,
-                                                &policy.owner,
-                                                &policy.name,
-                                                &id,
-                                                run_id,
-                                            )
-                                            .await
-                                        {
-                                            Ok(crate::github::StaleCancellation::Uncertain)
-                                            | Err(_) => result = Err(()),
-                                            _ => {}
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Ok(None) => {}
-                                Err(_) => {
-                                    result = Err(());
-                                    continue;
-                                }
-                            }
-                            match app
-                                .cancel_stale_run(
-                                    &mut scheduler,
-                                    &token,
-                                    &policy.owner,
-                                    &policy.name,
-                                    &id,
-                                )
-                                .await
-                            {
-                                Ok(crate::github::StaleCancellation::Uncertain) => {
-                                    eprintln!(
-                                        "stale-run cancellation outcome is uncertain; capacity remains reserved"
-                                    );
-                                    result = Err(());
-                                }
-                                Err(_) => result = Err(()),
-                                _ => {}
-                            }
-                        }
-                        result
-                    }
-                    Err(_) => Err(()),
-                },
-                Err(_) => Err(()),
-            },
-            _ => Err(()),
-        };
-        if result.is_err() {
-            eprintln!("stale-run cancellation failed; it will be checked again");
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
+        if let Err(error) = cancel_stale_once(&app, &db, &capacity, &policy).await {
+            eprintln!("stale-run cancellation failed: {error}");
             delay = delay.saturating_mul(2).min(Duration::from_secs(300));
         } else {
             delay = minimum;
