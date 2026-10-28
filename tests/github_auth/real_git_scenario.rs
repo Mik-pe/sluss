@@ -954,13 +954,25 @@ async fn two_host_scenario(fail_mac: bool) {
         )
         .unwrap();
     drop(store);
-    for _ in 0..2 {
-        assert!(matches!(
-            sluss::worker::dispatch_lanes_once(&app, &db, &policy, &capacity, &settings)
-                .await
-                .unwrap(),
-            Some(sluss::dispatch::Outcome::Sent { .. })
-        ));
+    let (first, second) = tokio::join!(
+        sluss::worker::dispatch_lanes_once(&app, &db, &policy, &capacity, &settings),
+        sluss::worker::dispatch_lanes_once(&app, &db, &policy, &capacity, &settings),
+    );
+    for result in [first, second] {
+        if let Err(error) = result {
+            assert!(
+                error.contains("concurrent") || error.contains("reconciliation"),
+                "{error}"
+            );
+        }
+    }
+    for _ in 0..3 {
+        if posts.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        sluss::worker::dispatch_lanes_once(&app, &db, &policy, &capacity, &settings)
+            .await
+            .unwrap();
     }
     assert_eq!(posts.load(Ordering::SeqCst), 2);
     let scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
