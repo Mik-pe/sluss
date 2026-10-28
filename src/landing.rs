@@ -248,7 +248,8 @@ impl LandingPlan {
     }
 
     /// Build the documented atomic compare-and-update operation. This does
-    /// not send it or attest that its inputs are authorized or current.
+    /// not send it or attest that its inputs are authorized or current. It
+    /// does not atomically guard PR heads, reviews, labels or branch policy.
     pub fn graphql_request(&self) -> Result<serde_json::Value, LandingError> {
         self.validate()?;
         let mut refs = vec![

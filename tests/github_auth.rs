@@ -6063,6 +6063,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(info.contains("repository runner inventory matches configured hosts: 1 runners"));
     assert!(info.contains("repository-scoped read, staging and Actions credentials were issued"));
     assert!(String::from_utf8_lossy(&doctor.stderr).contains("NOT READY"));
+    assert!(
+        String::from_utf8_lossy(&doctor.stderr)
+            .contains("PR heads, reviews and branch policy are not atomically guarded")
+    );
     assert!(!info.contains("fake-installation-token"));
     reads.store(0, Ordering::SeqCst);
     mode.store(30, Ordering::SeqCst);

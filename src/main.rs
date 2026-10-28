@@ -1233,6 +1233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("To inspect GitHub, supply --config, --capacity and --workflow-id.");
         }
         eprintln!(
+            "PR heads, reviews and branch policy are not atomically guarded by the landing request."
+        );
+        eprintln!(
             "NOT READY: workflow trust, full runner scope, bypass policy, attestation and strict landing are not verified."
         );
         std::process::exit(1);
