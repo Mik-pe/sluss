@@ -32,10 +32,16 @@ pub enum StoreError {
     Clock,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionCandidate {
     pub candidate: Candidate,
     pub evidence_digest: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedCandidate {
+    pub number: u64,
+    pub head_sha: String,
+    pub batch_id: String,
 }
 pub struct Store {
     conn: Connection,
@@ -62,6 +68,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
+            CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
                 id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
             );",
@@ -107,6 +115,10 @@ impl Store {
             WHERE candidates.head_sha != excluded.head_sha",
             params![candidate.number as i64, candidate.head_sha],
         )?;
+        tx.execute(
+            "DELETE FROM failed_singletons WHERE number=?1 AND head_sha<>?2",
+            params![candidate.number as i64, candidate.head_sha],
+        )?;
         let removed_evidence = tx.execute(
             "DELETE FROM candidate_evidence WHERE number=?1",
             [candidate.number as i64],
@@ -132,6 +144,14 @@ impl Store {
         let removed = tx.execute("DELETE FROM candidates WHERE number=?1", [sql_number])? != 0;
         tx.execute(
             "DELETE FROM candidate_evidence WHERE number=?1",
+            [sql_number],
+        )?;
+        tx.execute(
+            "DELETE FROM candidate_stability WHERE number=?1",
+            [sql_number],
+        )?;
+        tx.execute(
+            "DELETE FROM failed_singletons WHERE number=?1",
             [sql_number],
         )?;
         invalidate_batches(&tx, number, None)?;
@@ -249,6 +269,14 @@ impl Store {
                     "DELETE FROM candidate_evidence WHERE number=?1",
                     [number as i64],
                 )?;
+                tx.execute(
+                    "DELETE FROM candidate_stability WHERE number=?1",
+                    [number as i64],
+                )?;
+                tx.execute(
+                    "DELETE FROM failed_singletons WHERE number=?1",
+                    [number as i64],
+                )?;
                 invalidate_batches(&tx, number, None)?;
             }
         }
@@ -272,6 +300,10 @@ impl Store {
                 || existing_evidence.as_deref() != new_evidence
                 || new_evidence.is_none();
             if changed {
+                tx.execute(
+                    "DELETE FROM failed_singletons WHERE number=?1",
+                    [candidate.number as i64],
+                )?;
                 tx.execute("INSERT INTO candidate_stability(number,changed_ms) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET changed_ms=excluded.changed_ms", params![candidate.number as i64,now])?;
             } else {
                 // A pre-migration candidate starts its debounce window now.
@@ -317,6 +349,19 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
+    }
+
+    /// Current singleton failures, excluding records invalidated by new observations.
+    pub fn failed_candidates(&self) -> Result<Vec<FailedCandidate>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT f.number,f.head_sha,f.batch_id FROM failed_singletons f JOIN candidates c ON c.number=f.number AND c.head_sha=f.head_sha JOIN candidate_evidence e ON e.number=f.number AND e.digest=f.digest ORDER BY c.sequence,c.number")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FailedCandidate {
+                number: r.get::<_, i64>(0)? as u64,
+                head_sha: r.get(1)?,
+                batch_id: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Freeze an ordered batch from a reconciled queue in one transaction.
@@ -421,7 +466,75 @@ impl Store {
             return Ok(None);
         }
         let mut selected = Vec::new();
-        {
+        let mut selected_task = None;
+        let mut held_for_splits = std::collections::BTreeSet::new();
+        let tasks: Vec<(i64, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT id,members FROM split_tasks WHERE state='pending' ORDER BY id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for (task_id, body) in tasks {
+            let members: Vec<AdmissionCandidate> = serde_json::from_str(&body)?;
+            if members.is_empty() {
+                return Err(StoreError::InvalidBatch);
+            }
+            let mut stale = false;
+            let mut ready = true;
+            for member in &members {
+                let number = i64::try_from(member.candidate.number)
+                    .map_err(|_| StoreError::InvalidCandidate)?;
+                let head: Option<String> = tx
+                    .query_row(
+                        "SELECT head_sha FROM candidates WHERE number=?1",
+                        [number],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let evidence: Option<String> = tx
+                    .query_row(
+                        "SELECT digest FROM candidate_evidence WHERE number=?1",
+                        [number],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let changed: Option<i64> = tx
+                    .query_row(
+                        "SELECT changed_ms FROM candidate_stability WHERE number=?1",
+                        [number],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if head.as_deref() != Some(&member.candidate.head_sha)
+                    || evidence.as_deref() != Some(&member.evidence_digest)
+                {
+                    stale = true;
+                }
+                if occupied.contains(&member.candidate.number)
+                    || (debounce_ms > 0
+                        && changed
+                            .is_none_or(|time| time < 0 || now.saturating_sub(time) < debounce_ms))
+                {
+                    ready = false;
+                }
+            }
+            if stale {
+                tx.execute(
+                    "UPDATE split_tasks SET state='stale' WHERE id=?1 AND state='pending'",
+                    [task_id],
+                )?;
+                continue;
+            }
+            held_for_splits.extend(members.iter().map(|m| m.candidate.number));
+            if selected_task.is_none() && ready {
+                if members.len() > max_batch_size {
+                    return Err(StoreError::InvalidBatch);
+                }
+                selected = members.into_iter().map(|m| m.candidate).collect();
+                selected_task = Some(task_id);
+            }
+        }
+        if selected_task.is_none() {
             let mut stmt =
                 tx.prepare("SELECT number,head_sha FROM candidates ORDER BY sequence,number")?;
             let mut rows = stmt.query([])?;
@@ -431,7 +544,11 @@ impl Store {
                 if !valid_sha(&sha) {
                     return Err(StoreError::InvalidCandidate);
                 }
-                if !occupied.contains(&number) {
+                if !occupied.contains(&number) && !held_for_splits.contains(&number) {
+                    let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM failed_singletons f JOIN candidate_evidence e ON e.number=f.number WHERE f.number=?1 AND f.head_sha=?2 AND f.digest=e.digest)", params![number as i64,sha], |r| r.get(0))?;
+                    if blocked {
+                        continue;
+                    }
                     let changed: Option<i64> = tx
                         .query_row(
                             "SELECT changed_ms FROM candidate_stability WHERE number=?1",
@@ -466,6 +583,7 @@ impl Store {
             }
         }
         if selected.is_empty() {
+            tx.commit()?;
             return Ok(None);
         }
         let batch = Batch::new(id.into(), base_sha.into(), selected)
@@ -484,6 +602,9 @@ impl Store {
                 "INSERT INTO batch_evidence(batch_id,number,digest) VALUES(?1,?2,?3)",
                 params![id, candidate.number as i64, digest],
             )?;
+        }
+        if let Some(task_id) = selected_task {
+            tx.execute("UPDATE split_tasks SET state='planned',child_id=?2 WHERE id=?1 AND state='pending'", params![task_id,id])?;
         }
         tx.commit()?;
         Ok(Some(batch))
@@ -589,7 +710,7 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (mut batch, version) = checked_batch(&tx, id)?;
-        if batch.state != State::Building {
+        if !matches!(batch.state, State::Building | State::Testing { .. }) {
             return Err(StoreError::InvalidBatch);
         }
         batch
@@ -599,6 +720,7 @@ impl Store {
             "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
             params![serde_json::to_string(&batch)?, id, version],
         )?;
+        enqueue_bisection(&tx, &batch)?;
         tx.commit()?;
         Ok(batch)
     }
@@ -812,4 +934,38 @@ fn checked_batch(tx: &Transaction<'_>, id: &str) -> Result<(Batch, i64), StoreEr
         }
     }
     Ok((batch, version))
+}
+
+/// Split only failures explicitly classified by the caller as reproducible
+/// integration or CI failures. Infrastructure errors must not use this path.
+fn enqueue_bisection(tx: &Transaction<'_>, batch: &Batch) -> Result<(), StoreError> {
+    let mut members = Vec::new();
+    for candidate in &batch.candidates {
+        let number = i64::try_from(candidate.number).map_err(|_| StoreError::InvalidCandidate)?;
+        let evidence: Option<String> = tx
+            .query_row(
+                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                params![batch.id, number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let digest = evidence.ok_or(StoreError::StaleBatch)?;
+        members.push(AdmissionCandidate {
+            candidate: candidate.clone(),
+            evidence_digest: digest,
+        });
+    }
+    if members.len() == 1 {
+        let member = &members[0];
+        tx.execute("INSERT INTO failed_singletons(number,head_sha,digest,batch_id) VALUES(?1,?2,?3,?4) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,digest=excluded.digest,batch_id=excluded.batch_id", params![member.candidate.number as i64,member.candidate.head_sha,member.evidence_digest,batch.id])?;
+    } else {
+        let (left, right) = members.split_at(members.len() / 2);
+        for (side, group) in [(0, left), (1, right)] {
+            tx.execute(
+                "INSERT INTO split_tasks(parent_id,side,members,state) VALUES(?1,?2,?3,'pending')",
+                params![batch.id, side, serde_json::to_string(group)?],
+            )?;
+        }
+    }
+    Ok(())
 }

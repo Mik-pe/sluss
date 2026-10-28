@@ -363,3 +363,143 @@ fn debounce_survives_restart_and_resets_only_for_changed_candidates() {
     assert_eq!(batch.candidates[0].number, 1);
     assert_eq!(batch.candidates[0].head_sha, "f".repeat(40));
 }
+
+#[test]
+fn failed_batches_split_durably_and_failed_singletons_wait_for_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let base = "a".repeat(40);
+    let parent = "batch-0000000000000000";
+    let batch = store.plan_batch(parent, &base, 4, 1).unwrap().unwrap();
+    assert_eq!(batch.candidates.len(), 4);
+    store.start_integration(parent).unwrap();
+    store
+        .fail_integration(parent, "reproducible failure")
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    let first = store
+        .plan_batch("batch-0000000000000001", &base, 4, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first
+            .candidates
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    store.start_integration(&first.id).unwrap();
+    store
+        .fail_integration(&first.id, "reproducible failure")
+        .unwrap();
+    let second = store
+        .plan_batch("batch-0000000000000002", &base, 4, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second
+            .candidates
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    store.start_integration(&second.id).unwrap();
+    store
+        .fail_integration(&second.id, "reproducible failure")
+        .unwrap();
+    for (n, expected) in [(3, 1), (4, 2), (5, 3), (6, 4)] {
+        let batch = store
+            .plan_batch(&format!("batch-{n:016}"), &base, 4, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.candidates[0].number, expected);
+        store.start_integration(&batch.id).unwrap();
+        store
+            .fail_integration(&batch.id, "reproducible failure")
+            .unwrap();
+    }
+    assert!(
+        store
+            .plan_batch("batch-0000000000000007", &base, 4, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.failed_candidates().unwrap().len(), 4);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .arg("queue")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("awaiting change"));
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox
+        .record("new-head", "pull_request", &[9; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates = store.candidates().unwrap();
+    candidates[0].head_sha = "f".repeat(40);
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
+        .unwrap();
+    let retry = store
+        .plan_batch("batch-0000000000000007", &base, 4, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.candidates.len(), 1);
+    assert_eq!(retry.candidates[0].number, 1);
+    assert_eq!(retry.candidates[0].head_sha, "f".repeat(40));
+    assert_eq!(store.failed_candidates().unwrap().len(), 3);
+}
+
+#[test]
+fn stale_split_is_discarded_and_does_not_block_other_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let base = "a".repeat(40);
+    let parent = "batch-0000000000000000";
+    store.plan_batch(parent, &base, 4, 2).unwrap().unwrap();
+    store.start_integration(parent).unwrap();
+    store
+        .fail_integration(parent, "reproducible failure")
+        .unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox
+        .record("updated", "pull_request", &[8; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates = store.candidates().unwrap();
+    candidates[0].head_sha = "f".repeat(40);
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
+        .unwrap();
+    let right = store
+        .plan_batch("batch-0000000000000001", &base, 4, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        right
+            .candidates
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    let new = store
+        .plan_batch("batch-0000000000000002", &base, 4, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        new.candidates.iter().map(|c| c.number).collect::<Vec<_>>(),
+        [2, 1]
+    );
+}

@@ -225,8 +225,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.candidates()?.len()
         ),
         Command::Queue => {
+            let failed: std::collections::BTreeMap<_, _> = store
+                .failed_candidates()?
+                .into_iter()
+                .map(|f| (f.number, f.batch_id))
+                .collect();
             for pr in store.candidates()? {
-                println!("#{} {}", pr.number, pr.head_sha);
+                if let Some(batch) = failed.get(&pr.number) {
+                    println!(
+                        "#{} {} (failed in {}; awaiting change)",
+                        pr.number, pr.head_sha, batch
+                    );
+                } else {
+                    println!("#{} {}", pr.number, pr.head_sha);
+                }
             }
         }
         Command::Pause => {
