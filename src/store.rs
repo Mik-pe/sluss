@@ -45,6 +45,14 @@ pub struct FailedCandidate {
     pub head_sha: String,
     pub batch_id: String,
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PlanningSettings {
+    pub max_batch_size: usize,
+    pub max_active_batches: usize,
+    pub debounce: Duration,
+    pub batch_window: Duration,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -73,6 +81,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS batch_selection (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS planning_config (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -481,6 +490,80 @@ impl Store {
     /// Freeze an ordered batch from a reconciled queue in one transaction.
     /// The supplied base is an observation, not proof that the target is
     /// unchanged; callers must refresh provider state before integration.
+    /// Plan using only the last provider-reconciled repository and target.
+    /// The planning transaction rechecks the base and outstanding webhooks.
+    pub fn plan_observed_batch(
+        &mut self,
+        installation: i64,
+        repository: i64,
+        policy_digest: &str,
+        target: &str,
+        settings: &PlanningSettings,
+    ) -> Result<Option<Batch>, StoreError> {
+        let binding: Option<(i64, i64, String, String, String)> = self.conn.query_row(
+            "SELECT r.installation,r.repository,r.policy_digest,b.sha,t.branch FROM repository_binding r JOIN observed_base b ON b.id=r.id JOIN observed_target t ON t.id=r.id WHERE r.id=1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional()?;
+        let (known_installation, known_repository, known_policy, base, known_target) =
+            binding.ok_or(StoreError::Unbound)?;
+        if (known_installation, known_repository) != (installation, repository) {
+            return Err(StoreError::RepositoryMismatch);
+        }
+        if known_policy != policy_digest || known_target != target {
+            return Err(StoreError::PolicyMismatch);
+        }
+        if !(1..=100).contains(&settings.max_batch_size)
+            || !(1..=100).contains(&settings.max_active_batches)
+            || i64::try_from(settings.debounce.as_millis()).is_err()
+            || i64::try_from(settings.batch_window.as_millis()).is_err()
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let encoded = serde_json::to_string(settings)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO planning_config(id,body) VALUES(1,?1)",
+            [&encoded],
+        )?;
+        let stored: String =
+            self.conn
+                .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+        if stored != encoded {
+            return Err(StoreError::PolicyMismatch);
+        }
+        let random: String = self
+            .conn
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+        self.plan_batch_with_window(
+            &format!("batch-{random}"),
+            &base,
+            settings.max_batch_size,
+            settings.max_active_batches,
+            settings.debounce,
+            settings.batch_window,
+        )
+    }
+
+    /// Active batch identities and state for operators and restart recovery.
+    pub fn active_batches(&self) -> Result<Vec<Batch>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT body FROM batches ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let batch: Batch = serde_json::from_str(&row?)?;
+            if matches!(
+                batch.state,
+                State::Planned | State::Building | State::Testing { .. } | State::Verified { .. }
+            ) {
+                result.push(batch);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn plan_batch(
         &mut self,
         id: &str,
@@ -555,6 +638,24 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let settings = PlanningSettings {
+            max_batch_size,
+            max_active_batches,
+            debounce,
+            batch_window,
+        };
+        let stored_settings: Option<String> = tx
+            .query_row("SELECT body FROM planning_config WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let requested_settings = serde_json::to_string(&settings)?;
+        if stored_settings
+            .as_deref()
+            .is_some_and(|body| body != requested_settings)
+        {
+            return Err(StoreError::PolicyMismatch);
+        }
         let binding: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT installation,repository FROM repository_binding WHERE id=1",

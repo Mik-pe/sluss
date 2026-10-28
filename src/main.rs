@@ -26,6 +26,9 @@ enum Command {
         /// Enable automatic observation using operator-owned configuration.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Automatically freeze batches from reconciled queue observations.
+        #[arg(long, requires = "config")]
+        auto_plan: bool,
         /// Cancel known runs when their batch is invalidated.
         #[arg(long, requires_all = ["config", "capacity"])]
         cancel_stale: bool,
@@ -202,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Command::Serve {
         listen,
         config,
+        auto_plan,
         cancel_stale,
         observe_dispatches,
         capacity,
@@ -223,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some((
                 app,
                 config.policy(),
+                config.planning(),
                 std::time::Duration::from_secs(config.queue.poll_seconds),
                 std::time::Duration::from_secs(config.queue.rescan_seconds),
             ))
@@ -231,10 +236,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let scope = worker
             .as_ref()
-            .map(|(_, policy, _, _)| (policy.installation, policy.repository));
+            .map(|(_, policy, _, _, _)| (policy.installation, policy.repository));
         let app = sluss::webhook::router_with_scope(secret.into_bytes(), cli.db.clone(), scope)?;
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        if let Some((app, policy, poll, rescan)) = worker {
+        if let Some((app, policy, planning, poll, rescan)) = worker {
+            if auto_plan {
+                eprintln!("automatic batch planning enabled; staging and dispatch remain manual");
+                tokio::spawn(sluss::worker::supervise_planning(
+                    app.clone(),
+                    cli.db.clone(),
+                    policy.clone(),
+                    planning,
+                    poll,
+                ));
+            }
             if cancel_stale {
                 let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
                 eprintln!(
@@ -769,11 +784,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::Status => println!(
-            "paused: {}\nqueued observations: {}\nautomatic CI dispatch: unavailable\nmanual dispatch: experimental\nlanding: disabled",
-            store.paused()?,
-            store.candidates()?.len()
-        ),
+        Command::Status => {
+            println!(
+                "paused: {}\nqueued observations: {}\nautomatic CI dispatch: unavailable\nmanual dispatch: experimental\nlanding: disabled",
+                store.paused()?,
+                store.candidates()?.len()
+            );
+            for batch in store.active_batches()? {
+                println!(
+                    "batch {}: {:?} ({} PRs, base {})",
+                    batch.id,
+                    batch.state,
+                    batch.candidates.len(),
+                    batch.base_sha
+                );
+            }
+        }
         Command::Metrics => {
             let metrics = store.metrics()?;
             println!(

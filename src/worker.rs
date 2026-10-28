@@ -279,3 +279,64 @@ pub async fn supervise_dispatch_observation(
         sleep(delay).await;
     }
 }
+
+/// Make one planning decision from the currently reconciled queue. This does
+/// not fetch Git objects, stage a commit, start CI, or authorize a merge.
+pub fn plan_once(
+    app: &App,
+    db: &std::path::Path,
+    policy: &RepositoryPolicy,
+    settings: &crate::store::PlanningSettings,
+) -> Result<Option<crate::batch::Batch>, String> {
+    let digest = crate::reconcile::policy_digest(app, policy).map_err(|e| e.to_string())?;
+    Store::open(db)
+        .map_err(|e| e.to_string())?
+        .plan_observed_batch(
+            policy.installation,
+            policy.repository,
+            &digest,
+            &policy.target_branch,
+            settings,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Optional planning loop. The planner is transactionally safe across workers
+/// and simply finds active plans again after a restart.
+pub async fn supervise_planning(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    settings: crate::store::PlanningSettings,
+    poll: Duration,
+) {
+    let mut delay = poll;
+    loop {
+        let app = app.clone();
+        let db = db.clone();
+        let policy = policy.clone();
+        let settings = settings.clone();
+        let result =
+            tokio::task::spawn_blocking(move || plan_once(&app, &db, &policy, &settings)).await;
+        match result {
+            Ok(Ok(Some(batch))) => {
+                eprintln!(
+                    "planned batch {} with {} pull requests",
+                    batch.id,
+                    batch.candidates.len()
+                );
+                delay = poll;
+            }
+            Ok(Ok(None)) => delay = poll,
+            Ok(Err(error)) => {
+                eprintln!("automatic batch planning failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+            Err(_) => {
+                eprintln!("automatic batch planner stopped unexpectedly");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}

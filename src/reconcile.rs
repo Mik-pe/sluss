@@ -32,6 +32,13 @@ pub enum ReconcileError {
     Store(#[from] StoreError),
 }
 
+/// Bind queue observations to the App origin and the full operator policy.
+pub fn policy_digest(app: &App, config: &RepositoryPolicy) -> Result<String, ReconcileError> {
+    use sha2::Digest;
+    let encoded = serde_json::to_vec(&(app.scope(), config)).map_err(|_| ReconcileError::Scope)?;
+    Ok(hex::encode(sha2::Sha256::digest(encoded)))
+}
+
 /// Refresh a single pending delivery. A failure never acknowledges the job or
 /// applies a partial queue. The caller must retry and periodically recover
 /// missed events. Branch protection and CODEOWNERS remain unimplemented.
@@ -117,9 +124,7 @@ pub async fn reconcile_once(
     {
         return Err(ReconcileError::Unstable);
     }
-    use sha2::Digest;
-    let encoded = serde_json::to_vec(&(app.scope(), config)).map_err(|_| ReconcileError::Scope)?;
-    let policy_digest = hex::encode(sha2::Sha256::digest(encoded));
+    let policy_digest = policy_digest(app, config)?;
     store.apply_admission_reconciliation_with_base(
         job,
         &policy_digest,

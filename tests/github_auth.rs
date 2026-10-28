@@ -774,6 +774,7 @@ fn spawn_service(
             "--config",
         ])
         .arg(config)
+        .arg("--auto-plan")
         .env("SLUSS_WEBHOOK_SECRET", "test-secret")
         .env(
             "SLUSS_GITHUB_PRIVATE_KEY_PATH",
@@ -819,7 +820,7 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.sqlite");
     let config = dir.path().join("sluss.toml");
-    std::fs::write(&config,format!("version = 1\n[github]\napp_client_id = \"app-client-id\"\ninstallation_id = 42\nrepository_id = 7\nowner = \"owner\"\nrepository = \"repo\"\napi = \"http://{api_addr}/\"\n[queue]\ntarget = \"main\"\npoll_seconds = 1\nrescan_seconds = 30\n[checks]\nrequired_reviews = 1\nblock_labels = [\"do-not-merge\"]\n")).unwrap();
+    std::fs::write(&config,format!("version = 1\n[github]\napp_client_id = \"app-client-id\"\ninstallation_id = 42\nrepository_id = 7\nowner = \"owner\"\nrepository = \"repo\"\napi = \"http://{api_addr}/\"\n[queue]\ntarget = \"main\"\ndebounce_seconds = 0\nbatch_window_seconds = 0\npoll_seconds = 1\nrescan_seconds = 30\n[checks]\nrequired_reviews = 1\nblock_labels = [\"do-not-merge\"]\n")).unwrap();
     let mut child = spawn_service(&db, &config, key_dir.path(), port);
     let client = reqwest::Client::new();
     let mut failed_pending = false;
@@ -856,6 +857,36 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(ready, "startup rescan did not populate the queue");
+    let mut batch_id = None;
+    for _ in 0..150 {
+        if let Ok(store) = sluss::store::Store::open(&db)
+            && let Ok(batches) = store.active_batches()
+            && batches.len() == 1
+        {
+            assert_eq!(batches[0].candidates[0].number, 19);
+            batch_id = Some(batches[0].id.clone());
+            break;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("service exited before automatic planning");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let batch_id = batch_id.expect("automatic planner did not create a batch");
+    drop(child);
+    let mut child = spawn_service(&db, &config, key_dir.path(), port);
+    for _ in 0..50 {
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("service exited after planner restart");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let batches = sluss::store::Store::open(&db)
+        .unwrap()
+        .active_batches()
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].id, batch_id);
     mode.store(10, Ordering::SeqCst);
     let body = br#"{"installation":{"id":42},"repository":{"id":7}}"#;
     let mut mac = Hmac::<Sha256>::new_from_slice(b"test-secret").unwrap();
@@ -885,6 +916,13 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(cleared, "webhook reconciliation did not remove blocked PR");
+    assert!(
+        sluss::store::Store::open(&db)
+            .unwrap()
+            .active_batches()
+            .unwrap()
+            .is_empty()
+    );
     api_task.abort();
 }
 

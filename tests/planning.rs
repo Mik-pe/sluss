@@ -144,6 +144,89 @@ fn concurrent_planners_cannot_duplicate_prs_or_exceed_active_limit() {
     assert_eq!(batches[0].candidates.len(), 4);
 }
 #[test]
+fn observed_planners_share_limits_and_reject_unbound_policy() {
+    use sluss::store::PlanningSettings;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let settings = PlanningSettings {
+        max_batch_size: 4,
+        max_active_batches: 1,
+        debounce: Duration::ZERO,
+        batch_window: Duration::ZERO,
+    };
+    assert!(matches!(
+        store.plan_observed_batch(1, 2, &"f".repeat(64), "main", &settings),
+        Err(StoreError::Unbound)
+    ));
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox
+        .record("target-observed", "push", &[3; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates = store.candidates().unwrap();
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &with_evidence(&candidates),
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.plan_observed_batch(1, 2, &"e".repeat(64), "main", &settings),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        store.plan_observed_batch(1, 2, &"f".repeat(64), "other", &settings),
+        Err(StoreError::PolicyMismatch)
+    ));
+    store.set_paused(true).unwrap();
+    assert!(
+        store
+            .plan_observed_batch(1, 2, &"f".repeat(64), "main", &settings)
+            .unwrap()
+            .is_none()
+    );
+    store.set_paused(false).unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let settings = settings.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(db).unwrap();
+                barrier.wait();
+                store
+                    .plan_observed_batch(1, 2, &"f".repeat(64), "main", &settings)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let batches: Vec<_> = handles
+        .into_iter()
+        .filter_map(|h| h.join().unwrap())
+        .collect();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].candidates.len(), 4);
+    assert_eq!(Store::open(&db).unwrap().active_batches().unwrap(), batches);
+    let mut different = settings.clone();
+    different.max_active_batches = 2;
+    assert!(matches!(
+        store.plan_observed_batch(1, 2, &"f".repeat(64), "main", &different),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        store.plan_batch("batch-3123456789abcdef", &"a".repeat(40), 4, 2),
+        Err(StoreError::PolicyMismatch)
+    ));
+}
+
+#[test]
 fn direct_batch_insertion_cannot_duplicate_a_live_candidate() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.sqlite");

@@ -22,6 +22,26 @@ fn accepts_disabled_mode_and_rejects_unsupported_merge_or_unknown_settings() {
     let config = Config::load(&path).unwrap();
     assert_eq!(config.policy().repository, 7);
     assert_eq!(config.queue.rescan_seconds, 300);
+    assert_eq!(config.queue.max_batch_size, 4);
+    assert_eq!(config.queue.max_active_batches, 1);
+    assert_eq!(config.queue.debounce_seconds, 60);
+    assert_eq!(config.queue.batch_window_seconds, 60);
+    for extra in [
+        "max_batch_size = 0",
+        "max_active_batches = 101",
+        "batch_window_seconds = 86401",
+        "debounce_seconds = 86401",
+    ] {
+        std::fs::write(
+            &path,
+            VALID.replace("target = \"main\"", &format!("target = \"main\"\n{extra}")),
+        )
+        .unwrap();
+        assert!(
+            matches!(Config::load(&path), Err(ConfigError::Invalid)),
+            "{extra}"
+        );
+    }
     std::fs::write(&path, VALID.replace("disabled", "verified-fast-forward")).unwrap();
     assert!(matches!(Config::load(&path), Err(ConfigError::Invalid)));
     std::fs::write(&path, format!("{VALID}\nextra = true\n")).unwrap();

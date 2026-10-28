@@ -27,6 +27,14 @@ pub struct GitHub {
 #[serde(deny_unknown_fields)]
 pub struct Queue {
     pub target: String,
+    #[serde(default = "default_batch_size")]
+    pub max_batch_size: usize,
+    #[serde(default = "default_active_batches")]
+    pub max_active_batches: usize,
+    #[serde(default = "default_batch_window")]
+    pub batch_window_seconds: u64,
+    #[serde(default = "default_batch_window")]
+    pub debounce_seconds: u64,
     #[serde(default = "default_poll")]
     pub poll_seconds: u64,
     #[serde(default = "default_rescan")]
@@ -53,6 +61,15 @@ impl Default for Merge {
 }
 fn default_api() -> String {
     "https://api.github.com/".into()
+}
+fn default_batch_size() -> usize {
+    4
+}
+fn default_active_batches() -> usize {
+    1
+}
+fn default_batch_window() -> u64 {
+    60
 }
 fn default_poll() -> u64 {
     5
@@ -83,6 +100,10 @@ impl Config {
             || !crate::github::valid_name(&config.github.owner)
             || !crate::github::valid_name(&config.github.repository)
             || config.queue.target.is_empty()
+            || !(1..=100).contains(&config.queue.max_batch_size)
+            || !(1..=100).contains(&config.queue.max_active_batches)
+            || config.queue.batch_window_seconds > 86400
+            || config.queue.debounce_seconds > 86400
             || !(1..=100).contains(&config.checks.required_reviews)
             || config.checks.block_labels.iter().any(String::is_empty)
             || !(1..=60).contains(&config.queue.poll_seconds)
@@ -93,6 +114,14 @@ impl Config {
             return Err(ConfigError::Invalid);
         }
         Ok(config)
+    }
+    pub fn planning(&self) -> crate::store::PlanningSettings {
+        crate::store::PlanningSettings {
+            max_batch_size: self.queue.max_batch_size,
+            max_active_batches: self.queue.max_active_batches,
+            debounce: std::time::Duration::from_secs(self.queue.debounce_seconds),
+            batch_window: std::time::Duration::from_secs(self.queue.batch_window_seconds),
+        }
     }
     pub fn policy(&self) -> crate::reconcile::RepositoryPolicy {
         crate::reconcile::RepositoryPolicy {
