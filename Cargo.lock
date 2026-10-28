@@ -1513,6 +1513,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

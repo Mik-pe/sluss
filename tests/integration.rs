@@ -155,3 +155,93 @@ fn rejects_tag_objects_even_when_they_point_to_a_commit() {
     ));
     assert_eq!(git(dir.path(), &["rev-parse", "main"]), base);
 }
+
+#[test]
+fn publishes_idempotently_and_refuses_to_replace_another_commit() {
+    use sluss::integration::StageError;
+    let (dir, base, one, two) = fixture();
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        dir.path(),
+        &["push", remote.path().to_str().unwrap(), "main:main"],
+    );
+    let first = build(dir.path(), &base, std::slice::from_ref(&one)).unwrap();
+    let second = build(dir.path(), &base, std::slice::from_ref(&two)).unwrap();
+    let id = "batch-0123456789abcdef";
+    let staged = first.stage_local(remote.path(), id).unwrap();
+    assert_eq!(staged.reference, format!("refs/heads/sluss/{id}"));
+    assert_eq!(staged.sha, first.sha());
+    assert_eq!(first.stage_local(remote.path(), id).unwrap(), staged);
+    assert!(matches!(
+        second.stage_local(remote.path(), id),
+        Err(StageError::Conflict)
+    ));
+    assert!(matches!(
+        first.stage_local(remote.path(), "../main"),
+        Err(StageError::Invalid)
+    ));
+    assert_eq!(
+        git(remote.path(), &["rev-parse", &staged.reference]),
+        first.sha()
+    );
+    assert_eq!(git(remote.path(), &["rev-parse", "refs/heads/main"]), base);
+}
+
+#[test]
+fn competing_staging_publications_do_not_replace_each_other() {
+    use sluss::integration::StageError;
+    let (dir, base, one, two) = fixture();
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    let first = build(dir.path(), &base, &[one]).unwrap();
+    let second = build(dir.path(), &base, &[two]).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let launch = |integration: sluss::integration::Integration| {
+        let barrier = barrier.clone();
+        let remote = remote.path().to_owned();
+        std::thread::spawn(move || {
+            barrier.wait();
+            integration.stage_local(&remote, "batch-competition-012345")
+        })
+    };
+    let a = launch(first);
+    let b = launch(second);
+    let results = [a.join().unwrap(), b.join().unwrap()];
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(StageError::Conflict)))
+            .count(),
+        1,
+        "{results:?}"
+    );
+    let winner = results.iter().find_map(|r| r.as_ref().ok()).unwrap();
+    assert_eq!(
+        git(remote.path(), &["rev-parse", &winner.reference]),
+        winner.sha
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_invalid_github_staging_inputs_before_connecting() {
+    use sluss::integration::StageError;
+    let (dir, base, one, _) = fixture();
+    let integration = build(dir.path(), &base, &[one]).unwrap();
+    for (owner, repository, token, id) in [
+        ("bad/owner", "repo", "token", "batch-0123456789abcdef"),
+        ("owner", "repo", "", "batch-0123456789abcdef"),
+        ("owner", "repo", "token", "../main"),
+    ] {
+        assert!(matches!(
+            integration.stage_github(owner, repository, token, id),
+            Err(StageError::Invalid)
+        ));
+    }
+}

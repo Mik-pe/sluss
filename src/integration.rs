@@ -198,3 +198,237 @@ fn ensure(output: Output, context: &'static str) -> Result<Output, IntegrationEr
         Err(IntegrationError::Git(context))
     }
 }
+
+/// Result of publishing an integration to a temporary staging branch. This
+/// identifies the commit only; it is not evidence of CI or merge permission.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Staged {
+    pub reference: String,
+    pub sha: String,
+}
+
+#[derive(Debug, Error)]
+pub enum StageError {
+    #[error("invalid staging identifier or remote")]
+    Invalid,
+    #[error("staging ref already points to a different commit")]
+    Conflict,
+    #[error("staging publication failed or its result is uncertain")]
+    Uncertain,
+    #[error("authenticated Git staging is not supported on this platform")]
+    Unsupported,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl Integration {
+    /// Publish to an explicit local repository; intended for tests and local deployments.
+    pub fn stage_local(&self, remote: &Path, id: &str) -> Result<Staged, StageError> {
+        let remote = remote.canonicalize().map_err(|_| StageError::Invalid)?;
+        if !remote.is_dir() {
+            return Err(StageError::Invalid);
+        }
+        self.stage(remote.as_os_str(), id, None)
+    }
+
+    /// Publish to GitHub using an operator-supplied scoped token. This method
+    /// does not obtain credentials and must not run in an untrusted CI job.
+    #[cfg(unix)]
+    pub fn stage_github(
+        &self,
+        owner: &str,
+        repository: &str,
+        token: &str,
+        id: &str,
+    ) -> Result<Staged, StageError> {
+        if !crate::github::valid_name(owner)
+            || !crate::github::valid_name(repository)
+            || token.is_empty()
+            || token.len() > 4096
+            || !token.bytes().all(|b| (33..=126).contains(&b))
+        {
+            return Err(StageError::Invalid);
+        }
+        let remote = format!("https://github.com/{owner}/{repository}.git");
+        self.stage(std::ffi::OsStr::new(&remote), id, Some(token))
+    }
+    #[cfg(not(unix))]
+    pub fn stage_github(
+        &self,
+        _owner: &str,
+        _repository: &str,
+        _token: &str,
+        _id: &str,
+    ) -> Result<Staged, StageError> {
+        Err(StageError::Unsupported)
+    }
+
+    fn stage(
+        &self,
+        remote: &std::ffi::OsStr,
+        id: &str,
+        token: Option<&str>,
+    ) -> Result<Staged, StageError> {
+        if id.len() < 16
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            return Err(StageError::Invalid);
+        }
+        let reference = format!("refs/heads/sluss/{id}");
+        let auth = auth_helper(self.workspace.path(), token)?;
+        let read = || {
+            remote_ref(
+                &self.repository(),
+                remote,
+                &reference,
+                token,
+                auth.as_ref().map(|file| file.path()),
+            )
+        };
+        match read()? {
+            Some(actual) if actual == self.sha => {
+                return Ok(Staged {
+                    reference,
+                    sha: self.sha.clone(),
+                });
+            }
+            Some(_) => return Err(StageError::Conflict),
+            None => {}
+        }
+        let lease = format!("--force-with-lease={reference}:");
+        let spec = format!("{}:{reference}", self.sha);
+        let mut cmd = git(&self.repository());
+        cmd.args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "credential.helper=",
+            "push",
+            "--no-verify",
+            &lease,
+            "--",
+        ])
+        .arg(remote)
+        .arg(&spec);
+        add_auth(&mut cmd, token, auth.as_ref().map(|file| file.path()));
+        // A failed or interrupted push has an uncertain outcome until read back.
+        let _push_result = run_git(cmd, false);
+        match read() {
+            Ok(Some(actual)) if actual == self.sha => Ok(Staged {
+                reference,
+                sha: self.sha.clone(),
+            }),
+            Ok(Some(_)) => Err(StageError::Conflict),
+            _ => Err(StageError::Uncertain),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn auth_helper(
+    dir: &Path,
+    token: Option<&str>,
+) -> Result<Option<tempfile::NamedTempFile>, StageError> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    if token.is_none() {
+        return Ok(None);
+    }
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    file.write_all(b"#!/bin/sh\ncase \"$1\" in *sername*) printf '%s\\n' x-access-token;; *) printf '%s\\n' \"$SLUSS_GIT_TOKEN\";; esac\n")?;
+    Ok(Some(file))
+}
+#[cfg(not(unix))]
+fn auth_helper(
+    _dir: &Path,
+    token: Option<&str>,
+) -> Result<Option<tempfile::NamedTempFile>, StageError> {
+    if token.is_some() {
+        Err(StageError::Unsupported)
+    } else {
+        Ok(None)
+    }
+}
+fn add_auth(cmd: &mut Command, token: Option<&str>, helper: Option<&Path>) {
+    if let (Some(token), Some(helper)) = (token, helper) {
+        cmd.env("GIT_ASKPASS", helper).env("SLUSS_GIT_TOKEN", token);
+    }
+}
+fn remote_ref(
+    repo: &Path,
+    remote: &std::ffi::OsStr,
+    reference: &str,
+    token: Option<&str>,
+    helper: Option<&Path>,
+) -> Result<Option<String>, StageError> {
+    let mut cmd = git(repo);
+    cmd.args([
+        "-c",
+        "protocol.file.allow=always",
+        "-c",
+        "credential.helper=",
+        "ls-remote",
+        "--refs",
+        "--",
+    ])
+    .arg(remote)
+    .arg(reference);
+    add_auth(&mut cmd, token, helper);
+    let output = run_git(cmd, true)?;
+    if !output.status.success() {
+        return Err(StageError::Uncertain);
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| StageError::Uncertain)?;
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let mut lines = text.lines();
+    let Some((sha, actual_ref)) = lines.next().and_then(|line| line.split_once('\t')) else {
+        return Err(StageError::Uncertain);
+    };
+    if lines.next().is_some() || actual_ref != reference || !valid_sha(sha) {
+        return Err(StageError::Uncertain);
+    }
+    Ok(Some(sha.into()))
+}
+/// Bound external Git calls and never surface stdout/stderr containing secrets.
+fn run_git(mut cmd: Command, capture: bool) -> Result<Output, StageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(StageError::from);
+        }
+        if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                // The child is the leader of a new process group. Terminate
+                // Git helpers as well as the parent so credentials do not linger.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StageError::Uncertain);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
