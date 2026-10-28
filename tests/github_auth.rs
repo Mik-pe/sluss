@@ -45,6 +45,15 @@ async fn permission(State(state): State<ServerState>, headers: HeaderMap) -> Jso
     let id = if mode == 8 { 10 } else { 9 };
     Json(json!({"permission":access,"user":{"id":id,"login":"reviewer","type":"User"}}))
 }
+async fn dispatch_permission(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let permission = if state.mode.load(Ordering::SeqCst) == 38 {
+        "read"
+    } else {
+        "write"
+    };
+    Json(json!({"permission":permission,"user":{"id":9,"login":"reviewer","type":"User"}}))
+}
 async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
@@ -195,7 +204,8 @@ async fn reconcile_branch(State(state): State<ServerState>, headers: HeaderMap) 
 async fn doctor_branch(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    let sha = if state.mode.load(Ordering::SeqCst) == 30 && count > 0 {
+    let mode = state.mode.load(Ordering::SeqCst);
+    let sha = if (mode == 30 && count > 0) || (mode == 37 && count >= 8) {
         "c"
     } else {
         "b"
@@ -223,7 +233,7 @@ async fn repository_runners(
     assert_eq!(query["page"], "1");
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    let id = if mode == 28 || (mode == 29 && count > 0) {
+    let id = if mode == 28 || (mode == 29 && count % 2 == 1) {
         2
     } else {
         1
@@ -1185,9 +1195,8 @@ async fn staging_tokens_are_scoped_and_never_sent_from_a_non_github_origin() {
 #[tokio::test]
 async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     use sluss::{
-        batch::Candidate,
         selective::{FrozenSelection, Policy, Selection},
-        store::{AdmissionCandidate, Store},
+        store::Store,
         webhook::Inbox,
     };
     let (key_dir, private, public) = keys();
@@ -1199,6 +1208,13 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .route("/repos/owner/repo", get(dispatch_repo))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
         .route("/repos/owner/repo/branches/main", get(doctor_branch))
+        .route("/repos/owner/repo/pulls", get(open_pulls))
+        .route("/repos/owner/repo/pulls/19", get(pull))
+        .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route(
+            "/repos/owner/repo/collaborators/reviewer/permission",
+            get(dispatch_permission),
+        )
         .route(
             "/repos/owner/repo/actions/workflows/17",
             get(doctor_workflow),
@@ -1247,19 +1263,19 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .record("initial", "pull_request", &[1; 32], 42, 7)
         .unwrap();
     let event = inbox.pending().unwrap().remove(0);
-    store
-        .apply_admission_reconciliation(
-            &event,
-            &"f".repeat(64),
-            &[AdmissionCandidate {
-                candidate: Candidate {
-                    number: 1,
-                    head_sha: "c".repeat(40),
-                },
-                evidence_digest: "d".repeat(64),
-            }],
-        )
-        .unwrap();
+    let fixture_app =
+        App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let fixture_token = fixture_app.read_token(42, 7).await.unwrap();
+    let fixture_policy = sluss::config::Config::load(&config).unwrap().policy();
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut store,
+        &event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
     let id = "batch-0123456789abcdef";
     store
         .plan_batch(id, &"b".repeat(40), 1, 1)
@@ -1337,6 +1353,22 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(String::from_utf8_lossy(&changed.stderr).contains("verification policy changed"));
     assert_eq!(posts.load(Ordering::SeqCst), 0);
     std::fs::write(&policy, policy_text).unwrap();
+    reads.store(0, Ordering::SeqCst);
+    mode.store(30, Ordering::SeqCst);
+    let mut changed_base_args = dispatch_args();
+    changed_base_args.extend([
+        "--verification-policy".into(),
+        policy.to_str().unwrap().into(),
+    ]);
+    let changed_base = launch(changed_base_args.clone()).await.unwrap();
+    assert!(!changed_base.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_base.stderr).contains("Unstable"),
+        "{}",
+        String::from_utf8_lossy(&changed_base.stderr)
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    reads.store(0, Ordering::SeqCst);
     mode.store(29, Ordering::SeqCst);
     let unstable = launch(vec![
         "dispatch-github".into(),
@@ -1384,6 +1416,12 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("RunnerMismatch"));
     assert_eq!(posts.load(Ordering::SeqCst), 0);
+    reads.store(0, Ordering::SeqCst);
+    mode.store(37, Ordering::SeqCst);
+    let moved_after_scan = launch(changed_base_args).await.unwrap();
+    assert!(!moved_after_scan.status.success());
+    assert!(String::from_utf8_lossy(&moved_after_scan.stderr).contains("StaleBase"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
     mode.store(33, Ordering::SeqCst);
     let output = launch(vec![
         "dispatch-github".into(),
@@ -1413,6 +1451,54 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         String::from_utf8_lossy(&output.stdout)
             .contains("dispatched run 123 to reserved host sluss-host-test")
     );
+    mode.store(0, Ordering::SeqCst);
+    // A fresh scan must remove a PR whose reviewer no longer has write access.
+    let second_db = data.path().join("revoked.sqlite");
+    let mut second_inbox = Inbox::open(&second_db).unwrap();
+    let mut second_store = Store::open(&second_db).unwrap();
+    second_inbox
+        .record("initial-revoked", "pull_request", &[42; 32], 42, 7)
+        .unwrap();
+    let second_event = second_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut second_store,
+        &second_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    second_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    second_store.start_integration(id).unwrap();
+    second_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    mode.store(38, Ordering::SeqCst);
+    let args = dispatch_args();
+    let key = key_dir.path().join("test-key.pem");
+    let path = second_db.clone();
+    let revoked = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(path)
+            .args(args)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!revoked.status.success());
+    assert!(matches!(
+        second_store.batch(id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    assert!(second_store.candidates().unwrap().is_empty());
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
     mode.store(0, Ordering::SeqCst);
     let observer_app =
         App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
@@ -1517,7 +1603,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(!before_stale.status.success());
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     let mut store = Store::open(&db).unwrap();
-    store.remove_candidate(1).unwrap();
+    store.remove_candidate(19).unwrap();
     mode.store(31, Ordering::SeqCst);
     let worker_app =
         Arc::new(App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap());

@@ -125,6 +125,7 @@ pub async fn reconcile_once(
         &policy_digest,
         &candidates,
         &base.commit.sha,
+        &config.target_branch,
     )?;
     Ok(())
 }

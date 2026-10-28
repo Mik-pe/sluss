@@ -736,6 +736,8 @@ pub enum DispatchError {
     Invalid,
     #[error("staging ref no longer identifies the frozen integration commit")]
     StaleRef,
+    #[error("the target branch no longer matches the frozen base")]
+    StaleBase,
     #[error("the dispatch was already claimed or is not prepared")]
     AlreadyClaimed,
     #[error("the provider may have accepted the dispatch; reconcile without retrying")]
@@ -775,6 +777,37 @@ impl App {
         repository: &str,
         id: &str,
     ) -> Result<u64, DispatchError> {
+        self.issue_dispatch_inner(scheduler, token, owner, repository, id, None)
+            .await
+    }
+
+    /// Recheck the target around the staging-ref read before claiming a batch dispatch.
+    /// The caller supplies the batch's frozen base and a freshly reconciled target.
+    pub async fn issue_batch_dispatch(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        target_base: (&str, &str),
+    ) -> Result<u64, DispatchError> {
+        if !commit_sha(target_base.1) {
+            return Err(DispatchError::Invalid);
+        }
+        self.issue_dispatch_inner(scheduler, token, owner, repository, id, Some(target_base))
+            .await
+    }
+
+    async fn issue_dispatch_inner(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        target_base: Option<(&str, &str)>,
+    ) -> Result<u64, DispatchError> {
         use crate::scheduler::DispatchState;
         if !token.actions_write || !valid_name(owner) || !valid_name(repository) {
             return Err(DispatchError::Invalid);
@@ -792,9 +825,18 @@ impl App {
         if pending.state != DispatchState::Prepared {
             return Err(DispatchError::AlreadyClaimed);
         }
+        scheduler.validate_dispatch_target(id, target_base)?;
         let host_label = &pending.reservation.host;
         if !valid_runner_label(host_label) {
             return Err(DispatchError::Invalid);
+        }
+        if let Some((target, base)) = target_base {
+            let branch = self
+                .observe_target_branch(token, owner, repository, target)
+                .await?;
+            if branch.commit.sha != base {
+                return Err(DispatchError::StaleBase);
+            }
         }
         let repo_path = format!("repos/{owner}/{repository}");
         let observed_repo: Repository = self.get_json(token, &repo_path, None).await?;
@@ -813,6 +855,14 @@ impl App {
             || observed_ref.object.sha != pending.plan.integration_sha
         {
             return Err(DispatchError::StaleRef);
+        }
+        if let Some((target, base)) = target_base {
+            let branch = self
+                .observe_target_branch(token, owner, repository, target)
+                .await?;
+            if branch.commit.sha != base {
+                return Err(DispatchError::StaleBase);
+            }
         }
         if !scheduler.claim_dispatch(id)? {
             return Err(DispatchError::AlreadyClaimed);

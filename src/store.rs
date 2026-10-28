@@ -72,6 +72,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_selection (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -220,8 +221,14 @@ impl Store {
         policy_digest: &str,
         admitted: &[AdmissionCandidate],
         base_sha: &str,
+        target: &str,
     ) -> Result<(), StoreError> {
-        self.apply_admission_reconciliation_inner(job, policy_digest, admitted, Some(base_sha))
+        self.apply_admission_reconciliation_inner(
+            job,
+            policy_digest,
+            admitted,
+            Some((base_sha, target)),
+        )
     }
 
     fn apply_admission_reconciliation_inner(
@@ -229,7 +236,7 @@ impl Store {
         job: &crate::webhook::Reconciliation,
         policy_digest: &str,
         admitted: &[AdmissionCandidate],
-        base_sha: Option<&str>,
+        base_sha: Option<(&str, &str)>,
     ) -> Result<(), StoreError> {
         let candidates: Vec<Candidate> = admitted.iter().map(|v| v.candidate.clone()).collect();
         let digests: Vec<String> = admitted.iter().map(|v| v.evidence_digest.clone()).collect();
@@ -249,10 +256,12 @@ impl Store {
         policy_digest: &str,
         candidates: &[Candidate],
         digests: Option<&[String]>,
-        base_sha: Option<&str>,
+        base_sha: Option<(&str, &str)>,
     ) -> Result<(), StoreError> {
-        if base_sha.is_some_and(|sha| {
-            sha.len() != 40
+        if base_sha.is_some_and(|(sha, target)| {
+            target.is_empty()
+                || target.len() > 255
+                || sha.len() != 40
                 || !sha
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -326,7 +335,7 @@ impl Store {
         if old_base.is_some() && base_sha.is_none() {
             return Err(StoreError::StaleBatch);
         }
-        if let Some(base) = base_sha {
+        if let Some((base, target)) = base_sha {
             if old_base.as_deref() != Some(base) {
                 let batches = {
                     let mut stmt = tx.prepare("SELECT id,body FROM batches")?;
@@ -351,7 +360,16 @@ impl Store {
                 )?;
                 tx.execute("DELETE FROM failed_singletons", [])?;
             }
+            let old_target: Option<String> = tx
+                .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if old_target.as_deref().is_some_and(|old| old != target) {
+                return Err(StoreError::PolicyMismatch);
+            }
             tx.execute("INSERT INTO observed_base(id,sha) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET sha=excluded.sha", [base])?;
+            tx.execute("INSERT INTO observed_target(id,branch) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET branch=excluded.branch", [target])?;
         }
         let old: Vec<u64> = {
             let mut stmt = tx.prepare("SELECT number FROM candidates")?;

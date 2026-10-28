@@ -389,6 +389,7 @@ fn changing_target_base_invalidates_dispatch_and_stale_splits_atomically() {
             &"f".repeat(64),
             &with_evidence(&candidates),
             &base,
+            "main",
         )
         .unwrap();
     let id = "batch-0123456789abcdef";
@@ -440,6 +441,20 @@ fn changing_target_base_invalidates_dispatch_and_stale_splits_atomically() {
             .unwrap()
             .is_some()
     );
+    assert!(scheduler.validate_dispatch_target(id, None).is_err());
+    assert!(
+        scheduler
+            .validate_dispatch_target(id, Some(("other", &base)))
+            .is_err()
+    );
+    assert!(
+        scheduler
+            .validate_dispatch_target(id, Some(("main", &changed)))
+            .is_err()
+    );
+    scheduler
+        .validate_dispatch_target(id, Some(("main", &base)))
+        .unwrap();
     inbox
         .record("base-update", "push", &[11; 32], 1, 2)
         .unwrap();
@@ -454,6 +469,7 @@ fn changing_target_base_invalidates_dispatch_and_stale_splits_atomically() {
             &"f".repeat(64),
             &with_evidence(&candidates),
             &changed,
+            "main",
         )
         .unwrap();
     assert!(matches!(
@@ -484,6 +500,7 @@ fn changing_target_base_invalidates_dispatch_and_stale_splits_atomically() {
             &"f".repeat(64),
             &with_evidence(&candidates),
             &base,
+            "main",
         )
         .unwrap();
     let new_batch = store

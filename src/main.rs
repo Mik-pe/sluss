@@ -537,6 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("repository does not match the reconciled queue".into());
             }
             let (batch, _) = store.batch(&batch_id)?.ok_or("unknown batch")?;
+            let base_sha = batch.base_sha.clone();
             let sha = match batch.state {
                 sluss::batch::State::Testing { integration_sha } => integration_sha,
                 _ => return Err("batch has not been staged for testing".into()),
@@ -591,8 +592,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app =
-                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &key,
+                &config.github.api,
+            )?;
+            // Refresh all admission inputs using the bound policy before reserving capacity.
+            // Concurrent webhook delivery or another worker makes the scan fail closed.
+            let policy = config.policy();
+            let mut inbox = sluss::webhook::Inbox::open(&cli.db)?;
+            inbox.schedule_if_idle(policy.installation, policy.repository)?;
+            let job = inbox
+                .pending_for(policy.installation, policy.repository)?
+                .ok_or("reconciliation was consumed concurrently; retry dispatch")?;
+            let read_token = app
+                .read_token(plan.installation_id, plan.repository_id)
+                .await?;
+            let mut store = store;
+            sluss::reconcile::reconcile_once(&app, &read_token, &mut store, &job, &policy).await?;
+            let current = store.batch(&batch_id)?.ok_or("unknown batch")?.0;
+            if current.base_sha != base_sha
+                || current.state
+                    != (sluss::batch::State::Testing {
+                        integration_sha: plan.integration_sha.clone(),
+                    })
+            {
+                return Err("batch changed during pre-dispatch reconciliation".into());
+            }
             let inventory_token = app
                 .runner_inventory_token(plan.installation_id, plan.repository_id)
                 .await?;
@@ -614,12 +640,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             };
             let run = app
-                .issue_dispatch(
+                .issue_batch_dispatch(
                     &mut scheduler,
                     &token,
                     &config.github.owner,
                     &config.github.repository,
                     &batch_id,
+                    (&config.queue.target, &base_sha),
                 )
                 .await?;
             println!(

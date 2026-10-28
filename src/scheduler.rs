@@ -448,6 +448,49 @@ pub struct PendingDispatch {
     pub state: DispatchState,
 }
 impl Scheduler {
+    /// Verify that a provider target check uses the frozen batch base and the
+    /// branch from the latest bound reconciliation. Generic dispatches may
+    /// only use the explicitly unbound API.
+    pub fn validate_dispatch_target(
+        &mut self,
+        id: &str,
+        target_base: Option<(&str, &str)>,
+    ) -> Result<(), SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String)> = tx.query_row(
+            "SELECT b.batch_id,d.plan FROM dispatch_batches b JOIN dispatch_intents d ON d.id=b.id WHERE b.id=?1",
+            [id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        match (row, target_base) {
+            (None, None) => {}
+            (Some((batch_id, body)), Some((target, base))) => {
+                let plan: DispatchPlan = serde_json::from_str(&body)?;
+                validate_batch_dispatch(&tx, &batch_id, &plan)?;
+                let batch_body: String =
+                    tx.query_row("SELECT body FROM batches WHERE id=?1", [&batch_id], |r| {
+                        r.get(0)
+                    })?;
+                let batch: crate::batch::Batch = serde_json::from_str(&batch_body)?;
+                let current: Option<(String, String)> = tx.query_row(
+                    "SELECT observed_target.branch,observed_base.sha FROM observed_target JOIN observed_base ON observed_target.id=observed_base.id WHERE observed_target.id=1",
+                    [], |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional()?;
+                if current
+                    .as_ref()
+                    .is_none_or(|(name, sha)| name != target || sha != base)
+                    || batch.base_sha != base
+                {
+                    return Err(SchedulerError::StaleBatch);
+                }
+            }
+            _ => return Err(SchedulerError::StaleBatch),
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Only the worker that changes Prepared to Sending may issue the request.
     /// Sending is deliberately not retried after a crash or ambiguous response.
     pub fn claim_dispatch(&mut self, id: &str) -> Result<bool, SchedulerError> {
