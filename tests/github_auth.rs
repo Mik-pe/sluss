@@ -2574,6 +2574,239 @@ async fn github_staging_marks_changed_policy_as_a_deterministic_batch_failure() 
 }
 
 #[tokio::test]
+async fn github_staging_splits_only_workflow_hazards_introduced_by_the_batch() {
+    use sluss::{
+        batch::{Candidate, State},
+        coordinator::{self, GitHubRepository, PrepareError},
+        github::StagingError,
+        integration::StagingWorkflowError,
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (_key_dir, private, public) = keys();
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: Arc::new(AtomicU8::new(0)),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let token = client.staging_token(42, 7).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("source");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-b", "main"]);
+    std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+    std::fs::write(
+        repo.join(".github/workflows/safe.yml"),
+        "on: {push: {branches: [main]}}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("policy"), "trusted\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-b", "safe"]);
+    std::fs::write(repo.join("safe"), "safe\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "safe change"]);
+    let safe = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-b", "unsafe", &base]);
+    std::fs::write(repo.join(".github/workflows/new.yml"), "on: create\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "unsafe workflow"]);
+    let unsafe_head = git(&["rev-parse", "HEAD"]);
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[
+                AdmissionCandidate {
+                    candidate: Candidate {
+                        number: 1,
+                        head_sha: safe,
+                    },
+                    evidence_digest: "e".repeat(64),
+                },
+                AdmissionCandidate {
+                    candidate: Candidate {
+                        number: 2,
+                        head_sha: unsafe_head,
+                    },
+                    evidence_digest: "d".repeat(64),
+                },
+            ],
+        )
+        .unwrap();
+    let root = "batch-0123456789abcdef";
+    store.plan_batch(root, &base, 2, 2).unwrap().unwrap();
+    let repository = || GitHubRepository {
+        owner: "owner",
+        repository: "repo",
+    };
+    assert!(matches!(
+        coordinator::prepare_github(
+            &mut store,
+            &client,
+            &token,
+            repository(),
+            root,
+            &repo,
+            &["policy".into()]
+        )
+        .await,
+        Err(PrepareError::ChangedWorkflow(
+            StagingWorkflowError::CreateTrigger(_)
+        ))
+    ));
+    assert!(matches!(
+        store.batch(root).unwrap().unwrap().0.state,
+        State::Failed { .. }
+    ));
+    assert!(store.failed_candidates().unwrap().is_empty());
+    let safe_id = "batch-1123456789abcdef";
+    let child = store.plan_batch(safe_id, &base, 2, 2).unwrap().unwrap();
+    assert_eq!(child.candidates[0].number, 1);
+    // The local stub is not a GitHub origin, so reaching the staging boundary
+    // confirms the safe child passed the guard without publishing anything.
+    assert!(matches!(
+        coordinator::prepare_github(
+            &mut store,
+            &client,
+            &token,
+            repository(),
+            safe_id,
+            &repo,
+            &["policy".into()]
+        )
+        .await,
+        Err(PrepareError::GitHubStage(StagingError::InvalidScope))
+    ));
+    let unsafe_id = "batch-2123456789abcdef";
+    let child = store.plan_batch(unsafe_id, &base, 2, 2).unwrap().unwrap();
+    assert_eq!(child.candidates[0].number, 2);
+    assert!(matches!(
+        coordinator::prepare_github(
+            &mut store,
+            &client,
+            &token,
+            repository(),
+            unsafe_id,
+            &repo,
+            &["policy".into()]
+        )
+        .await,
+        Err(PrepareError::ChangedWorkflow(
+            StagingWorkflowError::CreateTrigger(_)
+        ))
+    ));
+    assert_eq!(
+        store
+            .failed_candidates()
+            .unwrap()
+            .iter()
+            .map(|c| c.number)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    git(&["checkout", "-b", "unsafe-base", &base]);
+    std::fs::write(repo.join(".github/workflows/safe.yml"), "on: push\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "unsafe base"]);
+    let unsafe_base = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-b", "benign"]);
+    std::fs::write(repo.join("benign"), "ordinary change\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "benign change"]);
+    let benign = git(&["rev-parse", "HEAD"]);
+    let other_db = dir.path().join("other.sqlite");
+    let mut other_inbox = Inbox::open(&other_db).unwrap();
+    let mut other_store = Store::open(&other_db).unwrap();
+    other_inbox
+        .record("initial", "pull_request", &[2; 32], 42, 7)
+        .unwrap();
+    let event = other_inbox.pending().unwrap().remove(0);
+    other_store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: Candidate {
+                    number: 3,
+                    head_sha: benign,
+                },
+                evidence_digest: "e".repeat(64),
+            }],
+        )
+        .unwrap();
+    let id = "batch-3123456789abcdef";
+    other_store
+        .plan_batch(id, &unsafe_base, 1, 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        coordinator::prepare_github(
+            &mut other_store,
+            &client,
+            &token,
+            repository(),
+            id,
+            &repo,
+            &["policy".into()]
+        )
+        .await,
+        Err(PrepareError::BaseWorkflow(
+            StagingWorkflowError::PushTrigger(_)
+        ))
+    ));
+    assert!(matches!(
+        other_store.batch(id).unwrap().unwrap().0.state,
+        State::Building
+    ));
+    assert!(other_store.failed_candidates().unwrap().is_empty());
+    assert_eq!(git(&["rev-parse", "main"]), base);
+    server.abort();
+}
+
+#[tokio::test]
 async fn uncertain_dispatch_discovery_is_read_only_scoped_and_never_asserts_origin() {
     use sluss::{
         batch::Candidate,

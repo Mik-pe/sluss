@@ -1,7 +1,7 @@
 //! Experimental local end-to-end integration preparation. No CI or landing.
 use crate::{
     github::{App, InstallationToken, StagingError},
-    integration::{self, IntegrationError, PolicyError, StageError},
+    integration::{self, IntegrationError, PolicyError, StageError, StagingWorkflowError},
     store::{Store, StoreError},
 };
 use std::path::Path;
@@ -21,6 +21,12 @@ pub enum PrepareError {
     Stage(#[from] StageError),
     #[error(transparent)]
     GitHubStage(#[from] StagingError),
+    #[error("base workflow configuration cannot safely stage: {0}")]
+    BaseWorkflow(#[source] StagingWorkflowError),
+    #[error("integration changes introduced an unsafe or ambiguous staging workflow: {0}")]
+    ChangedWorkflow(#[source] StagingWorkflowError),
+    #[error("staging workflow inspection could not finish: {0}")]
+    WorkflowInspection(#[source] StagingWorkflowError),
     #[error("integration worker stopped unexpectedly")]
     Worker,
 }
@@ -263,9 +269,23 @@ pub async fn prepare_github_with_options(
     let paths = policy_paths.to_vec();
     let verification_policy = options.verification_policy.cloned();
     let force_full = store.is_split_batch(batch_id)?;
+    let frozen_id = batch_id.to_owned();
     let built = tokio::task::spawn_blocking(move || -> Result<_, PrepareError> {
         let integration = integration::build(&source, &base, &heads)?;
+        // A bad base is operator configuration, not a PR failure. Only a
+        // deterministic problem introduced on top of a safe base is split.
+        integration
+            .check_staging_workflows_at(&base, &frozen_id)
+            .map_err(PrepareError::BaseWorkflow)?;
         let policy = integration.check_policy(&base, &paths)?;
+        integration
+            .check_staging_workflows(&frozen_id)
+            .map_err(|error| match error {
+                StagingWorkflowError::PushTrigger(_)
+                | StagingWorkflowError::CreateTrigger(_)
+                | StagingWorkflowError::Ambiguous(_) => PrepareError::ChangedWorkflow(error),
+                _ => PrepareError::WorkflowInspection(error),
+            })?;
         let selection = selection_for(
             &integration,
             &base,
@@ -287,6 +307,10 @@ pub async fn prepare_github_with_options(
         Err(PrepareError::Policy(error @ PolicyError::Changed)) => {
             store.fail_integration(batch_id, &error.to_string())?;
             return Err(error.into());
+        }
+        Err(PrepareError::ChangedWorkflow(error)) => {
+            store.fail_integration(batch_id, &error.to_string())?;
+            return Err(PrepareError::ChangedWorkflow(error));
         }
         Err(error) => return Err(error),
     };

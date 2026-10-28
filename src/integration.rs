@@ -269,18 +269,32 @@ impl Integration {
     /// Inspect every direct .yml/.yaml workflow file from this exact commit.
     /// Also rejects create triggers. Other events and external systems can still start CI.
     pub fn check_staging_workflows(&self, id: &str) -> Result<(), StagingWorkflowError> {
-        if !valid_staging_id(id) {
+        self.check_staging_workflows_at(self.sha(), id)
+    }
+
+    /// Inspect a frozen input commit in the integration's isolated repository.
+    pub(crate) fn check_staging_workflows_at(
+        &self,
+        commit: &str,
+        id: &str,
+    ) -> Result<(), StagingWorkflowError> {
+        if !valid_staging_id(id) || !valid_sha(commit) {
             return Err(StagingWorkflowError::Invalid);
         }
         let branch = format!("sluss/{id}");
         let repo = self.repository();
+        let mut kind = git(&repo);
+        kind.args(["cat-file", "-t", commit]);
+        if bounded_git(kind, 64)? != b"commit\n" {
+            return Err(StagingWorkflowError::Tree);
+        }
         let mut parent = git(&repo);
         parent.args([
             "--literal-pathspecs",
             "ls-tree",
             "-z",
             "--full-tree",
-            self.sha(),
+            commit,
             "--",
             ".github",
         ]);
@@ -304,7 +318,7 @@ impl Integration {
             "ls-tree",
             "-z",
             "--full-tree",
-            self.sha(),
+            commit,
             "--",
             ".github/workflows",
         ]);
