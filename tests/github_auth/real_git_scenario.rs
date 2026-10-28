@@ -8,6 +8,8 @@ struct Scenario {
     remote: PathBuf,
     base: String,
     head: String,
+    multi_host: bool,
+    fail_mac: bool,
 }
 
 fn git(repo: &FsPath, args: &[&str]) -> String {
@@ -88,6 +90,13 @@ async fn runners(
     headers: HeaderMap,
     query: Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
+    if s.multi_host {
+        assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+        return Json(json!({"total_count":2,"runners":[
+            {"id":1,"name":"linux","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"sluss-host-linux"}]},
+            {"id":2,"name":"mac","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"sluss-host-mac"}]}
+        ]}));
+    }
     repository_runners(State(s.server), headers, query).await
 }
 async fn workflow(State(s): State<Scenario>, headers: HeaderMap) -> Json<Value> {
@@ -157,6 +166,19 @@ async fn send(
     headers: HeaderMap,
     body: Json<Value>,
 ) -> impl axum::response::IntoResponse {
+    if s.multi_host {
+        assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+        let host = body["inputs"]["sluss_host"].as_str().unwrap();
+        let suite = body["inputs"]["sluss_suites"].as_str().unwrap();
+        let run = match (host, suite) {
+            ("sluss-host-linux", "compile") => 123,
+            ("sluss-host-mac", "test") => 124,
+            _ => panic!("unexpected lane dispatch"),
+        };
+        assert_eq!(body["ref"], "refs/heads/sluss/batch-0123456789abcdef");
+        s.server.permissions.fetch_add(1, Ordering::SeqCst);
+        return (StatusCode::OK, Json(json!({"workflow_run_id":run})));
+    }
     dispatch_post(State(s.server), headers, body).await
 }
 async fn run(
@@ -164,11 +186,24 @@ async fn run(
     headers: HeaderMap,
     uri: axum::extract::OriginalUri,
 ) -> Json<Value> {
+    let linux = s.multi_host && uri.0.path().contains("/runs/123");
+    let partial = linux && s.server.mode.load(Ordering::SeqCst) == 32;
+    let fail = s.multi_host
+        && s.fail_mac
+        && uri.0.path().contains("/runs/124")
+        && s.server.mode.load(Ordering::SeqCst) == 0;
     let Json(mut value) = dispatched_run(State(s.server), headers, uri).await;
     value["head_sha"] = json!(git(
         &s.remote,
         &["rev-parse", "refs/heads/sluss/batch-0123456789abcdef"]
     ));
+    if fail {
+        value["conclusion"] = json!("failure");
+    }
+    if partial {
+        value["status"] = json!("completed");
+        value["conclusion"] = json!("success");
+    }
     Json(value)
 }
 async fn jobs(
@@ -177,12 +212,30 @@ async fn jobs(
     query: Query<BTreeMap<String, String>>,
     uri: axum::extract::OriginalUri,
 ) -> Json<Value> {
+    let mac = s.multi_host && uri.0.path().contains("/runs/124");
+    let multi = s.multi_host;
+    let fail = mac && s.fail_mac && s.server.mode.load(Ordering::SeqCst) == 0;
+    let mode = s.server.mode.load(Ordering::SeqCst);
+    let running = multi && (mode == 31 || (mode == 32 && mac));
     let Json(mut value) = actions_jobs(State(s.server), headers, query, uri).await;
     for job in value["jobs"].as_array_mut().unwrap() {
         job["head_sha"] = json!(git(
             &s.remote,
             &["rev-parse", "refs/heads/sluss/batch-0123456789abcdef"]
         ));
+        if multi {
+            job["id"] = json!(if mac { 202 } else { 201 });
+            job["name"] = json!(if mac { "test-job" } else { "compile-job" });
+            job["runner_id"] = json!(if mac { 2 } else { 1 });
+            if running {
+                job["status"] = json!("in_progress");
+                job["conclusion"] = Value::Null;
+                job["completed_at"] = Value::Null;
+            }
+            if fail {
+                job["conclusion"] = json!("failure");
+            }
+        }
     }
     Json(value)
 }
@@ -254,6 +307,8 @@ async fn scenario(lane_mode: bool) {
         remote: remote.path().into(),
         base: base.clone(),
         head: head.clone(),
+        multi_host: false,
+        fail_mac: false,
     };
     let router = Router::new()
         .route("/app/installations/{id}/access_tokens", post(app_token))
@@ -659,6 +714,266 @@ async fn scenario(lane_mode: bool) {
             .await
             .is_err()
     );
+    assert_eq!(git(remote.path(), &["rev-parse", "refs/heads/main"]), base);
+    server.abort();
+}
+
+#[tokio::test]
+async fn two_hosts_dispatch_and_complete_one_exact_integration_after_restart() {
+    two_host_scenario(false).await;
+}
+
+#[tokio::test]
+async fn one_failed_host_fails_the_multi_lane_batch_after_restart() {
+    two_host_scenario(true).await;
+}
+
+async fn two_host_scenario(fail_mac: bool) {
+    use sluss::{
+        batch::State as BatchState,
+        coordinator::prepare_local_from_remote,
+        scheduler::{Capacity, Scheduler},
+        store::Store,
+        webhook::Inbox,
+    };
+    let source = tempfile::tempdir().unwrap();
+    git(source.path(), &["init", "-b", "main"]);
+    std::fs::create_dir_all(source.path().join(".github/workflows")).unwrap();
+    std::fs::write(
+        source.path().join(".github/workflows/ci.yml"),
+        WORKFLOW_GOOD,
+    )
+    .unwrap();
+    std::fs::write(source.path().join("base"), "base\n").unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+    );
+    let base = git(source.path(), &["rev-parse", "HEAD"]);
+    git(source.path(), &["checkout", "-b", "feature"]);
+    std::fs::write(source.path().join("change"), "change\n").unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "feature"],
+    );
+    let head = git(source.path(), &["rev-parse", "HEAD"]);
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        source.path(),
+        &[
+            "push",
+            remote.path().to_str().unwrap(),
+            "main:main",
+            "feature:refs/pull/19/head",
+        ],
+    );
+    let (_keys, private, public) = keys();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let mode = Arc::new(AtomicU8::new(31));
+    let state = Scenario {
+        server: ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: posts.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        },
+        remote: remote.path().into(),
+        base: base.clone(),
+        head,
+        multi_host: true,
+        fail_mac,
+    };
+    let router = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(app_token))
+        .route("/graphql", post(graphql))
+        .route("/repos/owner/repo", get(repo))
+        .route("/repos/owner/repo/branches/main", get(branch))
+        .route("/repos/owner/repo/pulls", get(pulls))
+        .route("/repos/owner/repo/pulls/19", get(pull_detail))
+        .route("/repos/owner/repo/pulls/19/reviews", get(pull_reviews))
+        .route(
+            "/repos/owner/repo/collaborators/reviewer/permission",
+            get(collaborator),
+        )
+        .route("/repos/owner/repo/actions/runners", get(runners))
+        .route("/repos/owner/repo/actions/workflows/17", get(workflow))
+        .route("/repos/owner/repo/rules/branches/main", get(rules))
+        .route(
+            "/repos/owner/repo/branches/main/protection",
+            get(protection),
+        )
+        .route("/repos/owner/repo/rulesets/10", get(ruleset))
+        .route(
+            "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
+            get(staging),
+        )
+        .route("/repos/owner/repo/git/trees/{id}", get(tree))
+        .route("/repos/owner/repo/git/blobs/{id}", get(blob))
+        .route(
+            "/repos/owner/repo/actions/workflows/17/dispatches",
+            post(send),
+        )
+        .route("/repos/owner/repo/actions/runs/123", get(run))
+        .route("/repos/owner/repo/actions/runs/123/attempts/1", get(run))
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/1/jobs",
+            get(jobs),
+        )
+        .route("/repos/owner/repo/actions/runs/124", get(run))
+        .route("/repos/owner/repo/actions/runs/124/attempts/1", get(run))
+        .route(
+            "/repos/owner/repo/actions/runs/124/attempts/1/jobs",
+            get(jobs),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let data = tempfile::tempdir().unwrap();
+    let db = data.path().join("queue.sqlite");
+    let config = data.path().join("sluss.toml");
+    std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
+    let policy = sluss::config::Config::load(&config).unwrap().policy();
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let token = app.read_token(42, 7).await.unwrap();
+    let capacity: Capacity = toml::from_str("[pools]\nlinux=1\nmacos=1\n[hosts.sluss-host-linux]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-linux.pools]\nlinux=1\n[hosts.sluss-host-mac]\nslots=1\nrunner_ids=[2]\n[hosts.sluss-host-mac.pools]\nmacos=1\n").unwrap();
+    let lane_policy = data.path().join("lanes.toml");
+    std::fs::write(&lane_policy, "version=1\n[lanes.compile]\nworkflow_id=17\nsuites=['compile']\nrequired_jobs=['compile-job']\n[lanes.compile.request.pools]\nlinux=1\n[lanes.test]\nworkflow_id=17\nsuites=['test']\nrequired_jobs=['test-job']\n[lanes.test.request.pools]\nmacos=1\n").unwrap();
+    let verification = data.path().join("verification.toml");
+    std::fs::write(&verification, "version=1\nfull_suites=['compile','test']\n[[components]]\nname='all'\npaths=['src/']\nsuites=['compile','test']\n").unwrap();
+    let selection_policy = sluss::selective::Policy::load(&verification).unwrap();
+    let settings = sluss::dispatch::LaneSettings {
+        policy: lane_policy,
+        verification_policy: Some(verification),
+    };
+    let mut inbox = Inbox::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut store = Store::open(&db).unwrap();
+    sluss::reconcile::reconcile_once(&app, &token, &mut store, &event, &policy)
+        .await
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store.plan_batch(id, &base, 1, 1).unwrap().unwrap();
+    let staged = prepare_local_from_remote(
+        &mut store,
+        id,
+        remote.path(),
+        "main",
+        &[".github/workflows/ci.yml".into()],
+    )
+    .unwrap();
+    store
+        .record_selection(
+            id,
+            &sluss::selective::FrozenSelection {
+                base_sha: base.clone(),
+                integration_sha: staged.sha.clone(),
+                policy_digest: selection_policy.digest().unwrap(),
+                selection: sluss::selective::Selection::Selected {
+                    suites: ["compile".into(), "test".into()].into(),
+                    components: ["all".into()].into(),
+                },
+            },
+        )
+        .unwrap();
+    drop(store);
+    for _ in 0..2 {
+        assert!(matches!(
+            sluss::dispatch::batch_lanes(&db, &app, &policy, &capacity, &settings, id)
+                .await
+                .unwrap(),
+            sluss::dispatch::Outcome::Sent { .. }
+        ));
+    }
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    let scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+    let pending = scheduler.pending_dispatches().unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending
+            .iter()
+            .all(|lane| lane.plan.integration_sha == staged.sha)
+    );
+    assert_ne!(pending[0].reservation.host, pending[1].reservation.host);
+    drop(scheduler);
+    drop(app);
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    sluss::worker::observe_dispatches_with_completion(&app, &db, &capacity, &policy, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        Store::open(&db)
+            .unwrap()
+            .batch(id)
+            .unwrap()
+            .unwrap()
+            .0
+            .state,
+        BatchState::Testing { .. }
+    ));
+    mode.store(32, Ordering::SeqCst);
+    sluss::worker::observe_dispatches_with_completion(&app, &db, &capacity, &policy, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        sluss::worker::release_ci_only_once(&app, &db, &capacity, &policy)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        Store::open(&db)
+            .unwrap()
+            .batch(id)
+            .unwrap()
+            .unwrap()
+            .0
+            .state,
+        BatchState::Testing { .. }
+    ));
+    assert_eq!(
+        Scheduler::open(&db, capacity.clone())
+            .unwrap()
+            .pending_dispatches()
+            .unwrap()
+            .len(),
+        1
+    );
+    mode.store(0, Ordering::SeqCst);
+    sluss::worker::observe_dispatches_with_completion(&app, &db, &capacity, &policy, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        sluss::worker::release_ci_only_once(&app, &db, &capacity, &policy)
+            .await
+            .unwrap(),
+        1
+    );
+    let store = Store::open(&db).unwrap();
+    let expected_conclusion = if fail_mac { "failure" } else { "success" };
+    assert!(
+        matches!(store.batch(id).unwrap().unwrap().0.state, BatchState::CiCompleteLanes { integration_sha, lanes, conclusion } if integration_sha == staged.sha && lanes.len() == 2 && conclusion == expected_conclusion)
+    );
+    let metrics = store.metrics().unwrap();
+    assert_eq!(
+        (metrics.completed_jobs, metrics.runner_milliseconds),
+        (2, 120_000)
+    );
+    assert!(
+        Scheduler::open(&db, capacity)
+            .unwrap()
+            .pending_dispatches()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
     assert_eq!(git(remote.path(), &["rev-parse", "refs/heads/main"]), base);
     server.abort();
 }
