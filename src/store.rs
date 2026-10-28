@@ -32,6 +32,12 @@ pub enum StoreError {
     StaleBatch,
     #[error("system clock is outside the supported range")]
     Clock,
+    #[error("pause Sluss and stop its workers before migrating selection policy")]
+    MigrationNeedsPause,
+    #[error(
+        "selection migration requires no active batches, reservations or unresolved dispatches"
+    )]
+    MigrationBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -87,6 +93,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS planning_config (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_config (id INTEGER PRIMARY KEY CHECK(id=1), paths TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS staging_selection_config (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS selection_migrations (id INTEGER PRIMARY KEY, previous_mode TEXT NOT NULL, next_mode TEXT NOT NULL, migrated_ms INTEGER NOT NULL, cleared_holds INTEGER NOT NULL, discarded_batches INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -1164,6 +1171,121 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Current frozen staging-selection mode, displayed for explicit migration.
+    pub fn staging_selection_mode(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT mode FROM staging_selection_config WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Change the selection mode only while paused and without reservations or
+    /// unresolved sends. Active batches require explicit discard. The caller
+    /// must stop workers: the database cannot prove Git processes have exited.
+    pub fn migrate_staging_selection(
+        &mut self,
+        expected: &str,
+        next: &str,
+        discard_unstarted: bool,
+    ) -> Result<bool, StoreError> {
+        let valid_mode = |mode: &str| mode == "full" || valid_hex(mode, 64);
+        if !(expected == "unbound" || valid_mode(expected)) || !valid_mode(next) {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let paused: bool = tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !paused {
+            return Err(StoreError::MigrationNeedsPause);
+        }
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT mode FROM staging_selection_config WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let current = current.unwrap_or_else(|| "unbound".into());
+        if current != expected {
+            return Err(StoreError::PolicyMismatch);
+        }
+        let bodies: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut active = Vec::new();
+        for body in bodies {
+            let batch: Batch = serde_json::from_str(&body)?;
+            if matches!(
+                batch.state,
+                State::Planned | State::Building | State::Testing { .. } | State::Verified { .. }
+            ) {
+                active.push(batch);
+            }
+        }
+        if !active.is_empty() && !discard_unstarted {
+            return Err(StoreError::MigrationBusy);
+        }
+        let capacity_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capacity_reservations')", [], |r| r.get(0))?;
+        if capacity_exists {
+            let reserved: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capacity_reservations)",
+                [],
+                |r| r.get(0),
+            )?;
+            if reserved {
+                return Err(StoreError::MigrationBusy);
+            }
+        }
+        let dispatch_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_intents')", [], |r| r.get(0))?;
+        if dispatch_exists {
+            let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM dispatch_intents WHERE state NOT IN ('finished','cancelled'))", [], |r| r.get(0))?;
+            if unresolved {
+                return Err(StoreError::MigrationBusy);
+            }
+        }
+        if current == next {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let discarded = i64::try_from(active.len()).map_err(|_| StoreError::InvalidBatch)?;
+        for mut batch in active {
+            batch
+                .invalidate("selection policy migrated".into())
+                .map_err(|_| StoreError::InvalidBatch)?;
+            tx.execute(
+                "UPDATE batches SET body=?1,version=version+1 WHERE id=?2",
+                params![serde_json::to_string(&batch)?, batch.id],
+            )?;
+        }
+        // A prior CI investigation is tied to the previous selection policy.
+        // Its pending descendants and CI-only holds cannot suppress new work.
+        tx.execute("WITH RECURSIVE descendants(id) AS (SELECT batch_id FROM ci_investigations UNION SELECT t.child_id FROM split_tasks t JOIN descendants d ON t.parent_id=d.id WHERE t.child_id IS NOT NULL) UPDATE split_tasks SET state='stale' WHERE state='pending' AND parent_id IN (SELECT id FROM descendants)", [])?;
+        tx.execute(
+            "UPDATE ci_investigations SET state='stale' WHERE state!='stale'",
+            [],
+        )?;
+        let cleared = tx.execute("DELETE FROM ci_candidate_completions", [])?;
+        tx.execute("DELETE FROM ci_capacity_waits WHERE ended_ms IS NULL", [])?;
+        tx.execute(
+            "INSERT INTO staging_selection_config(id,mode) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET mode=excluded.mode",
+            [next],
+        )?;
+        tx.execute("INSERT INTO selection_migrations(previous_mode,next_mode,migrated_ms,cleared_holds,discarded_batches) VALUES(?1,?2,?3,?4,?5)", params![current,next,now_ms()?,i64::try_from(cleared).map_err(|_| StoreError::InvalidBatch)?,discarded])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Return the declared-file policy digest for a prepared batch.

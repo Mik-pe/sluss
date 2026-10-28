@@ -92,6 +92,21 @@ enum Command {
         #[arg(long)]
         source: PathBuf,
     },
+    /// Migrate the selection policy after stopping workers and draining the queue.
+    MigrateSelection {
+        /// Current selection mode from `sluss status` (a digest, "full" or "unbound").
+        #[arg(long)]
+        expected_mode: String,
+        /// New operator-owned selective policy file.
+        #[arg(long, required_unless_present = "full", conflicts_with = "full")]
+        policy: Option<PathBuf>,
+        /// Switch to full verification instead of a selective policy.
+        #[arg(long, required_unless_present = "policy")]
+        full: bool,
+        /// Invalidate active batches after stopping workers; never releases reservations.
+        #[arg(long)]
+        discard_unstarted: bool,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -855,6 +870,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        Command::MigrateSelection {
+            expected_mode,
+            policy,
+            full,
+            discard_unstarted,
+        } => {
+            let next = match (policy, full) {
+                (Some(path), false) => sluss::selective::Policy::load(&path)?.digest()?,
+                (None, true) => "full".to_owned(),
+                _ => return Err("provide exactly one of --policy or --full".into()),
+            };
+            let mut store = store;
+            if store.migrate_staging_selection(&expected_mode, &next, discard_unstarted)? {
+                println!(
+                    "selection mode migrated to {next}; old CI-only holds were cleared; Sluss remains paused"
+                );
+            } else {
+                println!("selection mode already matches {next}; Sluss remains paused");
+            }
+        }
         Command::RetryCi { batch_id } => {
             let mut store = store;
             let count = store.retry_ci_only(&batch_id)?;
@@ -867,6 +902,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "paused: {}\nqueued observations: {}\nCI dispatch: experimental (manual or optional worker)\nlanding: disabled",
                 store.paused()?,
                 store.candidates()?.len()
+            );
+            println!(
+                "selection mode: {}",
+                store
+                    .staging_selection_mode()?
+                    .as_deref()
+                    .unwrap_or("unbound")
             );
             for (batch, state) in store.ci_investigations()? {
                 println!("CI investigation {batch}: {state} (not a merge approval)");

@@ -506,3 +506,358 @@ fn target_change_invalidates_ci_investigation_and_planned_child() {
         .unwrap();
     assert_eq!(numbers(&next), [1, 2, 3, 4]);
 }
+
+#[test]
+fn selection_migration_requires_a_drained_pause_and_invalidates_old_ci_holds() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    store.bind_staging_selection(&root.id, None).unwrap();
+    let policy_path = dir.path().join("verification.toml");
+    std::fs::write(&policy_path, include_str!("../examples/verification.toml")).unwrap();
+    let next = sluss::selective::Policy::load(&policy_path)
+        .unwrap()
+        .digest()
+        .unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection("full", &next, false),
+        Err(StoreError::MigrationNeedsPause)
+    ));
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection("full", &next, false),
+        Err(StoreError::MigrationBusy)
+    ));
+    store.set_paused(false).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    assert_eq!(store.ci_only_completions().unwrap().len(), 4);
+    let reservation = Request {
+        pools: [("rust".into(), 1)].into(),
+    };
+    scheduler
+        .reserve("other-work", &reservation)
+        .unwrap()
+        .unwrap();
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection("full", &next, false),
+        Err(StoreError::MigrationBusy)
+    ));
+    assert!(scheduler.release("other-work").unwrap());
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO dispatch_intents(id,plan,state) VALUES('uncertain','{}','sending')",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection("full", &next, false),
+        Err(StoreError::MigrationBusy)
+    ));
+    conn.execute("DELETE FROM dispatch_intents WHERE id='uncertain'", [])
+        .unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection(&"1".repeat(64), &next, false),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert_eq!(
+        store.staging_selection_mode().unwrap().as_deref(),
+        Some("full")
+    );
+    assert_eq!(store.ci_only_completions().unwrap().len(), 4);
+    // Exercise the user-facing command and operator-supplied policy file.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args(["migrate-selection", "--expected-mode", "full", "--policy"])
+        .arg(&policy_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Sluss remains paused"));
+    assert!(store.paused().unwrap());
+    assert_eq!(
+        store.staging_selection_mode().unwrap().as_deref(),
+        Some(next.as_str())
+    );
+    assert!(store.ci_only_completions().unwrap().is_empty());
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id.clone(), "stale".into()))
+    );
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::CiComplete { .. }
+    ));
+    assert_eq!(
+        conn.query_row("SELECT cleared_holds FROM selection_migrations", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap(),
+        4
+    );
+    drop(store);
+    let mut store = Store::open(dir.path().join("queue.sqlite")).unwrap();
+    assert!(
+        !store
+            .migrate_staging_selection(&next, &next, false)
+            .unwrap()
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM selection_migrations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    store.set_paused(false).unwrap();
+    let next_batch = plan(&mut store, 2).unwrap();
+    assert_eq!(
+        numbers(&next_batch),
+        [1, 2, 3, 4],
+        "the old CI split must not survive the migration"
+    );
+    store
+        .bind_staging_selection(&next_batch.id, Some(&next))
+        .unwrap();
+}
+
+#[test]
+fn selection_migration_preserves_pending_integration_conflict_splits() {
+    let (dir, mut store, _inbox, _scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    store.bind_staging_selection(&root.id, None).unwrap();
+    store.start_integration(&root.id).unwrap();
+    store.fail_integration(&root.id, "merge conflict").unwrap();
+    store.set_paused(true).unwrap();
+    assert!(
+        store
+            .migrate_staging_selection("full", &"d".repeat(64), false)
+            .unwrap()
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args([
+            "migrate-selection",
+            "--expected-mode",
+            &"d".repeat(64),
+            "--full",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        store.staging_selection_mode().unwrap().as_deref(),
+        Some("full")
+    );
+    store.set_paused(false).unwrap();
+    assert_eq!(numbers(&plan(&mut store, 2).unwrap()), [1, 2]);
+}
+
+#[test]
+fn competing_selection_migrations_compare_the_bound_mode_atomically() {
+    use std::sync::{Arc, Barrier};
+    let (dir, mut store, _inbox, _scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    store.bind_staging_selection(&root.id, None).unwrap();
+    store.start_integration(&root.id).unwrap();
+    store.fail_integration(&root.id, "merge conflict").unwrap();
+    store.set_paused(true).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let workers: Vec<_> = ["d".repeat(64), "e".repeat(64)]
+        .into_iter()
+        .map(|next| {
+            let path = dir.path().join("queue.sqlite");
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(path).unwrap();
+                barrier.wait();
+                let result = store.migrate_staging_selection("full", &next, false);
+                (next, result)
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, result)| matches!(result, Ok(true)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, result)| matches!(result, Err(StoreError::PolicyMismatch)))
+            .count(),
+        1
+    );
+    let winner = &results
+        .iter()
+        .find(|(_, result)| matches!(result, Ok(true)))
+        .unwrap()
+        .0;
+    assert_eq!(
+        store.staging_selection_mode().unwrap().as_ref(),
+        Some(winner)
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM selection_migrations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn migration_can_discard_unstarted_legacy_batch_but_not_a_reservation() {
+    use sha2::{Digest, Sha256};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let policy_path = dir.path().join("verification.toml");
+    std::fs::write(&policy_path, include_str!("../examples/verification.toml")).unwrap();
+    let policy = sluss::selective::Policy::load(&policy_path).unwrap();
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-selective-policy-v1\0");
+    hash.update(serde_json::to_vec(&policy).unwrap());
+    let legacy = hex::encode(hash.finalize());
+    let current = policy.digest().unwrap();
+    let root = plan(&mut store, 1).unwrap();
+    store
+        .bind_staging_selection(&root.id, Some(&legacy))
+        .unwrap();
+    store.start_integration(&root.id).unwrap();
+    let frozen = sluss::selective::FrozenSelection {
+        base_sha: root.base_sha.clone(),
+        integration_sha: "b".repeat(40),
+        policy_digest: legacy.clone(),
+        selection: sluss::selective::Selection::Selected {
+            suites: ["core-tests".into()].into(),
+            components: ["core".into()].into(),
+        },
+    };
+    store
+        .finish_integration_with_selection(
+            &root.id,
+            &"b".repeat(40),
+            &"c".repeat(64),
+            Some(&frozen),
+        )
+        .unwrap();
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection(&legacy, &current, false),
+        Err(StoreError::MigrationBusy)
+    ));
+    scheduler
+        .reserve(
+            "other-work",
+            &Request {
+                pools: [("rust".into(), 1)].into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store.migrate_staging_selection(&legacy, &current, true),
+        Err(StoreError::MigrationBusy)
+    ));
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::Testing { .. }
+    ));
+    assert!(scheduler.release("other-work").unwrap());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args(["migrate-selection", "--expected-mode", &legacy, "--policy"])
+        .arg(&policy_path)
+        .arg("--discard-unstarted")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert_eq!(
+        store.staging_selection_mode().unwrap().as_deref(),
+        Some(current.as_str())
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT discarded_batches FROM selection_migrations",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    store.set_paused(false).unwrap();
+    let retried = plan(&mut store, 2).unwrap();
+    assert_eq!(numbers(&retried), [1, 2, 3, 4]);
+    store
+        .bind_staging_selection(&retried.id, Some(&current))
+        .unwrap();
+}
+
+#[test]
+fn migration_handles_an_unbound_legacy_manual_selection() {
+    let (_dir, mut store, _inbox, _scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    store.start_integration(&root.id).unwrap();
+    store
+        .finish_integration(&root.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    store
+        .record_selection(
+            &root.id,
+            &sluss::selective::FrozenSelection {
+                base_sha: root.base_sha.clone(),
+                integration_sha: "b".repeat(40),
+                policy_digest: "d".repeat(64),
+                selection: sluss::selective::Selection::Selected {
+                    suites: ["core-tests".into()].into(),
+                    components: ["core".into()].into(),
+                },
+            },
+        )
+        .unwrap();
+    assert!(store.staging_selection_mode().unwrap().is_none());
+    store.set_paused(true).unwrap();
+    assert!(
+        store
+            .migrate_staging_selection("unbound", &"e".repeat(64), true)
+            .unwrap()
+    );
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert_eq!(
+        store.staging_selection_mode().unwrap().as_deref(),
+        Some("e".repeat(64).as_str())
+    );
+    store.set_paused(false).unwrap();
+    let next = plan(&mut store, 2).unwrap();
+    store
+        .bind_staging_selection(&next.id, Some(&"e".repeat(64)))
+        .unwrap();
+}
