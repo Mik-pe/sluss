@@ -66,6 +66,181 @@ fn plan(store: &mut Store, n: u64) -> Option<sluss::batch::Batch> {
 fn numbers(batch: &sluss::batch::Batch) -> Vec<u64> {
     batch.candidates.iter().map(|c| c.number).collect()
 }
+
+#[test]
+fn released_capacity_can_only_expand_while_paused_and_drained() {
+    use sluss::scheduler::SchedulerError;
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let db = dir.path().join("queue.sqlite");
+    let old_digest = Scheduler::capacity_digest(&db).unwrap().unwrap();
+    let mut next = Capacity {
+        pools: [("rust".into(), 2)].into(),
+        hosts: [
+            (
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [7].into(),
+                    pools: [("rust".into(), 1)].into(),
+                },
+            ),
+            (
+                "sluss-host-new".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [8].into(),
+                    pools: [("rust".into(), 1)].into(),
+                },
+            ),
+        ]
+        .into(),
+    };
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main"),
+        Err(SchedulerError::MigrationBusy)
+    ));
+    let root = plan(&mut store, 1).unwrap();
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main"),
+        Err(SchedulerError::MigrationBusy)
+    ));
+    store.set_paused(false).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "success");
+    store.set_paused(true).unwrap();
+    scheduler
+        .reserve(
+            "migration-probe",
+            &Request {
+                pools: [("rust".into(), 1)].into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main"),
+        Err(SchedulerError::MigrationBusy)
+    ));
+    assert!(scheduler.release("migration-probe").unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO dispatch_intents(id,plan,state,run_id) VALUES('uncertain-probe','{}','sending',NULL)", []).unwrap();
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main"),
+        Err(SchedulerError::MigrationBusy)
+    ));
+    conn.execute(
+        "DELETE FROM dispatch_intents WHERE id='uncertain-probe'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &"f".repeat(64), &next, 1, 2, "main"),
+        Err(SchedulerError::ConfigChanged)
+    ));
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 3, "main"),
+        Err(SchedulerError::MigrationBusy)
+    ));
+    let old_host = next.hosts.remove("sluss-host-test").unwrap();
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main"),
+        Err(SchedulerError::MigrationUnsafe)
+    ));
+    next.hosts.insert(
+        "sluss-host-test".into(),
+        Host {
+            runner_ids: [9].into(),
+            ..old_host.clone()
+        },
+    );
+    assert!(matches!(
+        Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main"),
+        Err(SchedulerError::MigrationUnsafe)
+    ));
+    next.hosts.insert("sluss-host-test".into(), old_host);
+    assert!(Scheduler::migrate_capacity(&db, &old_digest, &next, 1, 2, "main").unwrap());
+    assert!(store.paused().unwrap());
+    assert!(matches!(
+        scheduler.reserve(
+            "old-worker",
+            &Request {
+                pools: [("rust".into(), 1)].into()
+            }
+        ),
+        Err(SchedulerError::ConfigChanged)
+    ));
+    let new_digest = Scheduler::capacity_digest(&db).unwrap().unwrap();
+    assert_ne!(old_digest, new_digest);
+    assert!(!Scheduler::migrate_capacity(&db, &new_digest, &next, 1, 2, "main").unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM capacity_migrations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    let history: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM capacity_release_topology_history",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(history, 2);
+    drop(scheduler);
+    assert!(Scheduler::open(&db, next).is_ok());
+}
+
+#[test]
+fn concurrent_capacity_migrations_compare_the_same_digest() {
+    use std::sync::{Arc, Barrier};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let db = dir.path().join("queue.sqlite");
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "success");
+    store.set_paused(true).unwrap();
+    let digest = Scheduler::capacity_digest(&db).unwrap().unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut threads = Vec::new();
+    for budget in [2, 3] {
+        let db = db.clone();
+        let digest = digest.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            let next = Capacity {
+                pools: [("rust".into(), budget)].into(),
+                hosts: [(
+                    "sluss-host-test".into(),
+                    Host {
+                        slots: 1,
+                        runner_ids: [7].into(),
+                        pools: [("rust".into(), 1)].into(),
+                    },
+                )]
+                .into(),
+            };
+            barrier.wait();
+            Scheduler::migrate_capacity(db, &digest, &next, 1, 2, "main")
+        }));
+    }
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Ok(true)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(sluss::scheduler::SchedulerError::ConfigChanged)))
+            .count(),
+        1
+    );
+}
 fn finish(
     store: &mut Store,
     scheduler: &mut Scheduler,

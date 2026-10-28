@@ -119,6 +119,18 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Expand capacity while paused and drained, preserving old rerun budgets.
+    MigrateCapacity {
+        /// Current capacity digest from `sluss status`.
+        #[arg(long)]
+        expected_digest: String,
+        /// Configuration identifying the bound repository and target.
+        #[arg(long)]
+        config: PathBuf,
+        /// New operator-owned capacity configuration.
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Read an uncertain landing's GitHub refs without retrying the mutation.
     ObserveLandingRecovery {
         #[arg(long)]
@@ -1619,6 +1631,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("planning settings already match; Sluss remains paused");
             }
         }
+        Command::MigrateCapacity {
+            expected_digest,
+            config,
+            capacity,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let next = load_capacity(&capacity)?;
+            if sluss::scheduler::Scheduler::migrate_capacity(
+                &cli.db,
+                &expected_digest,
+                &next,
+                config.github.installation_id,
+                config.github.repository_id,
+                &config.queue.target,
+            )? {
+                println!(
+                    "capacity migrated; historical release topology retained; Sluss remains paused"
+                );
+            } else {
+                println!("capacity already matches; Sluss remains paused");
+            }
+        }
         Command::StartStagedCheck {
             batch_id,
             config,
@@ -1878,6 +1912,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "selection mode: {}",
                 store
                     .staging_selection_mode()?
+                    .as_deref()
+                    .unwrap_or("unbound")
+            );
+            println!(
+                "capacity digest: {}",
+                sluss::scheduler::Scheduler::capacity_digest(&cli.db)?
                     .as_deref()
                     .unwrap_or("unbound")
             );

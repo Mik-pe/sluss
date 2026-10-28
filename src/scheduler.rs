@@ -56,6 +56,10 @@ pub enum SchedulerError {
     ConfigBusy,
     #[error("capacity configuration changed; reopen the scheduler")]
     ConfigChanged,
+    #[error("capacity migration requires a paused and drained, correctly bound queue")]
+    MigrationBusy,
+    #[error("capacity migration must preserve the previously released runner topology and budgets")]
+    MigrationUnsafe,
     #[error("reservation identifier is already used by another request")]
     IdConflict,
     #[error("reservation identifier has already been released and cannot be reused")]
@@ -84,6 +88,142 @@ pub struct Scheduler {
     encoded: String,
 }
 impl Scheduler {
+    /// Inspect the currently bound capacity without creating or migrating a database.
+    pub fn capacity_digest(path: impl AsRef<Path>) -> Result<Option<String>, SchedulerError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capacity_config')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let body: Option<String> = conn
+            .query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        body.map(|body| {
+            let capacity: Capacity = serde_json::from_str(&body)?;
+            validate_capacity(&capacity)?;
+            if serde_json::to_string(&capacity)? != body {
+                return Err(SchedulerError::Corrupt);
+            }
+            Ok(capacity_digest(&body))
+        })
+        .transpose()
+    }
+
+    /// Migrate a paused, drained bound queue. After bounded releases, only a
+    /// topology that retains every old runner and covers its old budgets is
+    /// permitted, so a rerun cannot escape the new capacity envelope.
+    pub fn migrate_capacity(
+        path: impl AsRef<Path>,
+        expected: &str,
+        next: &Capacity,
+        installation: i64,
+        repository: i64,
+        target: &str,
+    ) -> Result<bool, SchedulerError> {
+        validate_capacity(next)?;
+        let next_body = serde_json::to_string(next)?;
+        let mut conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let paused: bool = tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get(0),
+        )?;
+        let binding: Option<(i64,i64,String)> = tx.query_row("SELECT r.installation,r.repository,t.branch FROM repository_binding r JOIN observed_target t ON r.id=t.id WHERE r.id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if !paused
+            || binding.as_ref().map(|(i, r, t)| (*i, *r, t.as_str()))
+                != Some((installation, repository, target))
+        {
+            return Err(SchedulerError::MigrationBusy);
+        }
+        let old_body: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        let old: Capacity = serde_json::from_str(&old_body)?;
+        validate_capacity(&old)?;
+        if serde_json::to_string(&old)? != old_body {
+            return Err(SchedulerError::Corrupt);
+        }
+        if capacity_digest(&old_body) != expected {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let locked: Option<String> = tx
+            .query_row(
+                "SELECT body FROM capacity_release_topology WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if locked.as_ref().is_some_and(|body| body != &old_body) {
+            return Err(SchedulerError::Corrupt);
+        }
+        if let Some(body) = &locked {
+            let previous: Capacity = serde_json::from_str(body)?;
+            if !capacity_extends_release_envelope(&previous, next) {
+                return Err(SchedulerError::MigrationUnsafe);
+            }
+        }
+        let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM capacity_reservations) OR EXISTS(SELECT 1 FROM dispatch_intents WHERE state NOT IN ('finished','cancelled'))", [], |r| r.get(0))?;
+        if busy {
+            return Err(SchedulerError::MigrationBusy);
+        }
+        {
+            let mut statement = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let batch: crate::batch::Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    batch.state,
+                    crate::batch::State::Planned
+                        | crate::batch::State::Building
+                        | crate::batch::State::Testing { .. }
+                        | crate::batch::State::Verified { .. }
+                ) {
+                    return Err(SchedulerError::MigrationBusy);
+                }
+            }
+        }
+        if old_body == next_body {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS capacity_release_topology_history (body TEXT PRIMARY KEY NOT NULL); CREATE TABLE IF NOT EXISTS capacity_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, previous_body TEXT NOT NULL, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);")?;
+        if let Some(body) = locked {
+            tx.execute(
+                "INSERT OR IGNORE INTO capacity_release_topology_history(body) VALUES(?1)",
+                [&body],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO capacity_release_topology_history(body) VALUES(?1)",
+                [&next_body],
+            )?;
+            tx.execute(
+                "UPDATE capacity_release_topology SET body=?1 WHERE id=1",
+                [&next_body],
+            )?;
+        }
+        tx.execute(
+            "UPDATE capacity_config SET body=?1 WHERE id=1",
+            [&next_body],
+        )?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SchedulerError::Invalid)?
+            .as_millis();
+        let now = i64::try_from(now).map_err(|_| SchedulerError::Invalid)?;
+        tx.execute(
+            "INSERT INTO capacity_migrations(previous_body,next_body,migrated_ms) VALUES(?1,?2,?3)",
+            params![old_body, next_body, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn open(path: impl AsRef<Path>, capacity: Capacity) -> Result<Self, SchedulerError> {
         validate_capacity(&capacity)?;
         let encoded = serde_json::to_string(&capacity)?;
@@ -92,6 +232,8 @@ impl Scheduler {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS capacity_config (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_release_topology (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS capacity_release_topology_history (body TEXT PRIMARY KEY NOT NULL);
+            CREATE TABLE IF NOT EXISTS capacity_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, previous_body TEXT NOT NULL, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
@@ -127,6 +269,12 @@ impl Scheduler {
                 |r| r.get(0),
             )
             .optional()?;
+        if let Some(body) = &release_topology {
+            tx.execute(
+                "INSERT OR IGNORE INTO capacity_release_topology_history(body) VALUES(?1)",
+                [body],
+            )?;
+        }
         if release_topology
             .as_ref()
             .is_some_and(|locked| locked != &encoded)
@@ -428,6 +576,35 @@ impl Scheduler {
         Ok(deleted)
     }
 }
+fn capacity_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-capacity-v1\0");
+    hash.update(body.as_bytes());
+    hex::encode(hash.finalize())
+}
+
+fn capacity_extends_release_envelope(previous: &Capacity, next: &Capacity) -> bool {
+    if crate::verification::check_release_topology(previous).is_err()
+        || crate::verification::check_release_topology(next).is_err()
+    {
+        return false;
+    }
+    previous
+        .pools
+        .iter()
+        .all(|(name, units)| next.pools.get(name).is_some_and(|new| new >= units))
+        && previous.hosts.iter().all(|(name, host)| {
+            next.hosts.get(name).is_some_and(|new| {
+                new.slots == host.slots
+                    && new.runner_ids == host.runner_ids
+                    && host.pools.iter().all(|(pool, units)| {
+                        new.pools.get(pool).is_some_and(|value| value >= units)
+                    })
+            })
+        })
+}
+
 fn validate_capacity(capacity: &Capacity) -> Result<(), SchedulerError> {
     if capacity.pools.is_empty()
         || capacity.hosts.is_empty()
@@ -2570,15 +2747,19 @@ fn read_conflict_release(conn: &Connection, id: &str) -> Result<bool, SchedulerE
     ).optional()?;
     let (plan, state, run, source, recovered, direct, workflow) =
         row.ok_or(SchedulerError::Corrupt)?;
-    let (batch_body, topology): (String, String) = conn.query_row(
-        "SELECT b.body,t.body FROM dispatch_batches x JOIN batches b ON b.id=x.batch_id CROSS JOIN capacity_release_topology t WHERE x.id=?1 AND t.id=1", [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+    let batch_body: String = conn.query_row(
+        "SELECT b.body FROM dispatch_batches x JOIN batches b ON b.id=x.batch_id WHERE x.id=?1",
+        [id],
+        |r| r.get(0),
     )?;
     let batch: crate::batch::Batch = serde_json::from_str(&batch_body)?;
-    if batch.id != id
-        || !matches!(batch.state, crate::batch::State::Invalidated { .. })
-        || serde_json::from_str::<Capacity>(&topology)? != evidence.capacity
-    {
+    let topology = serde_json::to_string(&evidence.capacity)?;
+    let known: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capacity_release_topology_history WHERE body=?1)",
+        [&topology],
+        |r| r.get(0),
+    )?;
+    if batch.id != id || !matches!(batch.state, crate::batch::State::Invalidated { .. }) || !known {
         return Err(SchedulerError::Corrupt);
     }
     let finished: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM capacity_finished WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM capacity_reservations WHERE id=?1)", [id], |r| r.get(0))?;
@@ -2690,6 +2871,10 @@ fn finish_bounded_reservation(
     if locked != encoded {
         return Err(SchedulerError::ConfigChanged);
     }
+    tx.execute(
+        "INSERT OR IGNORE INTO capacity_release_topology_history(body) VALUES(?1)",
+        [encoded],
+    )?;
     if tx.execute("DELETE FROM capacity_reservations WHERE id=?1", [id])? != 1 {
         return Err(SchedulerError::Corrupt);
     }

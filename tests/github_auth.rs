@@ -2598,9 +2598,49 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             .unwrap(),
         1
     );
+    // Upgrade a database made before topology history was introduced.
+    let legacy_capacity_db = rusqlite::Connection::open(&worker_db).unwrap();
+    legacy_capacity_db
+        .execute("DROP TABLE capacity_release_topology_history", [])
+        .unwrap();
+    drop(legacy_capacity_db);
     let worker_scheduler = sluss::scheduler::Scheduler::open(&worker_db, one_host.clone()).unwrap();
     assert!(worker_scheduler.conflict_release_recorded(id).unwrap());
     assert!(worker_scheduler.pending_dispatches().unwrap().is_empty());
+    // A topology expansion retains independently recorded historical conflict
+    // evidence under its original release envelope, including after restart.
+    let migration_store = Store::open(&worker_db).unwrap();
+    migration_store.set_paused(true).unwrap();
+    let capacity_digest = sluss::scheduler::Scheduler::capacity_digest(&worker_db)
+        .unwrap()
+        .unwrap();
+    let new_capacity = data.path().join("expanded-capacity.toml");
+    std::fs::write(&new_capacity, "[pools]\nrust=2\n[hosts.sluss-host-test]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-test.pools]\nrust=1\n[hosts.sluss-host-new]\nslots=1\nrunner_ids=[2]\n[hosts.sluss-host-new.pools]\nrust=1\n").unwrap();
+    let migration = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&worker_db)
+        .args([
+            "migrate-capacity",
+            "--expected-digest",
+            &capacity_digest,
+            "--config",
+        ])
+        .arg(&config)
+        .arg("--capacity")
+        .arg(&new_capacity)
+        .output()
+        .unwrap();
+    assert!(
+        migration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migration.stderr)
+    );
+    assert!(worker_scheduler.conflict_release_recorded(id).unwrap());
+    let expanded: sluss::scheduler::Capacity =
+        toml::from_str(&std::fs::read_to_string(&new_capacity).unwrap()).unwrap();
+    let expanded_scheduler = sluss::scheduler::Scheduler::open(&worker_db, expanded).unwrap();
+    assert!(expanded_scheduler.conflict_release_recorded(id).unwrap());
+    assert!(migration_store.paused().unwrap());
     let mut competitor = sluss::scheduler::Scheduler::open(&conflict_db, one_host.clone()).unwrap();
     let (a, b) = tokio::join!(
         fixture_app.resolve_dispatch_conflict(
