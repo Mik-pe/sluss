@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Receive authenticated GitHub webhook notifications (no worker yet).
+    /// Receive authenticated webhooks and optionally observe GitHub.
     Serve {
         /// Listen address; expose externally only behind a trusted HTTPS proxy.
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -29,6 +29,32 @@ enum Command {
     },
     /// Reconcile one pending repository wakeup (CI dispatch remains disabled).
     Reconcile(ReconcileArgs),
+    /// Freeze a batch from reconciled observations for local experimentation.
+    Plan {
+        #[arg(long)]
+        id: String,
+        /// Full SHA of an independently observed target commit.
+        #[arg(long)]
+        base_sha: String,
+        #[arg(long, default_value_t = 4)]
+        max_batch_size: usize,
+        #[arg(long, default_value_t = 1)]
+        max_active_batches: usize,
+        #[arg(long, default_value_t = 60)]
+        debounce_seconds: u64,
+    },
+    /// Build and publish an experimental staging ref to a local repository.
+    PrepareLocal {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        staging_remote: PathBuf,
+        /// Tracked files whose contents must match the frozen base.
+        #[arg(long, required = true)]
+        policy_file: Vec<String>,
+    },
     /// Show local queue state and implementation status.
     Status,
     /// Show reconciled PR observations.
@@ -147,6 +173,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Serve { .. } => unreachable!(),
         Command::Reconcile(_) => unreachable!(),
+        Command::Plan {
+            id,
+            base_sha,
+            max_batch_size,
+            max_active_batches,
+            debounce_seconds,
+        } => {
+            let mut store = store;
+            match store.plan_batch_debounced(
+                &id,
+                &base_sha,
+                max_batch_size,
+                max_active_batches,
+                std::time::Duration::from_secs(debounce_seconds),
+            )? {
+                Some(batch) => {
+                    println!("planned {} on {}", batch.id, batch.base_sha);
+                    for candidate in batch.candidates {
+                        println!("#{} {}", candidate.number, candidate.head_sha);
+                    }
+                }
+                None => println!(
+                    "no batch ready (paused, pending reconciliation, debounce, or capacity)"
+                ),
+            }
+        }
+        Command::PrepareLocal {
+            batch_id,
+            source,
+            staging_remote,
+            policy_file,
+        } => {
+            let mut store = store;
+            let result = sluss::coordinator::prepare_local(
+                &mut store,
+                &batch_id,
+                &source,
+                &staging_remote,
+                &policy_file,
+            )?;
+            println!(
+                "staged {} at {} (policy {})",
+                result.sha, result.reference, result.policy_digest
+            );
+            println!("CI and landing are not authorized by this result");
+        }
         Command::Status => println!(
             "paused: {}\nqueued observations: {}\nCI dispatch: unavailable\nlanding: disabled",
             store.paused()?,

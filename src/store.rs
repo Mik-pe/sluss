@@ -26,6 +26,8 @@ pub enum StoreError {
     InvalidBatch,
     #[error("queue has not been bound by provider reconciliation")]
     Unbound,
+    #[error("batch is paused, stale, or awaiting reconciliation")]
+    StaleBatch,
     #[error("system clock is outside the supported range")]
     Clock,
 }
@@ -59,6 +61,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS candidate_evidence (number INTEGER PRIMARY KEY, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
+            CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
                 id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
             );",
@@ -557,6 +560,100 @@ impl Store {
             .transpose()
     }
 
+    /// Begin or resume a frozen integration after checking the queue atomically.
+    pub fn start_integration(&mut self, id: &str) -> Result<Batch, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (mut batch, version) = checked_batch(&tx, id)?;
+        match batch.state {
+            State::Planned => {
+                batch.begin_build().map_err(|_| StoreError::InvalidBatch)?;
+                tx.execute(
+                    "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
+                    params![serde_json::to_string(&batch)?, id, version],
+                )?;
+            }
+            State::Building | State::Testing { .. } => {}
+            _ => return Err(StoreError::InvalidBatch),
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+    /// Record a deterministic integration failure only if the batch is still current.
+    pub fn fail_integration(&mut self, id: &str, reason: &str) -> Result<Batch, StoreError> {
+        if reason.is_empty() {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (mut batch, version) = checked_batch(&tx, id)?;
+        if batch.state != State::Building {
+            return Err(StoreError::InvalidBatch);
+        }
+        batch
+            .fail(reason.into())
+            .map_err(|_| StoreError::InvalidBatch)?;
+        tx.execute(
+            "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
+            params![serde_json::to_string(&batch)?, id, version],
+        )?;
+        tx.commit()?;
+        Ok(batch)
+    }
+    /// Record the exact staged commit and policy digest atomically. Repeated
+    /// completion is accepted only when both values match the frozen record.
+    pub fn finish_integration(
+        &mut self,
+        id: &str,
+        sha: &str,
+        policy_digest: &str,
+    ) -> Result<Batch, StoreError> {
+        let valid = |s: &str, n: usize| {
+            s.len() == n
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !valid(sha, 40) || !valid(policy_digest, 64) {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (mut batch, version) = checked_batch(&tx, id)?;
+        match &batch.state {
+            State::Building => {
+                batch
+                    .begin_testing(sha.into())
+                    .map_err(|_| StoreError::InvalidBatch)?;
+                tx.execute(
+                    "INSERT INTO batch_policy(batch_id,digest) VALUES(?1,?2)",
+                    params![id, policy_digest],
+                )?;
+                tx.execute(
+                    "UPDATE batches SET body=?1,version=version+1 WHERE id=?2 AND version=?3",
+                    params![serde_json::to_string(&batch)?, id, version],
+                )?;
+            }
+            State::Testing { integration_sha } if integration_sha == sha => {
+                let saved: Option<String> = tx
+                    .query_row(
+                        "SELECT digest FROM batch_policy WHERE batch_id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if saved.as_deref() != Some(policy_digest) {
+                    return Err(StoreError::StaleBatch);
+                }
+            }
+            _ => return Err(StoreError::InvalidBatch),
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+
     /// Optimistic concurrency prevents a stale worker from overwriting a newer state.
     pub fn update_batch(&mut self, batch: &Batch, version: i64) -> Result<(), StoreError> {
         let tx = self
@@ -653,4 +750,66 @@ fn now_ms() -> Result<i64, StoreError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| StoreError::Clock)?;
     i64::try_from(elapsed.as_millis()).map_err(|_| StoreError::Clock)
+}
+
+fn checked_batch(tx: &Transaction<'_>, id: &str) -> Result<(Batch, i64), StoreError> {
+    let binding: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT installation,repository FROM repository_binding WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (installation, repository) = binding.ok_or(StoreError::Unbound)?;
+    let paused: bool = tx.query_row(
+        "SELECT value != 0 FROM settings WHERE key='paused'",
+        [],
+        |r| r.get(0),
+    )?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM reconciliations WHERE installation=?1 AND repository=?2)",
+        params![installation, repository],
+        |r| r.get(0),
+    )?;
+    if paused || pending {
+        return Err(StoreError::StaleBatch);
+    }
+    let (body, version): (String, i64) = tx
+        .query_row("SELECT body,version FROM batches WHERE id=?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .ok_or(StoreError::InvalidBatch)?;
+    let batch: Batch = serde_json::from_str(&body)?;
+    if batch.id != id {
+        return Err(StoreError::InvalidBatch);
+    }
+    for candidate in &batch.candidates {
+        let number = i64::try_from(candidate.number).map_err(|_| StoreError::StaleBatch)?;
+        let head: Option<String> = tx
+            .query_row(
+                "SELECT head_sha FROM candidates WHERE number=?1",
+                [number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT digest FROM candidate_evidence WHERE number=?1",
+                [number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let frozen: Option<String> = tx
+            .query_row(
+                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                params![id, number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if head.as_deref() != Some(&candidate.head_sha) || current.is_none() || current != frozen {
+            return Err(StoreError::StaleBatch);
+        }
+    }
+    Ok((batch, version))
 }

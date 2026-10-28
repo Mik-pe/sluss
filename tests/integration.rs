@@ -305,3 +305,244 @@ fn policy_snapshot_detects_policy_changes_and_rejects_missing_or_invalid_paths()
         Err(PolicyError::Invalid)
     ));
 }
+
+#[test]
+fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
+    use sluss::{
+        batch::{Candidate, State},
+        coordinator::prepare_local,
+        scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError},
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    use std::collections::BTreeMap;
+    let (source, _, _, _) = fixture();
+    std::fs::create_dir_all(source.path().join(".github/workflows")).unwrap();
+    std::fs::write(
+        source.path().join(".github/workflows/ci.yml"),
+        "trusted policy\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "policy"],
+    );
+    let base = git(source.path(), &["rev-parse", "HEAD"]);
+    git(source.path(), &["checkout", "-b", "feature"]);
+    std::fs::write(source.path().join("feature"), "feature\n").unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "feature"],
+    );
+    let head = git(source.path(), &["rev-parse", "HEAD"]);
+    git(source.path(), &["checkout", "main"]);
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    git(
+        source.path(),
+        &["push", remote.path().to_str().unwrap(), "main:main"],
+    );
+    let data = tempfile::tempdir().unwrap();
+    let db = data.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let admission = AdmissionCandidate {
+        candidate: Candidate {
+            number: 1,
+            head_sha: head,
+        },
+        evidence_digest: "f".repeat(64),
+    };
+    store
+        .apply_admission_reconciliation(&event, &"e".repeat(64), &[admission])
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "plan",
+            "--id",
+            id,
+            "--base-sha",
+            &base,
+            "--debounce-seconds",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("planned {id}")));
+    // Simulate an interrupted process after it marked the batch Building.
+    store.start_integration(id).unwrap();
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    let paths = vec![".github/workflows/ci.yml".into()];
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["prepare-local", "--batch-id", id, "--source"])
+        .arg(source.path())
+        .arg("--staging-remote")
+        .arg(remote.path())
+        .args(["--policy-file", ".github/workflows/ci.yml"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CI and landing are not authorized"));
+    let prepared = prepare_local(&mut store, id, source.path(), remote.path(), &paths).unwrap();
+    assert_eq!(
+        git(remote.path(), &["rev-parse", &prepared.reference]),
+        prepared.sha
+    );
+    assert_eq!(git(remote.path(), &["rev-parse", "refs/heads/main"]), base);
+    assert_eq!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Testing {
+            integration_sha: prepared.sha.clone()
+        }
+    );
+    assert_eq!(
+        prepare_local(&mut store, id, source.path(), remote.path(), &paths).unwrap(),
+        prepared
+    );
+    assert!(
+        prepare_local(
+            &mut store,
+            id,
+            source.path(),
+            remote.path(),
+            &["shared".into()]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        git(remote.path(), &["rev-parse", &prepared.reference]),
+        prepared.sha
+    );
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &db,
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "host".into(),
+                Host {
+                    slots: 1,
+                    pools: pools.clone(),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    let request = Request { pools };
+    let mut plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: prepared.sha,
+        staging_ref: prepared.reference,
+        policy_digest: "c".repeat(64),
+    };
+    assert!(matches!(
+        scheduler.reserve_batch_dispatch(id, &request, &plan),
+        Err(SchedulerError::StaleBatch)
+    ));
+    plan.policy_digest = prepared.policy_digest;
+    assert!(
+        scheduler
+            .reserve_batch_dispatch(id, &request, &plan)
+            .unwrap()
+            .is_some()
+    );
+    inbox
+        .record("new-review", "pull_request_review", &[2; 32], 1, 2)
+        .unwrap();
+    assert!(matches!(
+        scheduler.claim_dispatch(id),
+        Err(SchedulerError::StaleBatch)
+    ));
+    assert!(prepare_local(&mut store, id, source.path(), remote.path(), &paths).is_err());
+}
+
+#[test]
+fn integration_conflicts_fail_the_batch_without_creating_staging_refs() {
+    use sluss::{
+        batch::{Candidate, State},
+        coordinator::prepare_local,
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (source, base, _, _) = fixture();
+    let mut heads = Vec::new();
+    for (branch, content) in [("conflict-one", "first\n"), ("conflict-two", "second\n")] {
+        git(source.path(), &["checkout", "-b", branch, &base]);
+        std::fs::write(source.path().join("shared"), content).unwrap();
+        git(source.path(), &["add", "."]);
+        git(
+            source.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-m", branch],
+        );
+        heads.push(git(source.path(), &["rev-parse", "HEAD"]));
+    }
+    git(source.path(), &["checkout", "main"]);
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    let data = tempfile::tempdir().unwrap();
+    let db = data.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let admitted: Vec<_> = heads
+        .into_iter()
+        .enumerate()
+        .map(|(n, head_sha)| AdmissionCandidate {
+            candidate: Candidate {
+                number: n as u64 + 1,
+                head_sha,
+            },
+            evidence_digest: format!("{:064x}", n + 1),
+        })
+        .collect();
+    store
+        .apply_admission_reconciliation(&event, &"e".repeat(64), &admitted)
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store.plan_batch(id, &base, 4, 1).unwrap().unwrap();
+    assert!(
+        prepare_local(
+            &mut store,
+            id,
+            source.path(),
+            remote.path(),
+            &["shared".into()]
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Failed { .. }
+    ));
+    assert_eq!(
+        git(remote.path(), &["for-each-ref", "--format=%(refname)"]),
+        ""
+    );
+    assert_eq!(git(source.path(), &["rev-parse", "main"]), base);
+}

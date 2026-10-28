@@ -23,7 +23,16 @@ To enable the experimental observer, copy [examples/sluss.toml](examples/sluss.t
 
 For development, `sluss reconcile --help` describes a manual, one-shot reconciliation command. It requires `SLUSS_GITHUB_PRIVATE_KEY_PATH` and explicit, operator-controlled App, installation and repository IDs. It reads all open PRs and their reviews, checks reviewer permissions, and atomically updates local queue observations if no newer event arrived. This path has only been tested with a local GitHub stub. A database is bound to one repository and policy; a policy change fails closed and currently requires an explicit migration that is not yet implemented.
 
-The database defaults to `sluss.sqlite` in the current directory; use `--db PATH` to select another. The pause flag and observations survive restarts, but there is no scheduler to pause yet. Queue entries must eventually be reconciled against GitHub; an observation is never an approval.
+For an experimental local Git exercise, reconcile a repository first, then freeze an observed base and prepare an integration in a local bare staging repository:
+
+```sh
+sluss --db sluss.sqlite plan --id batch-0123456789abcdef --base-sha <base-sha> --debounce-seconds 60
+sluss --db sluss.sqlite prepare-local --batch-id batch-0123456789abcdef --source /path/to/source --staging-remote /path/to/staging.git --policy-file .github/workflows/ci.yml
+```
+
+The operator must independently obtain the target base SHA and list every policy file; the source must contain the frozen commit objects. Preparing a batch does not start CI or grant merge permission. The local staging remote must be trusted and must not trigger unintended workloads. This path is for development and has not been validated against a live GitHub App.
+
+The database defaults to `sluss.sqlite` in the current directory; use `--db PATH` to select another. The pause flag and observations survive restarts; pause also stops the experimental batch planner. Queue entries must eventually be reconciled against GitHub; an observation is never an approval.
 
 ## Intended operation
 

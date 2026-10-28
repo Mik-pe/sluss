@@ -651,6 +651,16 @@ fn validate_batch_dispatch(
     {
         return Err(SchedulerError::StaleBatch);
     }
+    let policy: Option<String> = tx
+        .query_row(
+            "SELECT digest FROM batch_policy WHERE batch_id=?1",
+            [batch_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if policy.as_deref() != Some(&plan.policy_digest) {
+        return Err(SchedulerError::StaleBatch);
+    }
     for candidate in batch.candidates {
         let number = i64::try_from(candidate.number).map_err(|_| SchedulerError::StaleBatch)?;
         let head: Option<String> = tx

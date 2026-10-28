@@ -174,14 +174,14 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
     ready_queue(&db);
     let mut store = Store::open(&db).unwrap();
     let id = "batch-0123456789abcdef";
-    let mut batch = store
+    store
         .plan_batch(id, &"a".repeat(40), 2, 1)
         .unwrap()
         .unwrap();
-    batch.begin_build().unwrap();
-    store.update_batch(&batch, 0).unwrap();
-    batch.begin_testing("b".repeat(40)).unwrap();
-    store.update_batch(&batch, 1).unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
     let pools = BTreeMap::from([("rust".into(), 1)]);
     let mut scheduler = Scheduler::open(
         &db,
