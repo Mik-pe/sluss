@@ -848,7 +848,7 @@ impl App {
         repository: &str,
         id: &str,
     ) -> Result<u64, DispatchError> {
-        self.issue_dispatch_inner(scheduler, token, owner, repository, id, None)
+        self.issue_dispatch_inner(scheduler, (token, None), owner, repository, id, None)
             .await
     }
 
@@ -857,7 +857,7 @@ impl App {
     pub async fn issue_batch_dispatch(
         &self,
         scheduler: &mut crate::scheduler::Scheduler,
-        token: &InstallationToken,
+        tokens: (&InstallationToken, &InstallationToken),
         owner: &str,
         repository: &str,
         id: &str,
@@ -866,20 +866,28 @@ impl App {
         if !commit_sha(target_base.1) {
             return Err(DispatchError::Invalid);
         }
-        self.issue_dispatch_inner(scheduler, token, owner, repository, id, Some(target_base))
-            .await
+        self.issue_dispatch_inner(
+            scheduler,
+            (tokens.0, Some(tokens.1)),
+            owner,
+            repository,
+            id,
+            Some(target_base),
+        )
+        .await
     }
 
     async fn issue_dispatch_inner(
         &self,
         scheduler: &mut crate::scheduler::Scheduler,
-        token: &InstallationToken,
+        tokens: (&InstallationToken, Option<&InstallationToken>),
         owner: &str,
         repository: &str,
         id: &str,
         target_base: Option<(&str, &str)>,
     ) -> Result<u64, DispatchError> {
         use crate::scheduler::DispatchState;
+        let (token, security_token) = tokens;
         if !token.actions_write || !valid_name(owner) || !valid_name(repository) {
             return Err(DispatchError::Invalid);
         }
@@ -951,6 +959,36 @@ impl App {
                     None
                 }
             };
+            let security = if let Some(security_token) = security_token {
+                if security_token.repository_id != token.repository_id
+                    || security_token.installation_id != token.installation_id
+                {
+                    return Err(DispatchError::Invalid);
+                }
+                match self
+                    .observe_branch_security(security_token, owner, repository, target)
+                    .await
+                {
+                    Ok(security)
+                        if security.branch.commit.sha == base
+                            && rules.as_ref() == Some(&security.rules)
+                            && security.digest().is_ok() =>
+                    {
+                        Some(security)
+                    }
+                    Ok(security) if security.branch.commit.sha != base => {
+                        return Err(DispatchError::StaleBase);
+                    }
+                    _ => {
+                        eprintln!(
+                            "complete branch protection details unavailable; this dispatch remains CI-only"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             if self
                 .observe_target_branch(token, owner, repository, target)
                 .await?
@@ -960,7 +998,9 @@ impl App {
             {
                 return Err(DispatchError::StaleBase);
             }
-            if let Some(rules) = rules {
+            if let Some(security) = security {
+                scheduler.claim_batch_dispatch_with_security(id, &workflow.path, &security)?
+            } else if let Some(rules) = rules {
                 scheduler.claim_batch_dispatch_with_rules(id, &workflow.path, &rules)?
             } else {
                 scheduler.claim_batch_dispatch(id, &workflow.path)?
@@ -1150,6 +1190,7 @@ impl App {
         &self,
         journal: &mut crate::landing::LandingJournal,
         token: &InstallationToken,
+        security_token: &InstallationToken,
         policy: &crate::reconcile::RepositoryPolicy,
         operation_id: &str,
     ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
@@ -1164,6 +1205,11 @@ impl App {
             || !valid_name(repository)
             || token.app_client_id != self.client_id
             || token.api_origin != self.api.as_str()
+            || !security_token.runner_inventory_read
+            || security_token.app_client_id != self.client_id
+            || security_token.api_origin != self.api.as_str()
+            || security_token.repository_id != token.repository_id
+            || security_token.installation_id != token.installation_id
         {
             return Err(LandingRefreshError::Scope);
         }
@@ -1196,6 +1242,15 @@ impl App {
             .observe_branch_rules(token, owner, repository, &policy.target_branch)
             .await?;
         if Some(rules.digest()?) != plan.branch_rules_digest {
+            return Err(LandingRefreshError::Changed);
+        }
+        let security = self
+            .observe_branch_security(security_token, owner, repository, &policy.target_branch)
+            .await?;
+        if security.branch != base
+            || security.rules != rules
+            || Some(security.digest()?) != plan.branch_security_digest
+        {
             return Err(LandingRefreshError::Changed);
         }
         let short_ref = plan
@@ -1245,6 +1300,9 @@ impl App {
         let last_rules = self
             .observe_branch_rules(token, owner, repository, &policy.target_branch)
             .await?;
+        let last_security = self
+            .observe_branch_security(security_token, owner, repository, &policy.target_branch)
+            .await?;
         let last_base = self
             .observe_target_branch(token, owner, repository, &policy.target_branch)
             .await?;
@@ -1255,6 +1313,7 @@ impl App {
             || last.run_attempt != 1
             || last_base != base
             || last_rules != rules
+            || last_security != security
             || last_stage.reference != plan.staging_ref
             || last_stage.object.kind != "commit"
             || last_stage.object.sha != plan.staged_sha
@@ -1466,13 +1525,13 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BranchInfo {
     pub name: String,
     pub protected: bool,
     pub commit: BranchCommit,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BranchCommit {
     pub sha: String,
 }
@@ -1508,24 +1567,130 @@ pub struct RepositoryPreflight {
 }
 
 /// A 403/404 is deliberately not classified as absence of protection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtectionObservation {
     Present(serde_json::Value),
     Unavailable(u16),
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RulesetSecurityObservation {
     pub id: u64,
     pub detail: serde_json::Value,
     /// False means GitHub omitted or withheld the bypass list.
     pub bypass_visible: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchSecurityObservation {
     pub branch: BranchInfo,
     pub rules: BranchRulesSnapshot,
     pub protection: ProtectionObservation,
     pub rulesets: Vec<RulesetSecurityObservation>,
+}
+impl BranchSecurityObservation {
+    /// Hash only a complete visible observation. This does not establish
+    /// that the visible permissions or bypass actors are safe for landing.
+    pub fn digest(&self) -> Result<String, GitHubError> {
+        use sha2::{Digest, Sha256};
+        self.rules.digest()?;
+        if !self.branch.protected
+            || self.branch.name != self.rules.branch
+            || !commit_sha(&self.branch.commit.sha)
+            || !matches!(&self.protection, ProtectionObservation::Present(value) if valid_legacy_protection(value))
+            || self.rulesets.len() > 100
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for ruleset in &self.rulesets {
+            let detail = &ruleset.detail;
+            let actors = detail
+                .get("bypass_actors")
+                .and_then(|value| value.as_array())
+                .ok_or(GitHubError::UnstableObservation)?;
+            if ruleset.id == 0
+                || !ids.insert(ruleset.id)
+                || !ruleset.bypass_visible
+                || detail.get("id").and_then(|v| v.as_u64()) != Some(ruleset.id)
+                || detail.get("target").and_then(|v| v.as_str()) != Some("branch")
+                || detail.get("enforcement").and_then(|v| v.as_str()) != Some("active")
+                || detail.get("rules").and_then(|v| v.as_array()).is_none()
+                || actors.iter().any(|actor| !valid_bypass_actor(actor))
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        let mut expected_ids = std::collections::BTreeSet::new();
+        for rule in &self.rules.rules {
+            let id = rule
+                .get("ruleset_id")
+                .and_then(|value| value.as_u64())
+                .filter(|id| *id > 0)
+                .ok_or(GitHubError::UnstableObservation)?;
+            expected_ids.insert(id);
+            let detail = &self
+                .rulesets
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or(GitHubError::UnstableObservation)?
+                .detail;
+            let src = rule
+                .get("ruleset_source")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let dst = detail
+                .get("source")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let kind = rule
+                .get("ruleset_source_type")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if src.zip(dst).is_none_or(|(a, b)| !a.eq_ignore_ascii_case(b))
+                || kind.is_none()
+                || kind != detail.get("source_type").and_then(|v| v.as_str())
+                || !detail["rules"].as_array().is_some_and(|list| {
+                    list.iter().any(|entry| {
+                        entry.get("type") == rule.get("type")
+                            && entry.get("parameters") == rule.get("parameters")
+                    })
+                })
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        if ids != expected_ids {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let body = serde_json::to_vec(self).map_err(|_| GitHubError::UnstableObservation)?;
+        if body.len() > 1024 * 1024 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"sluss-branch-security-v1\0");
+        hash.update(body);
+        Ok(hex::encode(hash.finalize()))
+    }
+}
+fn valid_legacy_protection(value: &serde_json::Value) -> bool {
+    [
+        "/enforce_admins/enabled",
+        "/allow_force_pushes/enabled",
+        "/allow_deletions/enabled",
+        "/required_linear_history/enabled",
+    ]
+    .iter()
+    .all(|path| value.pointer(path).and_then(|v| v.as_bool()).is_some())
+        && [
+            "required_status_checks",
+            "required_pull_request_reviews",
+            "restrictions",
+        ]
+        .iter()
+        .all(|key| {
+            value
+                .get(key)
+                .is_some_and(|field| field.is_null() || field.is_object())
+        })
 }
 fn valid_bypass_actor(actor: &serde_json::Value) -> bool {
     let kind = actor.get("actor_type").and_then(|v| v.as_str());

@@ -90,13 +90,14 @@ fn setup() -> Fixture {
         .unwrap();
     assert!(
         scheduler
-            .claim_batch_dispatch_with_rules(
+            .claim_batch_dispatch_with_security(
                 BATCH,
                 ".github/workflows/ci.yml",
-                &sluss::github::BranchRulesSnapshot {
-                    repository_id: 2,
-                    branch: "main".into(),
-                    rules: vec![serde_json::json!({"type":"pull_request","ruleset_id":1})]
+                &sluss::github::BranchSecurityObservation {
+                    branch: sluss::github::BranchInfo { name:"main".into(),protected:true,commit:sluss::github::BranchCommit {sha:"a".repeat(40)} },
+                    rules:sluss::github::BranchRulesSnapshot { repository_id: 2, branch:"main".into(), rules:vec![serde_json::json!({"type":"pull_request","ruleset_id":1,"ruleset_source_type":"Repository","ruleset_source":"owner/repo"})] },
+                    protection:sluss::github::ProtectionObservation::Present(serde_json::json!({"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false},"required_linear_history":{"enabled":false},"required_status_checks":null,"required_pull_request_reviews":null,"restrictions":null})),
+                    rulesets:vec![sluss::github::RulesetSecurityObservation {id:1, bypass_visible:true, detail:serde_json::json!({"id":1,"target":"branch","enforcement":"active","source_type":"Repository","source":"owner/repo","rules":[{"type":"pull_request"}],"bypass_actors":[]})}],
                 }
             )
             .unwrap()
@@ -226,6 +227,7 @@ fn missing_receipt_or_frozen_workflow_and_failed_ci_cannot_prepare() {
         "DELETE FROM dispatch_receipt_sources",
         "DELETE FROM dispatch_workflows",
         "DELETE FROM dispatch_branch_rules",
+        "DELETE FROM dispatch_branch_security",
         "UPDATE ci_observations SET body=json_set(body,'$.observation',json('{\"Failed\":{\"conclusion\":\"failure\"}}'))",
     ] {
         let mut f = setup();
@@ -307,4 +309,78 @@ fn changed_policy_file_list_after_freeze_does_not_claim() {
         f.journal.get("land-one").unwrap().unwrap().1,
         IntentState::Prepared
     );
+}
+
+#[test]
+fn changed_detailed_protection_cannot_claim() {
+    let mut f = setup();
+    prepare(&mut f);
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM dispatch_branch_security WHERE id=?1",
+            [BATCH],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut security: sluss::github::BranchSecurityObservation =
+        serde_json::from_str(&body).unwrap();
+    match &mut security.protection {
+        sluss::github::ProtectionObservation::Present(value) => {
+            value["allow_force_pushes"]["enabled"] = serde_json::json!(true)
+        }
+        _ => panic!("expected visible protection"),
+    }
+    conn.execute(
+        "UPDATE dispatch_branch_security SET body=?1,digest=?2 WHERE id=?3",
+        rusqlite::params![
+            serde_json::to_string(&security).unwrap(),
+            security.digest().unwrap(),
+            BATCH
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        f.journal.claim_observed_batch("land-one"),
+        Err(LandingError::StaleBatch)
+    ));
+    assert_eq!(
+        f.journal.get("land-one").unwrap().unwrap().1,
+        IntentState::Prepared
+    );
+}
+
+#[test]
+fn hidden_or_incomplete_protection_is_not_a_complete_snapshot() {
+    let f = setup();
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM dispatch_branch_security WHERE id=?1",
+            [BATCH],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let security: sluss::github::BranchSecurityObservation = serde_json::from_str(&body).unwrap();
+    let mut hidden = security.clone();
+    hidden.rulesets[0].bypass_visible = false;
+    hidden.rulesets[0]
+        .detail
+        .as_object_mut()
+        .unwrap()
+        .remove("bypass_actors");
+    assert!(hidden.digest().is_err());
+    let mut unavailable = security.clone();
+    unavailable.protection = sluss::github::ProtectionObservation::Unavailable(404);
+    assert!(unavailable.digest().is_err());
+    let mut malformed = security.clone();
+    if let sluss::github::ProtectionObservation::Present(value) = &mut malformed.protection {
+        value["restrictions"] = serde_json::json!("not an object");
+    }
+    assert!(malformed.digest().is_err());
+    let mut incomplete = security;
+    if let sluss::github::ProtectionObservation::Present(value) = &mut incomplete.protection {
+        value.as_object_mut().unwrap().remove("restrictions");
+    }
+    assert!(incomplete.digest().is_err());
 }

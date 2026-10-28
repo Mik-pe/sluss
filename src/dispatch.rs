@@ -178,7 +178,7 @@ pub async fn batch(
     match app
         .issue_batch_dispatch(
             &mut scheduler,
-            &token,
+            (&token, &inventory_token),
             &policy.owner,
             &policy.name,
             batch_id,

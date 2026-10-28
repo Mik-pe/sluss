@@ -320,7 +320,9 @@ async fn doctor_protection(
     }
     (
         StatusCode::OK,
-        Json(json!({"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false}})),
+        Json(
+            json!({"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":state.mode.load(Ordering::SeqCst) == 76},"allow_deletions":{"enabled":false},"required_linear_history":{"enabled":false},"required_status_checks":null,"required_pull_request_reviews":null,"restrictions":null}),
+        ),
     )
 }
 async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
@@ -339,6 +341,9 @@ async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) ->
     }
     if mode == 73 {
         body["bypass_actors"] = json!([]);
+    }
+    if mode == 77 {
+        body["bypass_actors"][0]["actor_id"] = json!(18);
     }
     Json(body)
 }
@@ -1785,6 +1790,65 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(report.contains("(1 intervals)"));
     assert!(report.contains("observed runner-minutes: 0.00"));
     posts.store(0, Ordering::SeqCst);
+    // A readable branch-rules list with a withheld bypass list may still
+    // schedule CI, but must never become a complete landing observation.
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let hidden_db = data.path().join("hidden-bypass.sqlite");
+    let mut hidden_inbox = Inbox::open(&hidden_db).unwrap();
+    let mut hidden_store = Store::open(&hidden_db).unwrap();
+    hidden_inbox
+        .record("hidden", "pull_request", &[9; 32], 42, 7)
+        .unwrap();
+    let hidden_event = hidden_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut hidden_store,
+        &hidden_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    hidden_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    hidden_store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    hidden_store.start_integration(id).unwrap();
+    hidden_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    let one_host: sluss::scheduler::Capacity =
+        toml::from_str(&std::fs::read_to_string(&capacity).unwrap()).unwrap();
+    mode.store(67, Ordering::SeqCst);
+    assert!(matches!(
+        sluss::dispatch::batch(
+            &hidden_db,
+            &fixture_app,
+            &fixture_policy,
+            &one_host,
+            &settings,
+            id
+        )
+        .await
+        .unwrap(),
+        sluss::dispatch::Outcome::Sent { run: 123, .. }
+    ));
+    let hidden_conn = rusqlite::Connection::open(&hidden_db).unwrap();
+    let (has_rules,has_security):(bool,bool) = hidden_conn.query_row("SELECT EXISTS(SELECT 1 FROM dispatch_branch_rules WHERE id=?1), EXISTS(SELECT 1 FROM dispatch_branch_security WHERE id=?1)",[id],|r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert!(has_rules && !has_security);
+    sluss::worker::observe_dispatches_once(&fixture_app, &hidden_db, &one_host, &fixture_policy)
+        .await
+        .unwrap();
+    let mut hidden_journal = sluss::landing::LandingJournal::open(&hidden_db).unwrap();
+    assert!(matches!(
+        hidden_journal.prepare_observed_batch("hidden-land", id, "R_repo"),
+        Err(sluss::landing::LandingError::StaleBatch)
+    ));
+    posts.store(0, Ordering::SeqCst);
     // A previously prepared intent is pinned to a now-busy host. A second
     // batch must still reach the other idle host, without resending the first.
     mode.store(46, Ordering::SeqCst);
@@ -2211,7 +2275,9 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let frozen_landing = landing
         .prepare_observed_batch("land-refresh", id, "R_repo")
         .unwrap();
-    for invalid in [5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65] {
+    for invalid in [
+        5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77,
+    ] {
         reads.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
         assert!(
@@ -2219,6 +2285,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 .refresh_and_claim_observed_landing(
                     &mut landing,
                     &fixture_token,
+                    &security_token,
                     &observer_policy,
                     "land-refresh"
                 )
@@ -2239,6 +2306,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             .refresh_and_claim_observed_landing(
                 &mut landing,
                 &fixture_token,
+                &security_token,
                 &changed_policy,
                 "land-refresh"
             )
@@ -2250,6 +2318,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             .refresh_and_claim_observed_landing(
                 &mut landing,
                 &fixture_token,
+                &security_token,
                 &observer_policy,
                 "land-refresh"
             )

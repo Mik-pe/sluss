@@ -94,6 +94,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_branch_rules (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_branch_security (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
@@ -585,7 +586,7 @@ impl Scheduler {
         id: &str,
         workflow_path: &str,
     ) -> Result<bool, SchedulerError> {
-        self.claim_batch_dispatch_inner(id, workflow_path, None)
+        self.claim_batch_dispatch_inner(id, workflow_path, None, None)
     }
     /// Freeze provider-visible branch rules with the dispatch claim. The
     /// caller must obtain authentic observations; these do not prove bypass.
@@ -595,13 +596,24 @@ impl Scheduler {
         workflow_path: &str,
         rules: &crate::github::BranchRulesSnapshot,
     ) -> Result<bool, SchedulerError> {
-        self.claim_batch_dispatch_inner(id, workflow_path, Some(rules))
+        self.claim_batch_dispatch_inner(id, workflow_path, Some(rules), None)
+    }
+    /// Freeze detailed visible protection with the claim. This is observation,
+    /// not an evaluation of whether the listed bypass actors are acceptable.
+    pub fn claim_batch_dispatch_with_security(
+        &mut self,
+        id: &str,
+        workflow_path: &str,
+        security: &crate::github::BranchSecurityObservation,
+    ) -> Result<bool, SchedulerError> {
+        self.claim_batch_dispatch_inner(id, workflow_path, Some(&security.rules), Some(security))
     }
     fn claim_batch_dispatch_inner(
         &mut self,
         id: &str,
         workflow_path: &str,
         rules: Option<&crate::github::BranchRulesSnapshot>,
+        security: Option<&crate::github::BranchSecurityObservation>,
     ) -> Result<bool, SchedulerError> {
         if !crate::github::valid_workflow_path(workflow_path) {
             return Err(SchedulerError::WorkflowPolicyMismatch);
@@ -636,6 +648,23 @@ impl Scheduler {
             tx.execute(
                 "INSERT INTO dispatch_branch_rules(id,body,digest) VALUES(?1,?2,?3)",
                 params![id, serde_json::to_string(rules)?, digest],
+            )?;
+        }
+        if let Some(security) = security {
+            let body: String =
+                tx.query_row("SELECT body FROM batches WHERE id=?1", [&batch], |r| {
+                    r.get(0)
+                })?;
+            let frozen: crate::batch::Batch = serde_json::from_str(&body)?;
+            if security.rules.repository_id != plan.repository_id
+                || security.branch.commit.sha != frozen.base_sha
+            {
+                return Err(SchedulerError::StaleBatch);
+            }
+            let digest = security.digest().map_err(|_| SchedulerError::StaleBatch)?;
+            tx.execute(
+                "INSERT INTO dispatch_branch_security(id,body,digest) VALUES(?1,?2,?3)",
+                params![id, serde_json::to_string(security)?, digest],
             )?;
         }
         let paths: Option<String> = tx

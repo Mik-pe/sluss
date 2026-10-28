@@ -16,6 +16,7 @@ fn plan(id: &str) -> LandingPlan {
         admission_digest: "d".repeat(64),
         ci_evidence_digest: "e".repeat(64),
         branch_rules_digest: None,
+        branch_security_digest: None,
     }
 }
 fn ack(id: &str) -> Vec<u8> {
