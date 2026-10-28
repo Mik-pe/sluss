@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sluss::store::Store;
 
 #[derive(Parser)]
@@ -269,6 +269,18 @@ enum Command {
         #[arg(long, required = true)]
         policy_file: Vec<String>,
     },
+    /// Prepare a GitHub App registration link; no App is created by this command.
+    AppRegistrationUrl {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        organization: Option<String>,
+        #[arg(long, value_enum, default_value = "observe")]
+        profile: AppProfile,
+        /// Public HTTPS endpoint for /webhook; omit to start with polling only.
+        #[arg(long)]
+        webhook_url: Option<String>,
+    },
     /// Show runner time for completed jobs observed by Sluss.
     Metrics,
     /// Compare two operator-collected cohorts of jobs and delivered PRs.
@@ -315,9 +327,47 @@ struct ReconcileArgs {
     api: String,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum AppProfile {
+    Observe,
+    Ci,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::AppRegistrationUrl {
+        name,
+        organization,
+        profile,
+        webhook_url,
+    } = &cli.command
+    {
+        let profile = match profile {
+            AppProfile::Observe => sluss::setup::RegistrationProfile::Observe,
+            AppProfile::Ci => sluss::setup::RegistrationProfile::Ci,
+        };
+        let url = sluss::setup::registration_url(
+            name,
+            organization.as_deref(),
+            profile,
+            webhook_url.as_deref(),
+        )?;
+        println!("{url}");
+        println!(
+            "Review and submit the registration on GitHub. This command creates no App or installation."
+        );
+        if webhook_url.is_some() {
+            println!(
+                "Set the webhook secret separately in GitHub; it is not included in this URL."
+            );
+        } else {
+            println!(
+                "Webhooks are disabled; configure and subscribe them later or use periodic polling."
+            );
+        }
+        return Ok(());
+    }
     if let Command::PreviewTrustedBatch {
         batch_id,
         config,
@@ -1361,6 +1411,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::PolicyDigest { .. } => {
             unreachable!("policy digest is handled before opening the database")
+        }
+        Command::AppRegistrationUrl { .. } => {
+            unreachable!("App registration URL is handled before opening the database")
         }
         Command::Queue => {
             let failed: std::collections::BTreeMap<_, _> = store

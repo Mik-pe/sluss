@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod reconcile;
 pub mod scheduler;
 pub mod selective;
+pub mod setup;
 pub mod store;
 pub mod verification;
 pub mod webhook;
