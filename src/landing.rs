@@ -2133,7 +2133,12 @@ fn observed_plan(
         || policy.as_deref() != Some(dispatch.policy_digest.as_str())
         || record.workflow_path.as_deref() != Some(workflow.as_str())
         || !paths.contains(&workflow)
-        || !crate::github::workflow_path_matches(&workflow, &snapshot.run.path)
+        || !crate::github::workflow_path_matches(
+            &workflow,
+            &snapshot.run.path,
+            &dispatch.staging_ref,
+            &dispatch.integration_sha,
+        )
         || run_id.as_deref().and_then(|v| v.parse::<u64>().ok()) != Some(record.run_id)
         || !snapshot.jobs.iter().any(|j| j.runner_id == Some(runner))
         || record.observation != CiObservation::Successful

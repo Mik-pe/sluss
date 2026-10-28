@@ -928,6 +928,14 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
             sluss::verification::CiObservationError::Identity
         ))
     ));
+    let mut wrong_workflow_ref = snapshot.clone();
+    wrong_workflow_ref.run.path = ".github/workflows/ci.yml@refs/heads/main".into();
+    assert!(matches!(
+        scheduler.record_ci_observation(id, &wrong_workflow_ref),
+        Err(SchedulerError::CiObservation(
+            sluss::verification::CiObservationError::Identity
+        ))
+    ));
     assert_eq!(
         scheduler.record_ci_observation(id, &snapshot).unwrap(),
         CiObservation::Successful
@@ -944,6 +952,28 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
             r.get(0)
         })
         .unwrap();
+    let mut old_mismatch: serde_json::Value = serde_json::from_str(&original).unwrap();
+    old_mismatch["snapshot"]["run"]["path"] = ".github/workflows/ci.yml@refs/heads/main".into();
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        rusqlite::params![id, old_mismatch.to_string()],
+    )
+    .unwrap();
+    assert!(matches!(
+        scheduler.complete_ci_only(id),
+        Err(SchedulerError::CiObservation(
+            sluss::verification::CiObservationError::Identity
+        ))
+    ));
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Testing { .. }
+    ));
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        rusqlite::params![id, &original],
+    )
+    .unwrap();
     let mut legacy: serde_json::Value = serde_json::from_str(&original).unwrap();
     legacy.as_object_mut().unwrap().remove("snapshot");
     legacy.as_object_mut().unwrap().remove("runner_id");

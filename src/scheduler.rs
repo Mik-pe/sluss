@@ -1538,10 +1538,14 @@ impl Scheduler {
                 |r| r.get(0),
             )
             .optional()?;
-        if workflow_path
-            .as_deref()
-            .is_some_and(|path| !crate::github::workflow_path_matches(path, &run.path))
-        {
+        if workflow_path.as_deref().is_some_and(|path| {
+            !crate::github::workflow_path_matches(
+                path,
+                &run.path,
+                &plan.staging_ref,
+                &plan.integration_sha,
+            )
+        }) {
             return Err(SchedulerError::DispatchTransition);
         }
         let branch = plan
@@ -1762,7 +1766,12 @@ fn current_failure(
         || !plan.valid()
         || run_id.as_deref().and_then(|s| s.parse::<u64>().ok()) != Some(record.run_id)
         || record.workflow_path.as_deref() != Some(workflow.as_str())
-        || !crate::github::workflow_path_matches(&workflow, &snapshot.run.path)
+        || !crate::github::workflow_path_matches(
+            &workflow,
+            &snapshot.run.path,
+            &plan.staging_ref,
+            &plan.integration_sha,
+        )
         || !record.runner_id.is_some_and(|runner| {
             snapshot
                 .jobs
@@ -2015,10 +2024,14 @@ impl Scheduler {
                 |r| r.get(0),
             )
             .optional()?;
-        if workflow_path
-            .as_deref()
-            .is_some_and(|path| !crate::github::workflow_path_matches(path, &snapshot.run.path))
-        {
+        if workflow_path.as_deref().is_some_and(|path| {
+            !crate::github::workflow_path_matches(
+                path,
+                &snapshot.run.path,
+                &plan.staging_ref,
+                &plan.integration_sha,
+            )
+        }) {
             return Err(CiObservationError::Identity.into());
         }
         let observation = observe_ci(&plan, run_id, snapshot);
@@ -2381,6 +2394,19 @@ impl Scheduler {
         {
             return Err(SchedulerError::DispatchTransition);
         }
+        if let (Some(snapshot), Some(workflow)) =
+            (observation.snapshot.as_ref(), workflow_path.as_deref())
+            && !crate::github::workflow_path_matches(
+                workflow,
+                &snapshot.run.path,
+                &plan.staging_ref,
+                &plan.integration_sha,
+            )
+        {
+            return Err(SchedulerError::CiObservation(
+                crate::verification::CiObservationError::Identity,
+            ));
+        }
         // Re-evaluate snapshots saved by an older version before allowing
         // their summary to advance the CI-only lifecycle. Legacy summaries
         // without snapshots retain their existing, non-attesting behavior.
@@ -2455,8 +2481,23 @@ fn has_job_snapshot(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, Sc
     match body {
         Some(body) => {
             let record: CiObservationRecord = serde_json::from_str(&body)?;
+            let path: Option<String> = tx
+                .query_row(
+                    "SELECT path FROM dispatch_workflows WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
             Ok(record.snapshot.as_ref().is_some_and(|snapshot| {
-                record.runner_id.is_some_and(|runner| {
+                path.as_deref().is_some_and(|workflow| {
+                    record.workflow_path.as_deref() == Some(workflow)
+                        && crate::github::workflow_path_matches(
+                            workflow,
+                            &snapshot.run.path,
+                            &record.plan.staging_ref,
+                            &record.plan.integration_sha,
+                        )
+                }) && record.runner_id.is_some_and(|runner| {
                     snapshot
                         .jobs
                         .iter()

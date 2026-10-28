@@ -1540,6 +1540,39 @@ fn older_contradictory_success_snapshot_cannot_drive_bisection() {
 }
 
 #[test]
+fn older_snapshot_with_a_foreign_workflow_ref_cannot_drive_bisection() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let left = plan(&mut store, 2).unwrap();
+    finish(&mut store, &mut scheduler, &left, 2, "success");
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM ci_observations WHERE id=?1",
+            [&left.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut old: sluss::scheduler::CiObservationRecord = serde_json::from_str(&body).unwrap();
+    old.snapshot.as_mut().unwrap().run.path = ".github/workflows/ci.yml@refs/heads/main".into();
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        [&left.id, &serde_json::to_string(&old).unwrap()],
+    )
+    .unwrap();
+    let right = plan(&mut store, 3).unwrap();
+    finish(&mut store, &mut scheduler, &right, 3, "failure");
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "inconclusive".into()))
+    );
+    assert!(plan(&mut store, 4).is_none());
+}
+
+#[test]
 fn contradictory_completed_run_invalidates_its_pending_investigation() {
     let (dir, mut store, _inbox, mut scheduler) = setup();
     let root = plan(&mut store, 1).unwrap();

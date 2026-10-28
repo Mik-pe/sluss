@@ -881,10 +881,14 @@ impl App {
                     && run.head_sha == pending.plan.integration_sha
                     && run.head_branch.as_deref() == Some(branch)
                     && run.event == "workflow_dispatch"
-                    && intent
-                        .workflow_path
-                        .as_deref()
-                        .is_none_or(|p| workflow_path_matches(p, &run.path))
+                    && intent.workflow_path.as_deref().is_none_or(|p| {
+                        workflow_path_matches(
+                            p,
+                            &run.path,
+                            &pending.plan.staging_ref,
+                            &pending.plan.integration_sha,
+                        )
+                    })
             })
             .collect())
     }
@@ -1577,7 +1581,14 @@ impl App {
         if scheduler
             .dispatch_workflow(id)?
             .as_deref()
-            .is_some_and(|path| !workflow_path_matches(path, &snapshot.run.path))
+            .is_some_and(|path| {
+                !workflow_path_matches(
+                    path,
+                    &snapshot.run.path,
+                    &pending.plan.staging_ref,
+                    &pending.plan.integration_sha,
+                )
+            })
         {
             return Err(DispatchError::RunMismatch);
         }
@@ -1617,7 +1628,14 @@ impl App {
         if scheduler
             .dispatch_workflow(id)?
             .as_deref()
-            .is_some_and(|path| !workflow_path_matches(path, &snapshot.run.path))
+            .is_some_and(|path| {
+                !workflow_path_matches(
+                    path,
+                    &snapshot.run.path,
+                    &pending.plan.staging_ref,
+                    &pending.plan.integration_sha,
+                )
+            })
         {
             return Err(DispatchError::RunMismatch);
         }
@@ -1702,7 +1720,12 @@ impl App {
             .verify_dispatch_run(read, owner, repository, &pending, direct)
             .await?;
         for snapshot in [&first_recovered, &first_direct] {
-            if !workflow_path_matches(&workflow, &snapshot.run.path) {
+            if !workflow_path_matches(
+                &workflow,
+                &snapshot.run.path,
+                &pending.plan.staging_ref,
+                &pending.plan.integration_sha,
+            ) {
                 return Err(DispatchError::RunMismatch);
             }
             if snapshot.run.status != "completed"
@@ -3606,11 +3629,26 @@ pub(crate) fn valid_workflow_path(path: &str) -> bool {
         })
 }
 
-/// GitHub may append an @ref to the workflow path in a run response. The
-/// SHA, repository and head branch are checked separately by the caller.
-pub(crate) fn workflow_path_matches(expected: &str, reported: &str) -> bool {
+/// A reported workflow ref must not contradict the frozen integration.
+/// A path without a suffix has no ref information; the caller must separately
+/// verify run identity and cannot infer workflow trust from that absence.
+pub(crate) fn workflow_path_matches(
+    expected: &str,
+    reported: &str,
+    staging_ref: &str,
+    integration_sha: &str,
+) -> bool {
+    let Some(branch) = staging_ref
+        .strip_prefix("refs/heads/")
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
     match reported.split_once('@') {
-        Some((path, reference)) => path == expected && !reference.is_empty(),
+        Some((path, reference)) => {
+            path == expected
+                && (reference == staging_ref || reference == branch || reference == integration_sha)
+        }
         None => reported == expected,
     }
 }
@@ -4205,7 +4243,14 @@ impl App {
         if scheduler
             .dispatch_workflow(id)?
             .as_deref()
-            .is_some_and(|path| !workflow_path_matches(path, &run.path))
+            .is_some_and(|path| {
+                !workflow_path_matches(
+                    path,
+                    &run.path,
+                    &stale.plan.staging_ref,
+                    &stale.plan.integration_sha,
+                )
+            })
             || run.id != stale.run_id
             || run.run_attempt == 0
             || run.repository.id != stale.plan.repository_id
@@ -4260,5 +4305,42 @@ impl App {
             }
             _ => Ok(StaleCancellation::Uncertain),
         }
+    }
+}
+
+#[cfg(test)]
+mod workflow_path_tests {
+    use super::workflow_path_matches;
+
+    #[test]
+    fn workflow_suffix_must_match_the_frozen_branch_or_commit() {
+        let file = ".github/workflows/ci.yml";
+        let branch = "refs/heads/sluss/batch-123";
+        let sha = "a".repeat(40);
+        for path in [
+            file.to_string(),
+            format!("{file}@{branch}"),
+            format!("{file}@sluss/batch-123"),
+            format!("{file}@{sha}"),
+        ] {
+            assert!(workflow_path_matches(file, &path, branch, &sha), "{path}");
+        }
+        for path in [
+            format!("{file}@refs/heads/main"),
+            format!("{file}@main"),
+            format!("{file}@refs/tags/sluss/batch-123"),
+            format!("{file}@{}", "b".repeat(40)),
+            format!("{file}@"),
+            format!("{file}@{branch}@extra"),
+            format!(".github/workflows/other.yml@{branch}"),
+        ] {
+            assert!(!workflow_path_matches(file, &path, branch, &sha), "{path}");
+        }
+        assert!(!workflow_path_matches(
+            file,
+            file,
+            "refs/tags/not-a-branch",
+            &sha
+        ));
     }
 }

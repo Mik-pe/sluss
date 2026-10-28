@@ -207,6 +207,8 @@ async fn dispatched_run(
     };
     let workflow_path = if mode == 51 {
         ".github/workflows/other.yml@refs/heads/sluss/batch-0123456789abcdef"
+    } else if mode == 239 {
+        ".github/workflows/ci.yml@refs/heads/main"
     } else {
         ".github/workflows/ci.yml@refs/heads/sluss/batch-0123456789abcdef"
     };
@@ -2983,7 +2985,7 @@ async fn cli_dispatches_fixture() {
             .await,
         Ok(sluss::github::ConflictResolution::Waiting)
     ));
-    for bad_mode in [21, 23, 41, 51, 104] {
+    for bad_mode in [21, 23, 41, 51, 104, 239] {
         mode.store(bad_mode, Ordering::SeqCst);
         reads.store(0, Ordering::SeqCst);
         assert!(
@@ -3895,17 +3897,19 @@ async fn cli_dispatches_fixture() {
     let observer_capacity: sluss::scheduler::Capacity =
         toml::from_str(&std::fs::read_to_string(&capacity).unwrap()).unwrap();
     let observer_policy = sluss::config::Config::load(&config).unwrap().policy();
-    mode.store(51, Ordering::SeqCst);
-    assert!(
-        sluss::worker::observe_dispatches_once(
-            &observer_app,
-            &db,
-            &observer_capacity,
-            &observer_policy
-        )
-        .await
-        .is_err()
-    );
+    for bad_mode in [51, 239] {
+        mode.store(bad_mode, Ordering::SeqCst);
+        assert!(
+            sluss::worker::observe_dispatches_once(
+                &observer_app,
+                &db,
+                &observer_capacity,
+                &observer_policy
+            )
+            .await
+            .is_err()
+        );
+    }
     let frozen = sluss::scheduler::Scheduler::open(&db, observer_capacity.clone()).unwrap();
     assert_eq!(
         frozen.dispatch_workflow(id).unwrap().as_deref(),
@@ -5894,7 +5898,7 @@ async fn cli_dispatches_fixture() {
     for invalid in [
         5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77, 80, 81, 82, 104,
         105, 106, 108, 109, 110, 111, 112, 113, 114, 115, 117, 119, 120, 230, 231, 232, 233, 234,
-        235, 236, 237,
+        235, 236, 237, 239,
     ] {
         GUARDED_HEAD_READS.store(0, Ordering::SeqCst);
         reads.store(0, Ordering::SeqCst);
