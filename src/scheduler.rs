@@ -93,6 +93,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_branch_rules (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
@@ -584,6 +585,24 @@ impl Scheduler {
         id: &str,
         workflow_path: &str,
     ) -> Result<bool, SchedulerError> {
+        self.claim_batch_dispatch_inner(id, workflow_path, None)
+    }
+    /// Freeze provider-visible branch rules with the dispatch claim. The
+    /// caller must obtain authentic observations; these do not prove bypass.
+    pub fn claim_batch_dispatch_with_rules(
+        &mut self,
+        id: &str,
+        workflow_path: &str,
+        rules: &crate::github::BranchRulesSnapshot,
+    ) -> Result<bool, SchedulerError> {
+        self.claim_batch_dispatch_inner(id, workflow_path, Some(rules))
+    }
+    fn claim_batch_dispatch_inner(
+        &mut self,
+        id: &str,
+        workflow_path: &str,
+        rules: Option<&crate::github::BranchRulesSnapshot>,
+    ) -> Result<bool, SchedulerError> {
         if !crate::github::valid_workflow_path(workflow_path) {
             return Err(SchedulerError::WorkflowPolicyMismatch);
         }
@@ -602,6 +621,23 @@ impl Scheduler {
         }
         let plan: DispatchPlan = serde_json::from_str(&body)?;
         validate_batch_dispatch(&tx, &batch, &plan)?;
+        if let Some(rules) = rules {
+            let target: Option<String> = tx
+                .query_row("SELECT branch FROM observed_target WHERE id=1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if rules.repository_id != plan.repository_id
+                || target.as_deref() != Some(rules.branch.as_str())
+            {
+                return Err(SchedulerError::StaleBatch);
+            }
+            let digest = rules.digest().map_err(|_| SchedulerError::StaleBatch)?;
+            tx.execute(
+                "INSERT INTO dispatch_branch_rules(id,body,digest) VALUES(?1,?2,?3)",
+                params![id, serde_json::to_string(rules)?, digest],
+            )?;
+        }
         let paths: Option<String> = tx
             .query_row(
                 "SELECT paths FROM batch_policy_paths WHERE batch_id=?1",

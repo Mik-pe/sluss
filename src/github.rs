@@ -935,11 +935,36 @@ impl App {
                 return Err(DispatchError::StaleBase);
             }
         }
-        let claimed = if target_base.is_some() {
+        let claimed = if let Some((target, base)) = target_base {
             let workflow = self
                 .observe_registered_workflow(token, owner, repository, pending.plan.workflow_id)
                 .await?;
-            scheduler.claim_batch_dispatch(id, &workflow.path)?
+            let rules = match self
+                .observe_branch_rules(token, owner, repository, target)
+                .await
+            {
+                Ok(rules) => Some(rules),
+                Err(_) => {
+                    eprintln!(
+                        "branch rules unavailable; this dispatch is CI-only and cannot support an experimental landing claim"
+                    );
+                    None
+                }
+            };
+            if self
+                .observe_target_branch(token, owner, repository, target)
+                .await?
+                .commit
+                .sha
+                != base
+            {
+                return Err(DispatchError::StaleBase);
+            }
+            if let Some(rules) = rules {
+                scheduler.claim_batch_dispatch_with_rules(id, &workflow.path, &rules)?
+            } else {
+                scheduler.claim_batch_dispatch(id, &workflow.path)?
+            }
         } else {
             scheduler.claim_dispatch(id)?
         };
@@ -1167,6 +1192,12 @@ impl App {
         if base.commit.sha != plan.base_sha {
             return Err(LandingRefreshError::Changed);
         }
+        let rules = self
+            .observe_branch_rules(token, owner, repository, &policy.target_branch)
+            .await?;
+        if Some(rules.digest()?) != plan.branch_rules_digest {
+            return Err(LandingRefreshError::Changed);
+        }
         let short_ref = plan
             .staging_ref
             .strip_prefix("refs/")
@@ -1211,6 +1242,9 @@ impl App {
             .await?;
         let last: ActionsRun = self.get_json(token, &run_path, None).await?;
         let last_stage: DispatchRef = self.get_json(token, &ref_path, None).await?;
+        let last_rules = self
+            .observe_branch_rules(token, owner, repository, &policy.target_branch)
+            .await?;
         let last_base = self
             .observe_target_branch(token, owner, repository, &policy.target_branch)
             .await?;
@@ -1220,6 +1254,7 @@ impl App {
             || last != snapshot.run
             || last.run_attempt != 1
             || last_base != base
+            || last_rules != rules
             || last_stage.reference != plan.staging_ref
             || last_stage.object.kind != "commit"
             || last_stage.object.sha != plan.staged_sha
@@ -1471,7 +1506,75 @@ pub struct RepositoryPreflight {
     /// Active rules returned by GitHub, not a complete bypass-policy proof.
     pub rules: Vec<serde_json::Value>,
 }
+
+/// Provider-visible active branch rules only. Bypass actors and legacy branch
+/// protection may require other permissions and endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchRulesSnapshot {
+    pub repository_id: u64,
+    pub branch: String,
+    pub rules: Vec<serde_json::Value>,
+}
+impl BranchRulesSnapshot {
+    pub fn digest(&self) -> Result<String, GitHubError> {
+        use sha2::{Digest, Sha256};
+        if self.repository_id == 0
+            || encoded_branch_segment(&self.branch).is_none()
+            || self.rules.len() > 1000
+            || self.rules.iter().any(|rule| {
+                rule.get("type")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(str::is_empty)
+            })
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let body = serde_json::to_vec(self).map_err(|_| GitHubError::UnstableObservation)?;
+        if body.len() > 1024 * 1024 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"sluss-branch-rules-v1\0");
+        hash.update(body);
+        Ok(hex::encode(hash.finalize()))
+    }
+}
 impl App {
+    /// Compare two paginated reads of active rules, independently of rule
+    /// order. This does not inspect bypass actors or authorize a merge.
+    pub async fn observe_branch_rules(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+    ) -> Result<BranchRulesSnapshot, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let segment = encoded_branch_segment(branch).ok_or(GitHubError::InvalidConfiguration)?;
+        let root = format!("repos/{owner}/{repository}");
+        let repo: Repository = self.get_json(token, &root, None).await?;
+        if repo.id != token.repository_id {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let path = format!("{root}/rules/branches/{segment}");
+        let mut first = self.fetch_branch_rules(token, &path).await?;
+        let mut second = self.fetch_branch_rules(token, &path).await?;
+        first.sort_by_cached_key(|rule| rule.to_string());
+        second.sort_by_cached_key(|rule| rule.to_string());
+        if first != second {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let value = BranchRulesSnapshot {
+            repository_id: repo.id,
+            branch: branch.into(),
+            rules: second,
+        };
+        value.digest()?;
+        Ok(value)
+    }
     /// Read a target branch within the installation's repository scope.
     /// Callers must compare observations around the rest of a provider scan.
     pub async fn observe_target_branch(
@@ -1587,6 +1690,9 @@ impl App {
             }
             let done = rows.len() < 100;
             rules.extend(rows);
+            if rules.len() > 1000 {
+                return Err(GitHubError::UnstableObservation);
+            }
             if done {
                 return Ok(rules);
             }

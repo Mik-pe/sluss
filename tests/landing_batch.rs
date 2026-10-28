@@ -90,7 +90,15 @@ fn setup() -> Fixture {
         .unwrap();
     assert!(
         scheduler
-            .claim_batch_dispatch(BATCH, ".github/workflows/ci.yml")
+            .claim_batch_dispatch_with_rules(
+                BATCH,
+                ".github/workflows/ci.yml",
+                &sluss::github::BranchRulesSnapshot {
+                    repository_id: 2,
+                    branch: "main".into(),
+                    rules: vec![serde_json::json!({"type":"pull_request","ruleset_id":1})]
+                }
+            )
             .unwrap()
     );
     scheduler.record_receipt(BATCH, 42).unwrap();
@@ -217,6 +225,7 @@ fn missing_receipt_or_frozen_workflow_and_failed_ci_cannot_prepare() {
     for update in [
         "DELETE FROM dispatch_receipt_sources",
         "DELETE FROM dispatch_workflows",
+        "DELETE FROM dispatch_branch_rules",
         "UPDATE ci_observations SET body=json_set(body,'$.observation',json('{\"Failed\":{\"conclusion\":\"failure\"}}'))",
     ] {
         let mut f = setup();
@@ -229,6 +238,35 @@ fn missing_receipt_or_frozen_workflow_and_failed_ci_cannot_prepare() {
         );
         assert!(f.journal.get("land-one").unwrap().is_none());
     }
+}
+
+#[test]
+fn changed_frozen_branch_rules_cannot_claim() {
+    let mut f = setup();
+    prepare(&mut f);
+    let replacement = sluss::github::BranchRulesSnapshot {
+        repository_id: 2,
+        branch: "main".into(),
+        rules: vec![serde_json::json!({"type":"required_linear_history","ruleset_id":1})],
+    };
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute(
+        "UPDATE dispatch_branch_rules SET body=?1,digest=?2 WHERE id=?3",
+        rusqlite::params![
+            serde_json::to_string(&replacement).unwrap(),
+            replacement.digest().unwrap(),
+            BATCH
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        f.journal.claim_observed_batch("land-one"),
+        Err(LandingError::StaleBatch)
+    ));
+    assert_eq!(
+        f.journal.get("land-one").unwrap().unwrap().1,
+        IntentState::Prepared
+    );
 }
 
 #[test]

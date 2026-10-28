@@ -30,6 +30,9 @@ pub struct LandingPlan {
     pub policy_digest: String,
     pub admission_digest: String,
     pub ci_evidence_digest: String,
+    /// Missing on historical or purely local intents; not a bypass proof.
+    #[serde(default)]
+    pub branch_rules_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +122,10 @@ impl LandingPlan {
             || !hex(&self.policy_digest, 64)
             || !hex(&self.admission_digest, 64)
             || !hex(&self.ci_evidence_digest, 64)
+            || self
+                .branch_rules_digest
+                .as_deref()
+                .is_some_and(|value| !hex(value, 64))
         {
             return Err(LandingError::Invalid);
         }
@@ -511,6 +518,21 @@ fn observed_plan(
             |r| r.get(0),
         )
         .optional()?;
+    let rules_row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT body,digest FROM dispatch_branch_rules WHERE id=?1",
+            [batch_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (rules_body, rules_digest) = rules_row.ok_or(LandingError::StaleBatch)?;
+    let rules: crate::github::BranchRulesSnapshot = serde_json::from_str(&rules_body)?;
+    if i64::try_from(rules.repository_id).ok() != Some(binding.1)
+        || rules.branch != target
+        || rules.digest().ok().as_deref() != Some(rules_digest.as_str())
+    {
+        return Err(LandingError::StaleBatch);
+    }
     let row: Option<(String,String,Option<String>,String,String,String)> = tx.query_row(
         "SELECT c.body,d.plan,d.run_id,w.path,s.source,d.state FROM ci_observations c JOIN dispatch_batches b ON b.id=c.id AND b.batch_id=?1 JOIN dispatch_intents d ON d.id=c.id JOIN dispatch_workflows w ON w.id=c.id JOIN dispatch_receipt_sources s ON s.id=c.id WHERE c.id=?1", [batch_id],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
@@ -600,6 +622,7 @@ fn observed_plan(
         policy_digest: dispatch.policy_digest,
         admission_digest: hex::encode(Sha256::digest(admission_body)),
         ci_evidence_digest: hex::encode(Sha256::digest(ci_digest_body)),
+        branch_rules_digest: Some(rules_digest),
     };
     plan.validate()?;
     Ok(plan)

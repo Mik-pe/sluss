@@ -297,12 +297,18 @@ async fn doctor_workflow(State(state): State<ServerState>, headers: HeaderMap) -
     Json(json!({"id":17,"path":path,"state":status}))
 }
 async fn doctor_rules(
+    State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     assert_eq!(query["page"], "1");
-    Json(json!([{"type":"pull_request","ruleset_id":10}]))
+    let mode = state.mode.load(Ordering::SeqCst);
+    let different = mode == 64
+        || (matches!(mode, 65 | 66) && state.token_calls.fetch_add(1, Ordering::SeqCst) % 2 == 1);
+    Json(
+        json!([{"type":if different {"required_linear_history"} else {"pull_request"},"ruleset_id":10}]),
+    )
 }
 async fn repository_runners(
     State(state): State<ServerState>,
@@ -313,7 +319,7 @@ async fn repository_runners(
     assert_eq!(query["page"], "1");
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    if matches!(mode, 44..=47) {
+    if matches!(mode, 44..=47 | 66) {
         return Json(json!({"total_count":2,"runners":[
             {"id":2,"name":"busy-runner","status":"online","busy":true,"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
             {"id":1,"name":"runner","status":"online","busy":mode == 45 || mode == 47,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}
@@ -1648,7 +1654,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                     && item.state == sluss::scheduler::DispatchState::Prepared)
         );
     }
-    mode.store(44, Ordering::SeqCst);
+    mode.store(66, Ordering::SeqCst);
     reads.store(0, Ordering::SeqCst);
     assert_eq!(
         sluss::dispatch::batch(
@@ -1667,6 +1673,17 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         }
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let has_rules: bool = snapshot_conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_branch_rules WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !has_rules,
+        "unstable rules allow CI-only dispatch but must not become landing evidence"
+    );
     let metrics = Command::new(env!("CARGO_BIN_EXE_sluss"))
         .arg("--db")
         .arg(&independent_db)
@@ -2105,7 +2122,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let frozen_landing = landing
         .prepare_observed_batch("land-refresh", id, "R_repo")
         .unwrap();
-    for invalid in [5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63] {
+    for invalid in [5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65] {
         reads.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
         assert!(
