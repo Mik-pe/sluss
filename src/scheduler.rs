@@ -48,7 +48,9 @@ pub enum SchedulerError {
     CiConflict,
     #[error("capacity configuration or request is invalid")]
     Invalid,
-    #[error("a different capacity configuration is active while reservations exist")]
+    #[error(
+        "capacity configuration cannot change while reservations exist or the release topology is frozen"
+    )]
     ConfigBusy,
     #[error("capacity configuration changed; reopen the scheduler")]
     ConfigChanged,
@@ -81,6 +83,7 @@ impl Scheduler {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS capacity_config (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS capacity_release_topology (id INTEGER PRIMARY KEY CHECK(id = 1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
@@ -95,6 +98,19 @@ impl Scheduler {
                 r.get(0)
             })
             .optional()?;
+        let release_topology: Option<String> = tx
+            .query_row(
+                "SELECT body FROM capacity_release_topology WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if release_topology
+            .as_ref()
+            .is_some_and(|locked| locked != &encoded)
+        {
+            return Err(SchedulerError::ConfigBusy);
+        }
         if old.as_ref().is_some_and(|o| o != &encoded) {
             let count: i64 =
                 tx.query_row("SELECT COUNT(*) FROM capacity_reservations", [], |r| {
@@ -1228,6 +1244,89 @@ impl Scheduler {
         {
             return Err(SchedulerError::StaleBatch);
         }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+impl Scheduler {
+    /// Free a completed CI-only reservation after provider revalidation. The
+    /// caller must establish runner isolation and the release topology contract.
+    pub fn release_completed_ci_only(
+        &mut self,
+        id: &str,
+        run_id: u64,
+    ) -> Result<(), SchedulerError> {
+        use crate::batch::{Batch, State};
+        crate::verification::check_release_topology(&self.capacity)
+            .map_err(|_| SchedulerError::Invalid)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        type ReleaseRow = (String, String, Option<String>, String, String, String);
+        let row: Option<ReleaseRow> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,q.body,c.body,s.source FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id JOIN batches q ON q.id=b.batch_id JOIN ci_observations c ON c.id=d.id JOIN dispatch_receipt_sources s ON s.id=d.id WHERE d.id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+        ).optional()?;
+        let (plan_body, state, saved_run, batch_body, observation_body, source) =
+            row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
+        let batch: Batch = serde_json::from_str(&batch_body)?;
+        let observed: StoredCiObservation = serde_json::from_str(&observation_body)?;
+        let conclusion = match &observed.observation {
+            crate::verification::CiObservation::Successful => "success",
+            crate::verification::CiObservation::Failed { conclusion } if !conclusion.is_empty() => {
+                conclusion.as_str()
+            }
+            _ => return Err(SchedulerError::DispatchTransition),
+        };
+        if run_id == 0
+            || saved_run.as_deref() != Some(&run_id.to_string())
+            || source != "direct"
+            || observed.run_id != run_id
+            || observed.plan != plan
+            || batch.state
+                != (State::CiComplete {
+                    integration_sha: plan.integration_sha,
+                    run_id,
+                    conclusion: conclusion.into(),
+                })
+        {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        if state == "finished" {
+            return Ok(());
+        }
+        if state != "observed" {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO capacity_release_topology(id,body) VALUES(1,?1)",
+            [&self.encoded],
+        )?;
+        let locked: String = tx.query_row(
+            "SELECT body FROM capacity_release_topology WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if locked != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        if tx.execute("DELETE FROM capacity_reservations WHERE id=?1", [id])? != 1 {
+            return Err(SchedulerError::Corrupt);
+        }
+        tx.execute("INSERT INTO capacity_finished(id) VALUES(?1)", [id])?;
+        tx.execute(
+            "UPDATE dispatch_intents SET state='finished' WHERE id=?1",
+            [id],
+        )?;
         tx.commit()?;
         Ok(())
     }

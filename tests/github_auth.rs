@@ -166,7 +166,11 @@ async fn dispatched_run(
     } else {
         "workflow_dispatch"
     };
-    let attempt = if mode == 21 && latest { 2 } else { 1 };
+    let attempt = if latest && (mode == 21 || (mode == 42 && count >= 6)) {
+        2
+    } else {
+        1
+    };
     let workflow_id = if mode == 23 { 18 } else { 17 };
     let sha = if mode == 22 && count >= 3 { "b" } else { "a" };
     let status = if mode == 31 {
@@ -245,7 +249,7 @@ async fn repository_runners(
         1
     };
     Json(
-        json!({"total_count":1,"runners":[{"id":id,"name":"runner","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}]}),
+        json!({"total_count":1,"runners":[{"id":id,"name":"runner","status":"online","busy":mode == 41,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}]}),
     )
 }
 async fn dispatch_post(
@@ -2021,6 +2025,18 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 auto_store.batch(id).unwrap().unwrap().0.state,
                 sluss::batch::State::Testing { .. }
             ));
+            assert_eq!(
+                sluss::worker::release_ci_only_once(
+                    &fixture_app,
+                    &auto_db,
+                    &observer_capacity,
+                    &fixture_policy
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
         } else {
             if name == "failed" {
                 mode.store(40, Ordering::SeqCst);
@@ -2076,12 +2092,87 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                     .unwrap()
                     .is_none()
             );
-            let scheduler =
+            let mut scheduler =
                 sluss::scheduler::Scheduler::open(&auto_db, observer_capacity.clone()).unwrap();
             assert_eq!(
                 scheduler.pending_dispatches().unwrap().len(),
                 1,
-                "the reservation is retained"
+                "the reservation is retained before release"
+            );
+            if name != "failed" {
+                mode.store(21, Ordering::SeqCst);
+                assert!(
+                    sluss::worker::release_ci_only_once(
+                        &fixture_app,
+                        &auto_db,
+                        &observer_capacity,
+                        &fixture_policy
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+                reads.store(0, Ordering::SeqCst);
+                mode.store(42, Ordering::SeqCst);
+                assert!(
+                    sluss::worker::release_ci_only_once(
+                        &fixture_app,
+                        &auto_db,
+                        &observer_capacity,
+                        &fixture_policy
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+                assert!(
+                    reads.load(Ordering::SeqCst) >= 7,
+                    "rerun must appear after the first provider and inventory reads"
+                );
+                mode.store(41, Ordering::SeqCst);
+                assert!(
+                    sluss::worker::release_ci_only_once(
+                        &fixture_app,
+                        &auto_db,
+                        &observer_capacity,
+                        &fixture_policy
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+                mode.store(0, Ordering::SeqCst);
+            }
+            assert_eq!(
+                sluss::worker::release_ci_only_once(
+                    &fixture_app,
+                    &auto_db,
+                    &observer_capacity,
+                    &fixture_policy
+                )
+                .await
+                .unwrap(),
+                1
+            );
+            assert!(scheduler.pending_dispatches().unwrap().is_empty());
+            let mut changed_capacity = observer_capacity.clone();
+            changed_capacity.pools.insert("rust".into(), 2);
+            assert!(matches!(
+                sluss::scheduler::Scheduler::open(&auto_db, changed_capacity),
+                Err(sluss::scheduler::SchedulerError::ConfigBusy)
+            ));
+            scheduler.release_completed_ci_only(id, 123).unwrap();
+            assert!(scheduler.release_completed_ci_only(id, 124).is_err());
+            assert_eq!(
+                sluss::worker::release_ci_only_once(
+                    &fixture_app,
+                    &auto_db,
+                    &observer_capacity,
+                    &fixture_policy
+                )
+                .await
+                .unwrap(),
+                0
             );
             let queue = Command::new(env!("CARGO_BIN_EXE_sluss"))
                 .arg("--db")
@@ -2150,7 +2241,14 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                         .is_some()
                 );
             }
-            assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
+            assert!(scheduler.pending_dispatches().unwrap().is_empty());
+            assert!(
+                scheduler
+                    .reserve("next-job", &settings.request)
+                    .unwrap()
+                    .is_some(),
+                "released capacity must be reusable"
+            );
         }
     }
     server.abort();

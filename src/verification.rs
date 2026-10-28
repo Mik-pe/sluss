@@ -320,3 +320,58 @@ pub fn observe_ci(
     }
     Ok(CiObservation::Successful)
 }
+
+/// Conservative envelope for reusing capacity when GitHub allows reruns.
+/// The operator must also ensure no additional runner process shares a host
+/// and that job cleanup/isolation prevents work surviving its runner job.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReleaseTopologyError {
+    #[error(
+        "automatic CI-only release requires exactly one registered runner and one slot per physical host"
+    )]
+    Host,
+    #[error("pool budgets must cover the sum of all host pool capacities")]
+    Pool,
+}
+pub fn check_release_topology(
+    capacity: &crate::scheduler::Capacity,
+) -> Result<(), ReleaseTopologyError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut runners = BTreeSet::new();
+    let mut totals: BTreeMap<&str, u64> = BTreeMap::new();
+    if capacity.hosts.is_empty() || capacity.pools.is_empty() {
+        return Err(ReleaseTopologyError::Host);
+    }
+    for (label, host) in &capacity.hosts {
+        if !crate::github::valid_runner_label(label)
+            || host.slots != 1
+            || host.runner_ids.len() != 1
+            || host.runner_ids.contains(&0)
+            || !runners.insert(
+                *host
+                    .runner_ids
+                    .iter()
+                    .next()
+                    .ok_or(ReleaseTopologyError::Host)?,
+            )
+            || host.pools.is_empty()
+        {
+            return Err(ReleaseTopologyError::Host);
+        }
+        for (name, units) in &host.pools {
+            if *units == 0 || !capacity.pools.contains_key(name) {
+                return Err(ReleaseTopologyError::Pool);
+            }
+            *totals.entry(name).or_default() += u64::from(*units);
+        }
+    }
+    if totals.iter().any(|(name, used)| {
+        capacity
+            .pools
+            .get(*name)
+            .is_none_or(|limit| u64::from(*limit) < *used)
+    }) {
+        return Err(ReleaseTopologyError::Pool);
+    }
+    Ok(())
+}

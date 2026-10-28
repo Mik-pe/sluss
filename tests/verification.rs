@@ -365,3 +365,56 @@ fn ci_observation_requires_exact_run_and_every_required_job() {
         Err(CiObservationError::Identity)
     );
 }
+
+#[test]
+fn safe_release_requires_one_runner_per_host_and_conservative_pool_budgets() {
+    use sluss::{
+        scheduler::{Capacity, Host},
+        verification::{ReleaseTopologyError, check_release_topology},
+    };
+    use std::collections::BTreeMap;
+    let pools = BTreeMap::from([("rust".into(), 2), ("macos".into(), 1)]);
+    let mut capacity = Capacity {
+        pools,
+        hosts: BTreeMap::from([
+            (
+                "sluss-host-linux".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [1].into(),
+                    pools: [("rust".into(), 1)].into(),
+                },
+            ),
+            (
+                "sluss-host-mac".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: [2].into(),
+                    pools: [("rust".into(), 1), ("macos".into(), 1)].into(),
+                },
+            ),
+        ]),
+    };
+    assert_eq!(check_release_topology(&capacity), Ok(()));
+    capacity.pools.insert("rust".into(), 1);
+    assert_eq!(
+        check_release_topology(&capacity),
+        Err(ReleaseTopologyError::Pool)
+    );
+    capacity.pools.insert("rust".into(), 2);
+    capacity
+        .hosts
+        .get_mut("sluss-host-mac")
+        .unwrap()
+        .runner_ids
+        .insert(3);
+    assert_eq!(
+        check_release_topology(&capacity),
+        Err(ReleaseTopologyError::Host)
+    );
+    capacity.hosts.get_mut("sluss-host-mac").unwrap().runner_ids = [1].into();
+    assert_eq!(
+        check_release_topology(&capacity),
+        Err(ReleaseTopologyError::Host)
+    );
+}

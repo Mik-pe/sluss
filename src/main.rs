@@ -59,7 +59,10 @@ enum Command {
         /// Complete observed CI-only batches without releasing their reservations.
         #[arg(long, requires = "observe_dispatches")]
         complete_ci_only: bool,
-        /// Capacity configuration used by cancellation and observation.
+        /// Release completed CI-only reservations under the single-runner safety contract.
+        #[arg(long, requires_all = ["complete_ci_only", "capacity"])]
+        release_ci_only: bool,
+        /// Capacity configuration used by scheduling and observation.
         #[arg(long, requires = "config")]
         capacity: Option<PathBuf>,
     },
@@ -256,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_stale,
         observe_dispatches,
         complete_ci_only,
+        release_ci_only,
         capacity,
     } = cli.command
     {
@@ -334,6 +338,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "automatic stale-run cancellation enabled; capacity is not automatically released"
                 );
                 tokio::spawn(sluss::worker::supervise_stale_cancellation(
+                    app.clone(),
+                    cli.db.clone(),
+                    capacity,
+                    policy.clone(),
+                    poll,
+                ));
+            }
+            if release_ci_only {
+                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                sluss::verification::check_release_topology(&capacity)?;
+                eprintln!(
+                    "CI-only capacity release enabled under the single-runner isolation contract"
+                );
+                tokio::spawn(sluss::worker::supervise_ci_release(
                     app.clone(),
                     cli.db.clone(),
                     capacity,
@@ -871,7 +889,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for pr in store.candidates()? {
                 if let Some((batch, conclusion)) = completed.get(&pr.number) {
                     println!(
-                        "#{} {} (CI-only {} in {}; not merge approval)",
+                        "#{} {} (historical CI-only first attempt {} in {}; not merge approval)",
                         pr.number, pr.head_sha, conclusion, batch
                     );
                 } else if let Some(batch) = failed.get(&pr.number) {

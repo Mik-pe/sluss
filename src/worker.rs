@@ -496,3 +496,129 @@ pub async fn supervise_dispatch(
         sleep(delay).await;
     }
 }
+
+/// Revalidate completed runs and repository runner inventory before releasing
+/// CI-only reservations under the conservative single-runner topology.
+pub async fn release_ci_only_once(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+) -> Result<usize, String> {
+    use crate::{batch::State, scheduler::DispatchState, verification::Placement};
+    crate::verification::check_release_topology(capacity).map_err(|e| e.to_string())?;
+    let store = Store::open(db).map_err(|e| e.to_string())?;
+    if store.repository_scope().map_err(|e| e.to_string())?
+        != (policy.installation as u64, policy.repository as u64)
+    {
+        return Err("repository does not match the reconciled queue".into());
+    }
+    let mut scheduler =
+        crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
+    let mut released = 0;
+    for pending in scheduler.pending_dispatches().map_err(|e| e.to_string())? {
+        let run_id = match pending.state {
+            DispatchState::Observed { run_id } => run_id,
+            _ => continue,
+        };
+        let Some((batch, _)) = store
+            .batch(&pending.reservation.id)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let State::CiComplete {
+            run_id: completed_run,
+            ref conclusion,
+            ..
+        } = batch.state
+        else {
+            continue;
+        };
+        if completed_run != run_id {
+            return Err("completed batch and run differ".into());
+        }
+        let host = capacity
+            .hosts
+            .get(&pending.reservation.host)
+            .ok_or("reserved host is missing")?;
+        let token = app
+            .read_token(policy.installation as u64, policy.repository as u64)
+            .await
+            .map_err(|e| e.to_string())?;
+        let first = app
+            .reconcile_dispatch(
+                &mut scheduler,
+                &token,
+                &policy.owner,
+                &policy.name,
+                &pending.reservation.id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if first.run.status != "completed"
+            || first.run.conclusion.as_deref() != Some(conclusion)
+            || !matches!(
+                crate::verification::check_host_placement(&first, &host.runner_ids)
+                    .map_err(|e| e.to_string())?,
+                Placement::Confirmed { .. }
+            )
+        {
+            return Err("completed run or runner placement changed".into());
+        }
+        let inventory_token = app
+            .runner_inventory_token(policy.installation as u64, policy.repository as u64)
+            .await
+            .map_err(|e| e.to_string())?;
+        let runners = app
+            .observe_repository_runners(&inventory_token, &policy.owner, &policy.name)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::verification::check_repository_runner_inventory(capacity, &runners)
+            .map_err(|e| e.to_string())?;
+        let last = app
+            .reconcile_dispatch(
+                &mut scheduler,
+                &token,
+                &policy.owner,
+                &policy.name,
+                &pending.reservation.id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if first != last {
+            return Err("run changed during capacity revalidation".into());
+        }
+        scheduler
+            .release_completed_ci_only(&pending.reservation.id, run_id)
+            .map_err(|e| e.to_string())?;
+        released += 1;
+    }
+    Ok(released)
+}
+
+pub async fn supervise_ci_release(
+    app: Arc<App>,
+    db: PathBuf,
+    capacity: crate::scheduler::Capacity,
+    policy: RepositoryPolicy,
+    poll: Duration,
+) {
+    let minimum = poll.max(Duration::from_secs(60));
+    let mut delay = minimum;
+    loop {
+        match release_ci_only_once(&app, &db, &capacity, &policy).await {
+            Ok(count) => {
+                if count > 0 {
+                    eprintln!("released {count} completed CI-only reservations");
+                }
+                delay = minimum;
+            }
+            Err(error) => {
+                eprintln!("CI-only capacity revalidation failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+            }
+        }
+        sleep(delay).await;
+    }
+}
