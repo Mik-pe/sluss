@@ -24,6 +24,8 @@ pub enum StoreError {
     PolicyMismatch,
     #[error("batch inputs or state transition are invalid")]
     InvalidBatch,
+    #[error("queue has not been bound by provider reconciliation")]
+    Unbound,
 }
 
 pub struct Store {
@@ -213,6 +215,121 @@ impl Store {
         Ok(result)
     }
 
+    /// Freeze an ordered batch from a reconciled queue in one transaction.
+    /// The supplied base is an observation, not proof that the target is
+    /// unchanged; callers must refresh provider state before integration.
+    pub fn plan_batch(
+        &mut self,
+        id: &str,
+        base_sha: &str,
+        max_batch_size: usize,
+        max_active_batches: usize,
+    ) -> Result<Option<Batch>, StoreError> {
+        let valid_sha = |value: &str| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !(16..=64).contains(&id.len())
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || !valid_sha(base_sha)
+            || !(1..=100).contains(&max_batch_size)
+            || !(1..=100).contains(&max_active_batches)
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let binding: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT installation,repository FROM repository_binding WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (installation, repository) = binding.ok_or(StoreError::Unbound)?;
+        let paused: bool = tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get(0),
+        )?;
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reconciliations WHERE installation=?1 AND repository=?2)",
+            params![installation, repository],
+            |r| r.get(0),
+        )?;
+        if paused || pending {
+            return Ok(None);
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM batches WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Err(StoreError::Conflict);
+        }
+        let mut active = 0usize;
+        let mut occupied = std::collections::BTreeSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let batch: Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    batch.state,
+                    State::Planned
+                        | State::Building
+                        | State::Testing { .. }
+                        | State::Verified { .. }
+                ) {
+                    active += 1;
+                    occupied.extend(batch.candidates.iter().map(|c| c.number));
+                }
+            }
+        }
+        if active >= max_active_batches {
+            return Ok(None);
+        }
+        let mut selected = Vec::new();
+        {
+            let mut stmt =
+                tx.prepare("SELECT number,head_sha FROM candidates ORDER BY sequence,number")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let number = row.get::<_, i64>(0)? as u64;
+                let sha: String = row.get(1)?;
+                if !valid_sha(&sha) {
+                    return Err(StoreError::InvalidCandidate);
+                }
+                if !occupied.contains(&number) {
+                    selected.push(Candidate {
+                        number,
+                        head_sha: sha,
+                    });
+                    if selected.len() == max_batch_size {
+                        break;
+                    }
+                }
+            }
+        }
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let batch = Batch::new(id.into(), base_sha.into(), selected)
+            .map_err(|_| StoreError::InvalidBatch)?;
+        tx.execute(
+            "INSERT INTO batches(id,version,body) VALUES(?1,0,?2)",
+            params![id, serde_json::to_string(&batch)?],
+        )?;
+        tx.commit()?;
+        Ok(Some(batch))
+    }
+
     pub fn insert_batch(&mut self, batch: &Batch) -> Result<(), StoreError> {
         if batch.state != State::Planned
             || Batch::new(
@@ -239,6 +356,27 @@ impl Store {
                 .optional()?;
             if head.as_deref() != Some(&candidate.head_sha) {
                 return Err(StoreError::StaleCandidate);
+            }
+        }
+        // Even direct inserts cannot put the same PR into two live batches.
+        {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let existing: Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    existing.state,
+                    State::Planned
+                        | State::Building
+                        | State::Testing { .. }
+                        | State::Verified { .. }
+                ) && existing
+                    .candidates
+                    .iter()
+                    .any(|a| batch.candidates.iter().any(|b| a.number == b.number))
+                {
+                    return Err(StoreError::Conflict);
+                }
             }
         }
         let inserted = tx.execute(
