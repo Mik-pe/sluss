@@ -1264,7 +1264,114 @@ pub enum LandingRefreshError {
     #[error(transparent)]
     Journal(#[from] crate::landing::LandingError),
 }
+
+/// GitHub's current review status, not a complete mergeability or CODEOWNERS proof.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderReviewDecision {
+    pub number: u64,
+    pub state: String,
+    pub is_draft: bool,
+    pub base_ref_name: String,
+    pub base_ref_oid: String,
+    pub head_ref_oid: String,
+    pub review_decision: Option<String>,
+}
 impl App {
+    /// Read the provider's review decision twice. A result is a transient
+    /// observation only; GitHub documents no atomic review-and-ref update.
+    pub async fn observe_review_decision(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        repository_node_id: &str,
+        number: u64,
+    ) -> Result<ProviderReviewDecision, GitHubError> {
+        #[derive(Deserialize)]
+        struct RepositoryResponse {
+            id: String,
+            #[serde(rename = "pullRequest")]
+            pull: Option<ProviderReviewDecision>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<RepositoryResponse>,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            data: Option<Data>,
+            #[serde(default)]
+            errors: Option<serde_json::Value>,
+        }
+        if !token.checks_read
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+            || !valid_name(owner)
+            || !valid_name(repository)
+            || repository_node_id.is_empty()
+            || number == 0
+            || number > i32::MAX as u64
+        {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        const QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){id pullRequest(number:$number){number state isDraft baseRefName baseRefOid headRefOid reviewDecision}}}";
+        async fn once(
+            app: &App,
+            token: &InstallationToken,
+            owner: &str,
+            repository: &str,
+            number: u64,
+            node_id: &str,
+        ) -> Result<ProviderReviewDecision, GitHubError> {
+            let url = app
+                .api
+                .join("graphql")
+                .map_err(|_| GitHubError::InvalidConfiguration)?;
+            let mut response = app.client.post(url).header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28").bearer_auth(token.secret())
+                .json(&serde_json::json!({"query":QUERY,"variables":{"owner":owner,"name":repository,"number":number}}))
+                .send().await.map_err(|_| GitHubError::Request)?;
+            if !response.status().is_success() {
+                return Err(GitHubError::Status(response.status().as_u16()));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| GitHubError::Request)? {
+                if bytes.len().saturating_add(chunk.len()) > 65536 {
+                    return Err(GitHubError::UnstableObservation);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let result: Response =
+                serde_json::from_slice(&bytes).map_err(|_| GitHubError::UnstableObservation)?;
+            if result
+                .errors
+                .is_some_and(|errors| !errors.as_array().is_some_and(|e| e.is_empty()))
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let repo = result
+                .data
+                .and_then(|data| data.repository)
+                .ok_or(GitHubError::UnstableObservation)?;
+            let pull = repo.pull.ok_or(GitHubError::UnstableObservation)?;
+            if repo.id != node_id
+                || pull.number != number
+                || !commit_sha(&pull.base_ref_oid)
+                || !commit_sha(&pull.head_ref_oid)
+                || pull.base_ref_name.is_empty()
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+            Ok(pull)
+        }
+        let first = once(self, token, owner, repository, number, repository_node_id).await?;
+        let last = once(self, token, owner, repository, number, repository_node_id).await?;
+        if first != last {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(last)
+    }
     /// Refresh the PRs, reviews, refs and recorded Actions run immediately
     /// before claiming an experimental batch-bound intent. This is not authorization:
     /// approvals, trusted policy and provider state can still change later.
@@ -1353,7 +1460,26 @@ impl App {
         {
             return Err(LandingRefreshError::Changed);
         }
+        let mut provider_reviews = Vec::with_capacity(target.members.len());
         for member in &target.members {
+            let review = self
+                .observe_review_decision(
+                    token,
+                    owner,
+                    repository,
+                    &plan.repository_node_id,
+                    member.candidate.number,
+                )
+                .await?;
+            if review.state != "OPEN"
+                || review.is_draft
+                || review.review_decision.as_deref() != Some("APPROVED")
+                || review.base_ref_name != policy.target_branch
+                || review.base_ref_oid != plan.base_sha
+                || review.head_ref_oid != member.candidate.head_sha
+            {
+                return Err(LandingRefreshError::Changed);
+            }
             let observed = self
                 .observe_authorized_pull(token, owner, repository, member.candidate.number)
                 .await?;
@@ -1376,6 +1502,7 @@ impl App {
             {
                 return Err(LandingRefreshError::Changed);
             }
+            provider_reviews.push(review);
         }
         let run_id = target.run_id;
         let run_path = format!("{root}/actions/runs/{run_id}");
@@ -1384,6 +1511,21 @@ impl App {
             .observe_actions_attempt(token, owner, repository, run_id, 1)
             .await?;
         let last: ActionsRun = self.get_json(token, &run_path, None).await?;
+        for (member, previous) in target.members.iter().zip(&provider_reviews) {
+            if self
+                .observe_review_decision(
+                    token,
+                    owner,
+                    repository,
+                    &plan.repository_node_id,
+                    member.candidate.number,
+                )
+                .await?
+                != *previous
+            {
+                return Err(LandingRefreshError::Changed);
+            }
+        }
         let last_stage: DispatchRef = self.get_json(token, &ref_path, None).await?;
         let last_rules = self
             .observe_branch_rules(token, owner, repository, &policy.target_branch)

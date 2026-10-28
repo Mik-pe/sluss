@@ -259,6 +259,33 @@ async fn graphql_schema(
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let query = body["query"].as_str().unwrap();
+    if query.contains("reviewDecision") {
+        assert!(query.starts_with("query("));
+        assert_eq!(
+            body["variables"],
+            json!({"owner":"owner","name":"repo","number":19})
+        );
+        let mode = state.mode.load(Ordering::SeqCst);
+        if mode == 109 {
+            return Json(json!({"data":null,"errors":[{"message":"unavailable"}]}));
+        }
+        let count = state.token_calls.fetch_add(1, Ordering::SeqCst);
+        let decision = match mode {
+            104 => Some("REVIEW_REQUIRED"),
+            105 => Some("CHANGES_REQUESTED"),
+            106 => None,
+            119 => Some("UNKNOWN_NEW_STATUS"),
+            108 if count % 2 == 1 => Some("REVIEW_REQUIRED"),
+            117 if count >= 2 => Some("REVIEW_REQUIRED"),
+            _ => Some("APPROVED"),
+        };
+        return Json(
+            json!({"data":{"repository":{"id":if mode==110 {"R_other"} else {"R_repo"},"pullRequest":{
+            "number":if mode==114 {20} else {19},"state":if mode==115 {"CLOSED"} else {"OPEN"},"isDraft":mode==113,
+            "baseRefName":if mode==120 {"other"} else {"main"},"baseRefOid":if mode==112 {"c".repeat(40)} else {"b".repeat(40)},
+            "headRefOid":if mode==111 {"c".repeat(40)} else {"a".repeat(40)},"reviewDecision":decision}}}}),
+        );
+    }
     assert!(query.starts_with("query {"));
     assert!(query.contains("__schema"));
     let mode = state.mode.load(Ordering::SeqCst);
@@ -1577,6 +1604,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let posts = Arc::new(AtomicUsize::new(0));
     let mode = Arc::new(AtomicU8::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
+    let graphql_counts = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app", get(authenticated_app))
         .route("/app/installations/{id}/access_tokens", post(token))
@@ -1635,7 +1663,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             mode: mode.clone(),
             pulls: reads.clone(),
             permissions: posts.clone(),
-            token_calls: Arc::new(AtomicUsize::new(0)),
+            token_calls: graphql_counts.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2871,9 +2899,11 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .prepare_observed_batch("land-refresh", id, "R_repo")
         .unwrap();
     for invalid in [
-        5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77, 80, 81, 82,
+        5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77, 80, 81, 82, 104,
+        105, 106, 108, 109, 110, 111, 112, 113, 114, 115, 117, 119, 120,
     ] {
         reads.store(0, Ordering::SeqCst);
+        graphql_counts.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
         assert!(
             observer_app

@@ -14,6 +14,8 @@ An experimental library function can advance a branch in a trusted **local bare 
 
 An independent experimental landing journal can freeze a prospective GitHub ref update and retain uncertain attempts across process restarts. It does not send requests, authenticate evidence, or authorize landing; recovery of an uncertain attempt is not implemented.
 
+Its batch-bound claim also requires repeated, matching `APPROVED` review decisions from GitHub for each frozen PR. This is an additional transient rejection check, not proof of branch policy or CODEOWNERS compliance; the App-token path has only been tested against a local stub.
+
 ```sh
 cargo test
 cargo run -- status
