@@ -26,7 +26,9 @@ pub enum GitHubError {
     UnstableObservation,
     #[error("the workflow file is absent or not a regular file in the inspected commit")]
     MissingDefaultWorkflow,
-    #[error("the workflow file is invalid, unsupported or does not declare workflow_dispatch")]
+    #[error(
+        "the workflow file is invalid, unsupported or does not declare compatible workflow_dispatch inputs"
+    )]
     MissingWorkflowDispatch,
 }
 
@@ -4127,7 +4129,7 @@ impl App {
     }
 
     /// Verify the active workflow's file is a regular blob at a stable default
-    /// branch commit and declares workflow_dispatch. This does not prove trust.
+    /// branch commit and declares compatible dispatch inputs. This does not prove trust.
     pub async fn observe_default_workflow(
         &self,
         token: &InstallationToken,
@@ -4284,7 +4286,7 @@ impl App {
         hash.update(format!("blob {}\0", contents.len()).as_bytes());
         hash.update(&contents);
         if hex::encode(hash.finalize()) != expected_sha
-            || !crate::workflow::has_dispatch(&contents)
+            || !crate::workflow::supports_sluss_dispatch(&contents)
                 .map_err(|_| GitHubError::MissingWorkflowDispatch)?
         {
             return Err(GitHubError::MissingWorkflowDispatch);

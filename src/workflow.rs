@@ -1,4 +1,4 @@
-//! Bounded, conservative recognition of GitHub workflow dispatch triggers.
+//! Bounded, conservative recognition of Sluss-compatible dispatch inputs.
 //! This does not validate the workflow's semantics, jobs or trustworthiness.
 use std::collections::BTreeSet;
 use yaml_rust2::{
@@ -13,10 +13,11 @@ const MAX_DEPTH: usize = 64;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InvalidWorkflow;
 
-/// Return whether the single YAML document explicitly declares the trigger.
+/// Return whether the document explicitly declares the trigger and the two
+/// string inputs sent by Sluss, without any other mandatory inputs.
 /// Aliases outside `on` are ignored without expansion; an aliased trigger is
 /// rejected because its value cannot be proven by this streaming inspection.
-pub(crate) fn has_dispatch(bytes: &[u8]) -> Result<bool, InvalidWorkflow> {
+pub(crate) fn supports_sluss_dispatch(bytes: &[u8]) -> Result<bool, InvalidWorkflow> {
     if bytes.is_empty() || bytes.len() > MAX_BYTES {
         return Err(InvalidWorkflow);
     }
@@ -57,7 +58,7 @@ pub(crate) fn has_dispatch(bytes: &[u8]) -> Result<bool, InvalidWorkflow> {
     let mut found = false;
     while !matches!(cursor.peek()?, Event::MappingEnd) {
         let key = cursor.string_scalar()?;
-        if !keys.insert(key.clone()) {
+        if key == "<<" || !keys.insert(key.clone()) {
             return Err(InvalidWorkflow);
         }
         if key == "on" {
@@ -118,7 +119,10 @@ impl Cursor {
     }
     fn triggers(&mut self) -> Result<bool, InvalidWorkflow> {
         match self.peek()? {
-            Event::Scalar(..) => Ok(self.string_scalar()? == "workflow_dispatch"),
+            Event::Scalar(..) => {
+                self.string_scalar()?;
+                Ok(false)
+            }
             Event::SequenceStart(..) => {
                 self.take()?;
                 let mut names = BTreeSet::new();
@@ -129,19 +133,20 @@ impl Cursor {
                     }
                 }
                 self.expect(Event::SequenceEnd)?;
-                Ok(names.contains("workflow_dispatch"))
+                Ok(false)
             }
             Event::MappingStart(..) => {
                 self.take()?;
                 let mut names = BTreeSet::new();
+                let mut compatible = false;
                 while !matches!(self.peek()?, Event::MappingEnd) {
                     let name = self.string_scalar()?;
-                    if !names.insert(name.clone()) {
+                    if name == "<<" || !names.insert(name.clone()) {
                         return Err(InvalidWorkflow);
                     }
                     if name == "workflow_dispatch" {
                         match self.peek()? {
-                            Event::MappingStart(..) => self.skip_node()?,
+                            Event::MappingStart(..) => compatible = self.dispatch_config()?,
                             Event::Scalar(value, TScalarStyle::Plain, _, None)
                                 if value.is_empty() || value == "null" || value == "~" =>
                             {
@@ -154,10 +159,83 @@ impl Cursor {
                     }
                 }
                 self.expect(Event::MappingEnd)?;
-                Ok(names.contains("workflow_dispatch"))
+                Ok(compatible)
             }
             _ => Err(InvalidWorkflow),
         }
+    }
+
+    fn dispatch_config(&mut self) -> Result<bool, InvalidWorkflow> {
+        if !matches!(self.take()?, Event::MappingStart(..)) {
+            return Err(InvalidWorkflow);
+        }
+        let mut keys = BTreeSet::new();
+        let mut compatible = false;
+        while !matches!(self.peek()?, Event::MappingEnd) {
+            let key = self.string_scalar()?;
+            if key == "<<" || !keys.insert(key.clone()) {
+                return Err(InvalidWorkflow);
+            }
+            if key == "inputs" {
+                compatible = self.dispatch_inputs()?;
+            } else {
+                self.skip_node()?;
+            }
+        }
+        self.expect(Event::MappingEnd)?;
+        Ok(compatible)
+    }
+
+    fn dispatch_inputs(&mut self) -> Result<bool, InvalidWorkflow> {
+        if !matches!(self.take()?, Event::MappingStart(..)) {
+            return Err(InvalidWorkflow);
+        }
+        let mut names = BTreeSet::new();
+        let mut host = false;
+        let mut suites = false;
+        let mut other_mandatory = false;
+        while !matches!(self.peek()?, Event::MappingEnd) {
+            let name = self.string_scalar()?;
+            if name == "<<" || !names.insert(name.clone()) || names.len() > 25 {
+                return Err(InvalidWorkflow);
+            }
+            let (kind, required) = self.input_definition()?;
+            match name.as_str() {
+                "sluss_host" => host = kind.as_deref() == Some("string"),
+                "sluss_suites" => suites = kind.as_deref() == Some("string"),
+                _ => other_mandatory |= required,
+            }
+        }
+        self.expect(Event::MappingEnd)?;
+        Ok(host && suites && !other_mandatory)
+    }
+
+    fn input_definition(&mut self) -> Result<(Option<String>, bool), InvalidWorkflow> {
+        if !matches!(self.take()?, Event::MappingStart(..)) {
+            return Err(InvalidWorkflow);
+        }
+        let mut keys = BTreeSet::new();
+        let mut kind = None;
+        let mut required = false;
+        while !matches!(self.peek()?, Event::MappingEnd) {
+            let key = self.string_scalar()?;
+            if key == "<<" || !keys.insert(key.clone()) {
+                return Err(InvalidWorkflow);
+            }
+            match key.as_str() {
+                "type" => kind = Some(self.string_scalar()?),
+                "required" => match self.take()? {
+                    Event::Scalar(value, TScalarStyle::Plain, _, None) if value == "true" => {
+                        required = true;
+                    }
+                    Event::Scalar(value, TScalarStyle::Plain, _, None) if value == "false" => {}
+                    _ => return Err(InvalidWorkflow),
+                },
+                _ => self.skip_node()?,
+            }
+        }
+        self.expect(Event::MappingEnd)?;
+        Ok((kind, required))
     }
 }
 
@@ -165,31 +243,26 @@ impl Cursor {
 mod tests {
     use super::*;
     #[test]
-    fn recognizes_dispatch_in_scalar_sequence_and_mapping_forms() {
+    fn requires_both_string_inputs_without_other_mandatory_inputs() {
+        let good = "on: {workflow_dispatch: {inputs: {sluss_host: {type: string}, sluss_suites: {type: string}, note: {type: string, required: false}}}}\n";
+        assert_eq!(supports_sluss_dispatch(good.as_bytes()), Ok(true));
         for text in [
-            "on: workflow_dispatch\n",
-            "on: [push, workflow_dispatch]\n",
-            "'on':\n  workflow_dispatch:\n",
-            "on: {workflow_dispatch: {}, push: {branches: [main]}}\n",
-            "on:\n  workflow_dispatch:\n    inputs:\n      name:\n        type: string\n",
-            "shared: &steps [one, two]\non: workflow_dispatch\njobs: *steps\n",
+            "on: workflow_dispatch\n".to_string(),
+            "on: [push, workflow_dispatch]\n".to_string(),
+            "on: {workflow_dispatch: {}}\n".to_string(),
+            "on: push\n".to_string(),
+            "on: {workflow_dispatch: {inputs: {sluss_host: {type: string}}}}\n".to_string(),
+            "on: {workflow_dispatch: {inputs: {sluss_host: {type: string}, sluss_suites: {type: string}, extra: {type: string, required: true}}}}\n".to_string(),
+            "on: {workflow_dispatch: {inputs: {sluss_host: {type: choice}, sluss_suites: {type: string}}}}\n".to_string(),
+            "on: {workflow_dispatch: {inputs: {sluss_host: {}, sluss_suites: {type: string}}}}\n".to_string(),
         ] {
-            assert_eq!(has_dispatch(text.as_bytes()), Ok(true), "{text}");
-        }
-        for text in [
-            "on: push\n",
-            "on: [push, pull_request]\n",
-            "on: {push: {}}\n",
-            "name: workflow_dispatch\n",
-            "jobs:\n  workflow_dispatch: {}\n",
-        ] {
-            assert_eq!(has_dispatch(text.as_bytes()), Ok(false), "{text}");
+            assert_eq!(supports_sluss_dispatch(text.as_bytes()), Ok(false), "{text}");
         }
     }
     #[test]
     fn accepts_the_project_workflow_example() {
         let example = include_bytes!("../examples/github-actions/sluss-ci.yml");
-        assert_eq!(has_dispatch(example), Ok(true));
+        assert_eq!(supports_sluss_dispatch(example), Ok(true));
     }
     #[test]
     fn rejects_ambiguous_or_unbounded_trigger_declarations() {
@@ -199,18 +272,23 @@ mod tests {
             "on: {workflow_dispatch: {}, workflow_dispatch: {}}\n",
             "on: {workflow_dispatch: true}\n",
             "on: {workflow_dispatch: 'null'}\n",
+            "on: {workflow_dispatch: {inputs: {sluss_host: {type: string}, sluss_host: {type: string}}}}}\n",
+            "on: {workflow_dispatch: {inputs: {sluss_host: {type: string, type: string}}}}}\n",
+            "on: {workflow_dispatch: {inputs: {sluss_host: {type: string, required: 'false'}}}}}\n",
+            "on: {workflow_dispatch: {inputs: {sluss_host: *alias}}}\n",
+            "defaults: &d {required: true}\non: {workflow_dispatch: {inputs: {extra: {<<: *d}}}}}\n",
             "events: &e [workflow_dispatch]\non: *e\n",
             "on: workflow_dispatch\n---\non: push\n",
             "on: [workflow_dispatch\n",
         ] {
             assert_eq!(
-                has_dispatch(text.as_bytes()),
+                supports_sluss_dispatch(text.as_bytes()),
                 Err(InvalidWorkflow),
                 "{text}"
             );
         }
         assert_eq!(
-            has_dispatch(&vec![b'a'; MAX_BYTES + 1]),
+            supports_sluss_dispatch(&vec![b'a'; MAX_BYTES + 1]),
             Err(InvalidWorkflow)
         );
         let deep = format!(
@@ -218,12 +296,27 @@ mod tests {
             "[".repeat(65),
             "]".repeat(65)
         );
-        assert_eq!(has_dispatch(deep.as_bytes()), Err(InvalidWorkflow));
-        assert_eq!(has_dispatch(&[0xff]), Err(InvalidWorkflow));
+        assert_eq!(
+            supports_sluss_dispatch(deep.as_bytes()),
+            Err(InvalidWorkflow)
+        );
+        assert_eq!(supports_sluss_dispatch(&[0xff]), Err(InvalidWorkflow));
+        let inputs = (0..26)
+            .map(|i| format!("i{i}: {{type: string}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let too_many = format!("on: {{workflow_dispatch: {{inputs: {{{inputs}}}}}}}\n");
+        assert_eq!(
+            supports_sluss_dispatch(too_many.as_bytes()),
+            Err(InvalidWorkflow)
+        );
         let excessive = format!(
             "on: workflow_dispatch\njobs: [{}]\n",
             "x,".repeat(MAX_EVENTS)
         );
-        assert_eq!(has_dispatch(excessive.as_bytes()), Err(InvalidWorkflow));
+        assert_eq!(
+            supports_sluss_dispatch(excessive.as_bytes()),
+            Err(InvalidWorkflow)
+        );
     }
 }

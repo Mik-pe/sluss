@@ -1889,7 +1889,7 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
     ));
     for invalid in [
         226, 227, 228, 229, 240, 241, 242, 243, 244, 245, 246, 248, 249, 250, 251, 252, 253, 254,
-        255,
+        255, 230, 231,
     ] {
         DEFAULT_REPO_READS.store(0, Ordering::SeqCst);
         DEFAULT_BRANCH_READS.store(0, Ordering::SeqCst);
@@ -6249,7 +6249,9 @@ async fn cli_dispatches_fixture() {
     assert!(!doctor.status.success());
     let info = String::from_utf8_lossy(&doctor.stdout);
     assert!(info.contains("target: main"));
-    assert!(info.contains("workflow_dispatch declared on default branch main"));
+    assert!(
+        info.contains("workflow_dispatch with Sluss string inputs declared on default branch main")
+    );
     assert!(info.contains("workflow trust is not verified"));
     assert!(info.contains("active branch rules returned: 2"));
     assert!(info.contains("authenticated GitHub App: sluss-test (ID 17)"));
@@ -8027,7 +8029,8 @@ async fn default_branch_info(
     )
 }
 
-const WORKFLOW_GOOD: &str = "name: Test\non:\n  workflow_dispatch:\n";
+const WORKFLOW_GOOD: &str = "name: Test\non:\n  workflow_dispatch:\n    inputs:\n      sluss_host: {type: string}\n      sluss_suites: {type: string}\n";
+const WORKFLOW_NO_INPUTS: &str = "on: {workflow_dispatch: {}}\n";
 const WORKFLOW_NO_DISPATCH: &str = "on: push\n";
 const WORKFLOW_INVALID: &str = "on: [workflow_dispatch\n";
 static STAGE_REF_READS: AtomicUsize = AtomicUsize::new(0);
@@ -8061,7 +8064,9 @@ async fn default_workflow_tree(
         vec![json!({"path":"workflows","mode":"040000","type":"tree","sha":"2".repeat(40)})]
     } else if tree_id == "e".repeat(40) || tree_id == "2".repeat(40) {
         let default = tree_id == "e".repeat(40);
-        let contents = if mode == 255 && default {
+        let contents = if (mode == 230 && default) || (mode == 231 && !default) {
+            WORKFLOW_NO_INPUTS
+        } else if mode == 255 && default {
             WORKFLOW_INVALID
         } else if (mode == 250 && default) || (mode == 251 && !default) {
             WORKFLOW_NO_DISPATCH
@@ -8094,10 +8099,15 @@ async fn default_workflow_blob(
     use base64::Engine;
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
-    let contents = [WORKFLOW_GOOD, WORKFLOW_NO_DISPATCH, WORKFLOW_INVALID]
-        .into_iter()
-        .find(|text| test_blob_sha(text) == blob_id)
-        .unwrap();
+    let contents = [
+        WORKFLOW_GOOD,
+        WORKFLOW_NO_DISPATCH,
+        WORKFLOW_INVALID,
+        WORKFLOW_NO_INPUTS,
+    ]
+    .into_iter()
+    .find(|text| test_blob_sha(text) == blob_id)
+    .unwrap();
     let changed = contents.replace("Test", "Nest");
     let encoded = base64::engine::general_purpose::STANDARD.encode(if mode == 229 {
         changed.as_str()
