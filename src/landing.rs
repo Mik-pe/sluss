@@ -292,11 +292,28 @@ impl LandingJournal {
         Ok(plan)
     }
 
-    /// Recheck the local frozen inputs while claiming. Provider changes after
-    /// this transaction and trusted CI policy still need independent guards.
+    /// Recheck only local frozen inputs while claiming. This development API
+    /// does not query the provider and must not be used to authorize a write.
+    /// Provider changes and trusted CI policy still need independent guards.
     pub fn claim_observed_batch(
         &mut self,
         operation_id: &str,
+    ) -> Result<Option<LandingPlan>, LandingError> {
+        self.claim_observed_batch_inner(operation_id, None)
+    }
+
+    pub(crate) fn claim_with_fresh_snapshot(
+        &mut self,
+        operation_id: &str,
+        snapshot: &crate::github::ActionsSnapshot,
+    ) -> Result<Option<LandingPlan>, LandingError> {
+        self.claim_observed_batch_inner(operation_id, Some(snapshot))
+    }
+
+    fn claim_observed_batch_inner(
+        &mut self,
+        operation_id: &str,
+        snapshot: Option<&crate::github::ActionsSnapshot>,
     ) -> Result<Option<LandingPlan>, LandingError> {
         let tx = self
             .conn
@@ -317,6 +334,19 @@ impl LandingJournal {
         if now != plan {
             return Err(LandingError::StaleBatch);
         }
+        if let Some(snapshot) = snapshot {
+            let body: String = tx.query_row(
+                "SELECT body FROM ci_observations WHERE id=?1",
+                [&plan.batch_id],
+                |r| r.get(0),
+            )?;
+            let saved: crate::scheduler::CiObservationRecord = serde_json::from_str(&body)?;
+            let mut current = snapshot.clone();
+            current.jobs.sort_by_key(|job| job.id);
+            if saved.snapshot.as_ref() != Some(&current) {
+                return Err(LandingError::StaleBatch);
+            }
+        }
         if tx.execute(
             "UPDATE landing_intents_v1 SET state='sending' WHERE id=?1 AND state='prepared'",
             [operation_id],
@@ -326,6 +356,35 @@ impl LandingJournal {
         }
         tx.commit()?;
         Ok(Some(plan))
+    }
+
+    pub(crate) fn refresh_target(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(LandingPlan, u64), LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,i64,String)> = tx.query_row(
+            "SELECT i.plan,i.state,i.repository_id,i.target_ref FROM landing_intents_v1 i JOIN landing_batch_bindings_v1 b ON b.id=i.id WHERE i.id=?1", [operation_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        let (plan, state) = decode_row(operation_id, row.ok_or(LandingError::BatchBound)?)?;
+        if state != IntentState::Prepared {
+            return Err(LandingError::Transition);
+        }
+        if observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)? != plan {
+            return Err(LandingError::StaleBatch);
+        }
+        let body: String = tx.query_row(
+            "SELECT body FROM ci_observations WHERE id=?1",
+            [&plan.batch_id],
+            |r| r.get(0),
+        )?;
+        let saved: crate::scheduler::CiObservationRecord = serde_json::from_str(&body)?;
+        let id = saved.run_id;
+        tx.commit()?;
+        Ok((plan, id))
     }
     /// Only an unclaimed intent can be cancelled without external reconciliation.
     pub fn cancel(&mut self, id: &str) -> Result<bool, LandingError> {

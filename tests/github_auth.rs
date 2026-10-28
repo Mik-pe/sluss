@@ -150,9 +150,14 @@ async fn actions_jobs(
     let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if mode == 40 { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
-async fn dispatch_repo(headers: HeaderMap) -> Json<Value> {
+async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
-    Json(json!({"id": 7}))
+    let node = if state.mode.load(Ordering::SeqCst) == 63 {
+        "R_other"
+    } else {
+        "R_repo"
+    };
+    Json(json!({"id": 7, "node_id": node}))
 }
 async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -2094,6 +2099,51 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     )
     .await
     .unwrap();
+    // A fresh provider read must match the frozen run, including the latest
+    // attempt and repository node identity, before this experimental claim.
+    let mut landing = sluss::landing::LandingJournal::open(&db).unwrap();
+    let frozen_landing = landing
+        .prepare_observed_batch("land-refresh", id, "R_repo")
+        .unwrap();
+    for invalid in [13, 21, 22, 40, 51, 63] {
+        reads.store(0, Ordering::SeqCst);
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(
+            observer_app
+                .refresh_and_claim_observed_landing(
+                    &mut landing,
+                    &fixture_token,
+                    "owner",
+                    "repo",
+                    "land-refresh"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            landing.get("land-refresh").unwrap().unwrap().1,
+            sluss::landing::IntentState::Prepared
+        );
+    }
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        observer_app
+            .refresh_and_claim_observed_landing(
+                &mut landing,
+                &fixture_token,
+                "owner",
+                "repo",
+                "land-refresh"
+            )
+            .await
+            .unwrap(),
+        Some(frozen_landing)
+    );
+    assert_eq!(
+        landing.get("land-refresh").unwrap().unwrap().1,
+        sluss::landing::IntentState::Sending
+    );
     // A restarted observer reads the same receipt without duplicating measurements.
     sluss::worker::observe_dispatches_once(
         &observer_app,

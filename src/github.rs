@@ -1106,6 +1106,70 @@ impl App {
 }
 
 #[derive(Debug, Error)]
+pub enum LandingRefreshError {
+    #[error("repository or App token scope does not match the frozen intent")]
+    Scope,
+    #[error("Actions run changed while it was being observed")]
+    Changed,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Journal(#[from] crate::landing::LandingError),
+}
+impl App {
+    /// Refresh the recorded Actions run immediately before claiming an
+    /// experimental batch-bound intent. This is not landing authorization:
+    /// approvals, trusted policy and provider state can still change later.
+    /// No GitHub mutation is sent by this method.
+    pub async fn refresh_and_claim_observed_landing(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        operation_id: &str,
+    ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        if !valid_name(owner)
+            || !valid_name(repository)
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let (plan, run_id) = journal.refresh_target(operation_id)?;
+        if i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
+            || i64::try_from(token.installation_id).ok() != Some(plan.installation_id)
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let first_repo: Identity = self.get_json(token, &root, None).await?;
+        if first_repo.id != token.repository_id || first_repo.node_id != plan.repository_node_id {
+            return Err(LandingRefreshError::Scope);
+        }
+        let run_path = format!("{root}/actions/runs/{run_id}");
+        let first: ActionsRun = self.get_json(token, &run_path, None).await?;
+        let snapshot = self
+            .observe_actions_attempt(token, owner, repository, run_id, 1)
+            .await?;
+        let last: ActionsRun = self.get_json(token, &run_path, None).await?;
+        let last_repo: Identity = self.get_json(token, &root, None).await?;
+        if first_repo != last_repo || first != last || last != snapshot.run || last.run_attempt != 1
+        {
+            return Err(LandingRefreshError::Changed);
+        }
+        journal
+            .claim_with_fresh_snapshot(operation_id, &snapshot)
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum InputFetchError {
     #[error("GitHub input fetch is not authorized for this token or repository")]
     InvalidScope,
