@@ -1220,6 +1220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "workflow: {} ({}, {})",
                 preflight.workflow.id, preflight.workflow.path, preflight.workflow.state
             );
+            println!(
+                "workflow file exists on default branch {} at {}; dispatch trigger and workflow trust are not verified",
+                preflight.default_workflow.branch, preflight.default_workflow.commit_sha
+            );
             let runners = app
                 .observe_repository_runners(
                     &inventory_token,
@@ -1235,9 +1239,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _staging = app.staging_token(installation, repository_id).await?;
             let _dispatch = app.dispatch_token(installation, repository_id).await?;
             println!("repository-scoped read, staging and Actions credentials were issued");
-            if preflight.workflow.state != "active" {
-                eprintln!("workflow is not active");
-            }
         } else {
             eprintln!("To inspect GitHub, supply --config, --capacity and --workflow-id.");
         }

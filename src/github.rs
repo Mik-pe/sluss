@@ -24,6 +24,8 @@ pub enum GitHubError {
     InvalidResponse,
     #[error("GitHub data is invalid, incomplete, or changed during observation")]
     UnstableObservation,
+    #[error("the registered workflow file is absent or not a regular file on the default branch")]
+    MissingDefaultWorkflow,
 }
 
 pub struct App {
@@ -1438,10 +1440,13 @@ impl App {
                 return Err(DispatchError::StaleBase);
             }
         }
+        let workflow = self
+            .observe_registered_workflow(token, owner, repository, pending.plan.workflow_id)
+            .await?;
+        let default_workflow = self
+            .observe_default_workflow(token, owner, repository, &workflow)
+            .await?;
         let claimed = if let Some((target, base)) = target_base {
-            let workflow = self
-                .observe_registered_workflow(token, owner, repository, pending.plan.workflow_id)
-                .await?;
             let rules = match self
                 .observe_branch_rules(token, owner, repository, target)
                 .await
@@ -1493,6 +1498,8 @@ impl App {
             {
                 return Err(DispatchError::StaleBase);
             }
+            self.recheck_default_workflow(token, owner, repository, &workflow, &default_workflow)
+                .await?;
             if let Some(security) = security {
                 scheduler.claim_batch_dispatch_with_security(id, &workflow.path, &security)?
             } else if let Some(rules) = rules {
@@ -1501,6 +1508,8 @@ impl App {
                 scheduler.claim_batch_dispatch(id, &workflow.path)?
             }
         } else {
+            self.recheck_default_workflow(token, owner, repository, &workflow, &default_workflow)
+                .await?;
             scheduler.claim_dispatch(id)?
         };
         if !claimed {
@@ -3659,10 +3668,22 @@ pub struct WorkflowInfo {
     pub path: String,
     pub state: String,
 }
+#[derive(Deserialize, PartialEq, Eq)]
+struct DefaultRepository {
+    id: u64,
+    default_branch: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultWorkflowPresence {
+    pub branch: String,
+    pub commit_sha: String,
+    pub blob_sha: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryPreflight {
     pub branch: BranchInfo,
     pub workflow: WorkflowInfo,
+    pub default_workflow: DefaultWorkflowPresence,
     /// Active rules returned by GitHub, not a complete bypass-policy proof.
     pub rules: Vec<serde_json::Value>,
 }
@@ -4078,6 +4099,117 @@ impl App {
         Ok(last)
     }
 
+    /// Verify the active workflow's file is a regular blob at a stable default
+    /// branch commit. This does not parse workflow_dispatch or prove trust.
+    pub async fn observe_default_workflow(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        workflow: &WorkflowInfo,
+    ) -> Result<DefaultWorkflowPresence, GitHubError> {
+        #[derive(Deserialize)]
+        struct Tree {
+            sha: String,
+            truncated: bool,
+            tree: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            path: String,
+            mode: String,
+            #[serde(rename = "type")]
+            kind: String,
+            sha: String,
+        }
+        if !valid_name(owner)
+            || !valid_name(repository)
+            || workflow.state != "active"
+            || workflow.id == 0
+            || !valid_workflow_path(&workflow.path)
+            || !(token.checks_read || token.actions_write)
+        {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let repo1: DefaultRepository = self.get_json(token, &root, None).await?;
+        if repo1.id != token.repository_id {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let branch1 = self
+            .observe_target_branch(token, owner, repository, &repo1.default_branch)
+            .await?;
+        let mut tree_sha = branch1.commit.sha.clone();
+        let filename = workflow
+            .path
+            .strip_prefix(".github/workflows/")
+            .ok_or(GitHubError::InvalidConfiguration)?;
+        for (component, kind, modes) in [
+            (".github", "tree", &["040000"][..]),
+            ("workflows", "tree", &["040000"][..]),
+            (filename, "blob", &["100644", "100755"][..]),
+        ] {
+            let tree: Tree = self
+                .get_json(token, &format!("{root}/git/trees/{tree_sha}"), None)
+                .await?;
+            if tree.sha != tree_sha || tree.truncated || tree.tree.len() > 10000 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let mut entries = tree.tree.iter().filter(|entry| entry.path == component);
+            let entry = entries.next().ok_or(GitHubError::MissingDefaultWorkflow)?;
+            if entries.next().is_some()
+                || entry.kind != kind
+                || !modes.contains(&entry.mode.as_str())
+                || !commit_sha(&entry.sha)
+            {
+                return Err(GitHubError::MissingDefaultWorkflow);
+            }
+            tree_sha = entry.sha.clone();
+        }
+        let branch2 = self
+            .observe_target_branch(token, owner, repository, &repo1.default_branch)
+            .await?;
+        let repo2: DefaultRepository = self.get_json(token, &root, None).await?;
+        if repo1 != repo2 || branch1 != branch2 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(DefaultWorkflowPresence {
+            branch: repo1.default_branch,
+            commit_sha: branch1.commit.sha,
+            blob_sha: tree_sha,
+        })
+    }
+
+    async fn recheck_default_workflow(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        workflow: &WorkflowInfo,
+        expected: &DefaultWorkflowPresence,
+    ) -> Result<(), GitHubError> {
+        let registered = self
+            .observe_registered_workflow(token, owner, repository, workflow.id)
+            .await?;
+        if registered != *workflow {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let first: DefaultRepository = self.get_json(token, &root, None).await?;
+        let branch = self
+            .observe_target_branch(token, owner, repository, &expected.branch)
+            .await?;
+        let last: DefaultRepository = self.get_json(token, &root, None).await?;
+        if first != last
+            || first.id != token.repository_id
+            || first.default_branch != expected.branch
+            || branch.commit.sha != expected.commit_sha
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(())
+    }
+
     /// Inspect current branch, workflow registration and active branch rules.
     /// Agreement across reads is an observation, not a landing authorization.
     pub async fn inspect_repository(
@@ -4113,15 +4245,20 @@ impl App {
             || branch2.name != branch
             || !commit_sha(&branch2.commit.sha)
             || workflow2.id != workflow_id
-            || !workflow2.path.starts_with(".github/workflows/")
-            || workflow2.path.is_empty()
-            || workflow2.state.is_empty()
+            || !valid_workflow_path(&workflow2.path)
+            || workflow2.state != "active"
         {
             return Err(GitHubError::UnstableObservation);
         }
+        let default_workflow = self
+            .observe_default_workflow(token, owner, repository, &workflow2)
+            .await?;
+        self.recheck_default_workflow(token, owner, repository, &workflow2, &default_workflow)
+            .await?;
         Ok(RepositoryPreflight {
             branch: branch2,
             workflow: workflow2,
+            default_workflow,
             rules: rules2,
         })
     }

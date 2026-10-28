@@ -163,7 +163,15 @@ async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> 
     } else {
         "R_repo"
     };
-    Json(json!({"id": 7, "node_id": node}))
+    let mode = state.mode.load(Ordering::SeqCst);
+    let default = if mode == 245 && DEFAULT_REPO_READS.fetch_add(1, Ordering::SeqCst) > 1 {
+        "other"
+    } else if mode == 247 {
+        "release"
+    } else {
+        "main"
+    };
+    Json(json!({"id": 7, "node_id": node, "default_branch":default}))
 }
 async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -1775,6 +1783,19 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
         .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/branches/main", get(default_branch_info))
+        .route(
+            "/repos/owner/repo/branches/release",
+            get(default_branch_info),
+        )
+        .route(
+            "/repos/owner/repo/git/trees/{tree_id}",
+            get(default_workflow_tree),
+        )
+        .route(
+            "/repos/owner/repo/actions/workflows/17",
+            get(doctor_workflow),
+        )
         .route(
             "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
             get(dispatch_ref),
@@ -1861,6 +1882,35 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
             .await,
         Err(DispatchError::GitHub(GitHubError::InvalidConfiguration))
     ));
+    for invalid in [240, 241, 242, 243, 244, 245, 246, 248, 249] {
+        DEFAULT_REPO_READS.store(0, Ordering::SeqCst);
+        DEFAULT_BRANCH_READS.store(0, Ordering::SeqCst);
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(
+            client
+                .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
+                .await
+                .is_err(),
+            "mode {invalid}"
+        );
+        assert!(matches!(
+            scheduler.pending_dispatches().unwrap()[0].state,
+            DispatchState::Prepared
+        ));
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+    }
+    mode.store(247, Ordering::SeqCst);
+    let registered = client
+        .observe_registered_workflow(&read_token, "owner", "repo", 17)
+        .await
+        .unwrap();
+    let other_default = client
+        .observe_default_workflow(&read_token, "owner", "repo", &registered)
+        .await
+        .unwrap();
+    assert_eq!(other_default.branch, "release");
+    assert_eq!(other_default.commit_sha, "c".repeat(40));
+    mode.store(0, Ordering::SeqCst);
     assert_eq!(
         client
             .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
@@ -2218,6 +2268,10 @@ async fn cli_dispatches_fixture() {
         .route("/repos/owner/repo/check-runs", post(failed_check_post))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
         .route("/repos/owner/repo/branches/main", get(doctor_branch))
+        .route(
+            "/repos/owner/repo/git/trees/{tree_id}",
+            get(default_workflow_tree),
+        )
         .route("/repos/owner/repo/pulls", get(open_pulls))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
@@ -6152,6 +6206,22 @@ async fn cli_dispatches_fixture() {
     released.release_invalidated_ci_only(id, 123).unwrap();
     assert!(released.release_invalidated_ci_only(id, 124).is_err());
     assert_eq!(posts.load(Ordering::SeqCst), 2);
+    mode.store(240, Ordering::SeqCst);
+    let missing_default = launch(vec![
+        "doctor".into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--workflow-id".into(),
+        "17".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(!missing_default.status.success());
+    assert!(String::from_utf8_lossy(&missing_default.stderr).contains("MissingDefaultWorkflow"));
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
     let doctor = launch(vec![
         "doctor".into(),
         "--config".into(),
@@ -6166,6 +6236,8 @@ async fn cli_dispatches_fixture() {
     assert!(!doctor.status.success());
     let info = String::from_utf8_lossy(&doctor.stdout);
     assert!(info.contains("target: main"));
+    assert!(info.contains("workflow file exists on default branch main"));
+    assert!(info.contains("dispatch trigger and workflow trust are not verified"));
     assert!(info.contains("active branch rules returned: 2"));
     assert!(info.contains("authenticated GitHub App: sluss-test (ID 17)"));
     assert!(info.contains("active rulesets inspected: 1; bypass lists unavailable: 0"));
@@ -7919,4 +7991,59 @@ async fn exercise_head_freeze_race(
         journal.marker_creation_state(id).unwrap(),
         sluss::landing::MarkerCreationState::Prepared
     );
+}
+
+static DEFAULT_REPO_READS: AtomicUsize = AtomicUsize::new(0);
+static DEFAULT_BRANCH_READS: AtomicUsize = AtomicUsize::new(0);
+
+async fn default_branch_info(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let release = uri.0.path().ends_with("/release");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let changed = match mode {
+        248 => DEFAULT_BRANCH_READS.fetch_add(1, Ordering::SeqCst) > 0,
+        249 => DEFAULT_BRANCH_READS.fetch_add(1, Ordering::SeqCst) >= 2,
+        _ => false,
+    };
+    Json(
+        json!({"name":if release {"release"} else {"main"},"protected":false,"commit":{"sha":if release || changed {"c".repeat(40)} else {"b".repeat(40)}}}),
+    )
+}
+
+async fn default_workflow_tree(
+    State(state): State<ServerState>,
+    Path(tree_id): Path<String>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let mut entries = if tree_id == "b".repeat(40) || tree_id == "c".repeat(40) {
+        if mode == 240 {
+            vec![]
+        } else {
+            vec![json!({"path":".github","mode":"040000","type":"tree","sha":"d".repeat(40)})]
+        }
+    } else if tree_id == "d".repeat(40) {
+        vec![json!({"path":"workflows","mode":"040000","type":"tree","sha":"e".repeat(40)})]
+    } else if tree_id == "e".repeat(40) {
+        if mode == 241 {
+            vec![]
+        } else {
+            vec![
+                json!({"path":"ci.yml","mode":if mode==244 {"120000"} else {"100644"},"type":"blob","sha":"f".repeat(40)}),
+            ]
+        }
+    } else {
+        vec![]
+    };
+    if mode == 246 && tree_id == "b".repeat(40) {
+        entries.push(entries[0].clone());
+    }
+    Json(
+        json!({"sha":if mode==243 {"a".repeat(40)} else {tree_id},"truncated":mode==242,"tree":entries}),
+    )
 }
