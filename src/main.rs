@@ -997,6 +997,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let listener = tokio::net::TcpListener::bind(listen).await?;
         let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
+        if let Some((app, _, _, _, _)) = &worker {
+            app.enable_shared_rate_limits(&cli.db)?;
+        }
         // Validate the actual persisted topology as well as the file. Without
         // this, planning and staging can run while all capacity workers retry
         // a permanent mismatch with outstanding reservations.

@@ -979,6 +979,15 @@ async fn rate_limited_token(
             )
                 .into_response()
         }
+        224 => {
+            state.token_calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "4")],
+                Json(json!({"message":"rate limit"})),
+            )
+                .into_response()
+        }
         221 => {
             state.token_calls.fetch_add(1, Ordering::SeqCst);
             (
@@ -1847,6 +1856,98 @@ fn spawn_service(
         .spawn()
         .unwrap();
     ChildGuard(child)
+}
+
+#[tokio::test]
+async fn service_rate_limit_survives_restart_and_is_shared_with_another_process() {
+    let (key_dir, _private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(224));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let api = Router::new()
+        .route(
+            "/app/installations/{id}/access_tokens",
+            post(rate_limited_token),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let config = dir.path().join("sluss.toml");
+    std::fs::write(&config, format!("version = 1\n[github]\napp_client_id = \"app-client-id\"\ninstallation_id = 42\nrepository_id = 7\nowner = \"owner\"\nrepository = \"repo\"\napi = \"http://{addr}/\"\n[queue]\ntarget = \"main\"\npoll_seconds = 1\n[checks]\nrequired_reviews = 1\n")).unwrap();
+    let port = || {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    };
+    let mut first = spawn_service(&db, &config, key_dir.path(), port());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let saved = db.exists()
+                && rusqlite::Connection::open_with_flags(
+                    &db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT until_ms FROM github_rate_limit_gate WHERE id=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .ok()
+                })
+                .is_some();
+            if saved && calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            assert!(
+                first.0.try_wait().unwrap().is_none(),
+                "first service exited before saving rate limit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first service did not save the rate limit");
+    mode.store(0, Ordering::SeqCst);
+    let mut second = spawn_service(&db, &config, key_dir.path(), port());
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(second.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "another process must honor the saved gate"
+    );
+    drop(first);
+    drop(second);
+    let mut restarted = spawn_service(&db, &config, key_dir.path(), port());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(restarted.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a restarted process must honor the saved gate"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while calls.load(Ordering::SeqCst) == 1 {
+            assert!(
+                restarted.0.try_wait().unwrap().is_none(),
+                "restarted service exited during recovery"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the remaining service did not resume after the saved deadline");
+    drop(restarted);
+    server.abort();
 }
 
 #[tokio::test]

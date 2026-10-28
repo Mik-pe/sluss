@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -23,6 +23,8 @@ pub enum GitHubError {
     Status(u16),
     #[error("GitHub rate limit is active; request deferred")]
     RateLimited,
+    #[error("the shared GitHub rate-limit state is unavailable")]
+    RateLimitStore,
     #[error("GitHub returned an invalid or unexpectedly scoped installation token")]
     InvalidResponse,
     #[error("GitHub data is invalid, incomplete, or changed during observation")]
@@ -41,6 +43,7 @@ pub struct App {
     client: reqwest::Client,
     api: reqwest::Url,
     rate_limit: Mutex<RateLimitGate>,
+    shared_rate_limit: OnceLock<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -332,7 +335,27 @@ impl App {
             client,
             api,
             rate_limit: Mutex::new(RateLimitGate::Open),
+            shared_rate_limit: OnceLock::new(),
         })
+    }
+
+    /// Coordinate API backoff with service processes using the same database.
+    /// Call once during startup before any worker or provider request.
+    pub fn enable_shared_rate_limits(&self, database: &std::path::Path) -> Result<(), GitHubError> {
+        let path = database
+            .canonicalize()
+            .map_err(|_| GitHubError::RateLimitStore)?;
+        if let Some(existing) = self.shared_rate_limit.get() {
+            return if *existing == path {
+                Ok(())
+            } else {
+                Err(GitHubError::InvalidConfiguration)
+            };
+        }
+        crate::rate_limit::initialize(&path).map_err(|_| GitHubError::RateLimitStore)?;
+        self.shared_rate_limit
+            .set(path)
+            .map_err(|_| GitHubError::InvalidConfiguration)
     }
 
     /// Defer new API requests across workers after an observed rate limit.
@@ -341,7 +364,7 @@ impl App {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, GitHubError> {
-        self.check_rate_limit()?;
+        self.check_rate_limit().await?;
         let mut response = request.send().await.map_err(|_| GitHubError::Request)?;
         let status = response.status();
         let now = SystemTime::now()
@@ -369,44 +392,64 @@ impl App {
                 delay = rate_limit_delay(status, response.headers(), true, now);
             }
             if let Some(delay) = delay {
-                self.defer_requests(delay)?;
+                self.defer_requests(delay).await?;
             }
             return Err(GitHubError::Status(status.as_u16()));
         }
         if let Some(delay) = delay {
-            self.defer_requests(delay)?;
+            self.defer_requests(delay).await?;
         }
         Ok(response)
     }
 
-    fn check_rate_limit(&self) -> Result<(), GitHubError> {
-        let mut gate = self
-            .rate_limit
-            .lock()
-            .map_err(|_| GitHubError::RateLimited)?;
-        match &*gate {
-            RateLimitGate::Until(deadline) if Instant::now() >= *deadline => {
-                *gate = RateLimitGate::Open
+    async fn check_rate_limit(&self) -> Result<(), GitHubError> {
+        {
+            let mut gate = self
+                .rate_limit
+                .lock()
+                .map_err(|_| GitHubError::RateLimited)?;
+            match &*gate {
+                RateLimitGate::Until(deadline) if Instant::now() >= *deadline => {
+                    *gate = RateLimitGate::Open
+                }
+                RateLimitGate::Open => {}
+                _ => return Err(GitHubError::RateLimited),
             }
-            RateLimitGate::Open => {}
-            _ => return Err(GitHubError::RateLimited),
+        }
+        if let Some(path) = self.shared_rate_limit.get() {
+            let path = path.clone();
+            let blocked = tokio::task::spawn_blocking(move || crate::rate_limit::blocked(&path))
+                .await
+                .map_err(|_| GitHubError::RateLimitStore)?
+                .map_err(|_| GitHubError::RateLimitStore)?;
+            if blocked {
+                return Err(GitHubError::RateLimited);
+            }
         }
         Ok(())
     }
 
-    fn defer_requests(&self, delay: Duration) -> Result<(), GitHubError> {
-        let mut gate = self
-            .rate_limit
-            .lock()
-            .map_err(|_| GitHubError::RateLimited)?;
-        let Some(deadline) = Instant::now().checked_add(delay) else {
-            *gate = RateLimitGate::Indefinite;
-            return Ok(());
-        };
-        match &*gate {
-            RateLimitGate::Indefinite => {}
-            RateLimitGate::Until(old) if *old >= deadline => {}
-            _ => *gate = RateLimitGate::Until(deadline),
+    async fn defer_requests(&self, delay: Duration) -> Result<(), GitHubError> {
+        {
+            let mut gate = self
+                .rate_limit
+                .lock()
+                .map_err(|_| GitHubError::RateLimited)?;
+            match Instant::now().checked_add(delay) {
+                None => *gate = RateLimitGate::Indefinite,
+                Some(deadline) => match &*gate {
+                    RateLimitGate::Indefinite => {}
+                    RateLimitGate::Until(old) if *old >= deadline => {}
+                    _ => *gate = RateLimitGate::Until(deadline),
+                },
+            }
+        }
+        if let Some(path) = self.shared_rate_limit.get() {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || crate::rate_limit::defer(&path, delay))
+                .await
+                .map_err(|_| GitHubError::RateLimitStore)?
+                .map_err(|_| GitHubError::RateLimitStore)?;
         }
         Ok(())
     }
@@ -1877,7 +1920,7 @@ impl App {
             {
                 return Err(DispatchError::StaleRef);
             }
-            self.check_rate_limit()?;
+            self.check_rate_limit().await?;
             if let Some(security) = security {
                 scheduler.claim_batch_dispatch_with_security(id, &workflow.path, &security)?
             } else if let Some(rules) = rules {
@@ -1895,7 +1938,7 @@ impl App {
             {
                 return Err(DispatchError::StaleRef);
             }
-            self.check_rate_limit()?;
+            self.check_rate_limit().await?;
             scheduler.claim_dispatch(id)?
         };
         if !claimed {
@@ -2481,7 +2524,7 @@ impl App {
         {
             return Err(MarkerCreationError::Scope);
         }
-        self.check_rate_limit()?;
+        self.check_rate_limit().await?;
         match journal.claim_marker_creation(&target, trusted)? {
             crate::landing::MarkerCreationState::Creating => {
                 return Err(MarkerCreationError::Uncertain);
@@ -3221,7 +3264,7 @@ impl App {
         let (record, revision) = self
             .verify_staged_ci_inner(journal, (read, security), policy, trusted_ci, batch_id)
             .await?;
-        self.check_rate_limit()?;
+        self.check_rate_limit().await?;
         let intent = match journal.claim_pending_ci_check(&record, revision)? {
             PendingCiCheckClaim::Send(intent) => intent,
             PendingCiCheckClaim::Existing(
@@ -3397,7 +3440,7 @@ impl App {
         if before.check_suite.id != target.suite_id {
             return Err(PendingCheckError::CandidateMismatch);
         }
-        self.check_rate_limit()?;
+        self.check_rate_limit().await?;
         if !journal.claim_pending_ci_cancellation(&target)? {
             return Err(PendingCheckError::Uncertain);
         }
@@ -3616,7 +3659,7 @@ impl App {
         if snapshot.run.id != intent.run_id || snapshot.run.head_sha != intent.integration_sha {
             return Err(FailureCheckError::Scope);
         }
-        self.check_rate_limit()?;
+        self.check_rate_limit().await?;
         if !scheduler.claim_failure_check(batch_id, app.id, &snapshot)? {
             return Err(FailureCheckError::Uncertain);
         }
@@ -4895,7 +4938,7 @@ impl App {
         ) {
             return Ok(StaleCancellation::Uncertain);
         }
-        self.check_rate_limit()?;
+        self.check_rate_limit().await?;
         let claim = if let Some(run_id) = conflicting_run {
             scheduler.claim_conflict_cancellation(id, run_id)?
         } else {
