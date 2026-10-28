@@ -654,3 +654,158 @@ fn concurrent_duplicate_collisions_create_one_reconciliation() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn ci_event_bursts_preserve_admission_scan_but_invalidate_ci_evidence() {
+    use sluss::{batch::Candidate, store::AdmissionCandidate};
+    let (_dir, db, mut store, mut inbox) = security_fixture();
+    let _journal = sluss::landing::LandingJournal::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let app =
+        sluss::webhook::router_with_scope(b"secret".to_vec(), db.clone(), Some((17, 25))).unwrap();
+    assert!(inbox.schedule_if_idle(17, 25).unwrap());
+    let scan = inbox.pending_for(17, 25).unwrap().unwrap();
+    let before: i64 = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='webhook_deliveries'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute("INSERT INTO ci_evidence_candidate_heads_v1(batch_id,policy_digest,digest) VALUES('batch-0000000000000001','policy','evidence')", []).unwrap();
+    for (index, event) in ["check_run", "check_suite", "workflow_run"]
+        .iter()
+        .enumerate()
+    {
+        let body = serde_json::json!({"installation":{"id":17},"repository":{"id":25}, "action":"completed", *event:{"id":123}}).to_string();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &format!("ci-{index}"),
+                event,
+                &body,
+                &signature(body.as_bytes()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            inbox.pending_for(17, 25).unwrap(),
+            Some(sluss::webhook::Reconciliation {
+                installation: 17,
+                repository: 25,
+                revision: scan.revision
+            })
+        );
+    }
+    let after: i64 = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='webhook_deliveries'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        after >= before + 3,
+        "CI hints must advance the attestation delivery clock"
+    );
+    let heads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_evidence_candidate_heads_v1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(heads, 0);
+    // A completed CI event cannot invalidate an otherwise current PR scan.
+    store
+        .apply_admission_reconciliation_with_base(
+            &scan,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: Candidate {
+                    number: 5,
+                    head_sha: "a".repeat(40),
+                },
+                evidence_digest: "e".repeat(64),
+            }],
+            &"b".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert!(inbox.pending_for(17, 25).unwrap().is_none());
+    assert!(matches!(
+        store
+            .batch("batch-0000000000000001")
+            .unwrap()
+            .unwrap()
+            .0
+            .state,
+        sluss::batch::State::Planned
+    ));
+    drop(inbox);
+    let mut inbox = Inbox::open(&db).unwrap();
+    assert!(inbox.pending_for(17, 25).unwrap().is_none());
+    // Even with a CI event header, an ambiguous signed body wakes admission.
+    let body = r#"{"installation":{"id":17},"repository":{"id":25},"check_run":{"id":1},"pull_request":{"number":5}}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "ambiguous",
+                "check_run",
+                body,
+                &signature(body.as_bytes())
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let ambiguous = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(ambiguous.revision > scan.revision);
+    assert!(inbox.acknowledge(&ambiguous).unwrap());
+    // An ID collision always takes the conservative path, including CI hints.
+    let body = r#"{"installation":{"id":17},"repository":{"id":25},"check_run":{"id":2}}"#;
+    assert_eq!(
+        app.oneshot(request(
+            "ci-0",
+            "check_run",
+            body,
+            &signature(body.as_bytes())
+        ))
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(inbox.pending_for(17, 25).unwrap().is_some());
+    // The public low-level API lacks a verified body shape and stays conservative.
+    let job = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(inbox.acknowledge(&job).unwrap());
+    assert_eq!(
+        inbox
+            .record("raw", "workflow_run", &[7; 32], 17, 25)
+            .unwrap(),
+        Record::New
+    );
+    assert!(inbox.pending_for(17, 25).unwrap().is_some());
+    let job = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(inbox.acknowledge(&job).unwrap());
+    // A webhook-only, unscoped receiver retains its prior wakeup behavior.
+    let unscoped = router(b"secret".to_vec(), db.clone()).unwrap();
+    let body = r#"{"installation":{"id":17},"repository":{"id":25},"workflow_run":{"id":3}}"#;
+    assert_eq!(
+        unscoped
+            .oneshot(request(
+                "unscoped-ci",
+                "workflow_run",
+                body,
+                &signature(body.as_bytes())
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(inbox.pending_for(17, 25).unwrap().is_some());
+}

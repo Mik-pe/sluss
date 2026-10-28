@@ -148,17 +148,42 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     {
         return StatusCode::ACCEPTED;
     }
+    // Event headers are not signed. Only bypass the admission wakeup when
+    // the authenticated body also has the expected CI object and no obvious
+    // PR, push, review, or security-event fields. Ambiguous bodies retain the
+    // conservative full reconciliation path.
+    let ci_only = state.scope.is_some()
+        && ci_observation_event(event)
+        && serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .is_some_and(|body| {
+                body.as_object().is_some_and(|body| {
+                    body.get(event).is_some_and(serde_json::Value::is_object)
+                        && [
+                            "pull_request",
+                            "review",
+                            "ref",
+                            "rule",
+                            "ruleset",
+                            "member",
+                            "team",
+                        ]
+                        .iter()
+                        .all(|key| !body.contains_key(*key))
+                })
+            });
     let digest: [u8; 32] = Sha256::digest(&body).into();
     let delivery = delivery.to_owned();
     let event = event.to_owned();
     match tokio::task::spawn_blocking(move || {
         let mut inbox = Inbox::open(state.db)?;
-        inbox.record(
+        inbox.record_inner(
             &delivery,
             &event,
             &digest,
             envelope.installation.id,
             repository,
+            ci_only,
         )
     })
     .await
@@ -182,6 +207,13 @@ pub enum InboxError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
+}
+
+/// These events concern CI observations, not PR admission. The observer polls
+/// GitHub independently; each delivery still invalidates saved CI candidates
+/// and advances the durable delivery clock.
+fn ci_observation_event(event: &str) -> bool {
+    matches!(event, "check_run" | "check_suite" | "workflow_run")
 }
 
 fn security_event(event: &str) -> bool {
@@ -232,8 +264,8 @@ impl Inbox {
         Ok(Self { conn })
     }
 
-    /// Insert delivery and wakeup in one transaction. IDs must never be reset:
-    /// revisions must not be reused after a reconciliation has been acknowledged.
+    /// Record a hint without a verified payload shape. Such hints always wake
+    /// admission; revisions are never reused after acknowledgement.
     pub fn record(
         &mut self,
         delivery: &str,
@@ -241,6 +273,18 @@ impl Inbox {
         digest: &[u8; 32],
         installation: i64,
         repository: i64,
+    ) -> Result<Record, InboxError> {
+        self.record_inner(delivery, event, digest, installation, repository, false)
+    }
+
+    fn record_inner(
+        &mut self,
+        delivery: &str,
+        event: &str,
+        digest: &[u8; 32],
+        installation: i64,
+        repository: i64,
+        ci_only: bool,
     ) -> Result<Record, InboxError> {
         let tx = self
             .conn
@@ -281,11 +325,13 @@ impl Inbox {
             params![delivery, event, digest.as_slice()],
         )?;
         let revision = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO reconciliations(installation, repository, revision) VALUES(?1, ?2, ?3)
-            ON CONFLICT(installation, repository) DO UPDATE SET revision=excluded.revision",
-            params![installation, repository, revision],
-        )?;
+        if !ci_only {
+            tx.execute(
+                "INSERT INTO reconciliations(installation, repository, revision) VALUES(?1, ?2, ?3)
+                ON CONFLICT(installation, repository) DO UPDATE SET revision=excluded.revision",
+                params![installation, repository, revision],
+            )?;
+        }
         crate::store::invalidate_ci_candidate_hint(&tx, installation, repository)?;
         if security_event(event) {
             crate::store::invalidate_security_event(&tx, installation, repository)?;
