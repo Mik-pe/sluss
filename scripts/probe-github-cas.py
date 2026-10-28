@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Probe GitHub's concurrent two-ref compare-and-update on disposable branches.
+"""Probe GitHub's concurrent three-ref compare-and-update on disposable branches.
 
 Requires the GitHub CLI and a credential with permission to create/delete refs.
 This changes the specified repository temporarily and may trigger workflows.
@@ -37,7 +37,7 @@ def get_ref(repo, name):
     return json.loads(response.stdout)["object"]["sha"]
 
 
-def update(repo_id, prefix, target, stage, base, candidate, label, barrier):
+def update(repo_id, prefix, target, stage, marker, base, candidate, label, barrier):
     mutation_id = f"{prefix}-{label}"
     request = {
         "query": QUERY,
@@ -49,6 +49,8 @@ def update(repo_id, prefix, target, stage, base, candidate, label, barrier):
                     {"name": f"refs/heads/{target}", "beforeOid": base,
                      "afterOid": candidate, "force": False},
                     {"name": f"refs/heads/{stage}", "beforeOid": candidate,
+                     "afterOid": candidate, "force": False},
+                    {"name": f"refs/heads/{marker}", "beforeOid": base,
                      "afterOid": candidate, "force": False},
                 ],
             }
@@ -89,35 +91,59 @@ def run(repo, base, first, second):
                 or data.get("merge_base_commit", {}).get("sha") != base):
             raise RuntimeError(f"{candidate} is not a verified descendant of {base}")
     prefix = "sluss-concurrent-probe-" + uuid.uuid4().hex
-    target, stage_a, stage_b = (f"{prefix}-{suffix}" for suffix in ("target", "stage-a", "stage-b"))
-    names = (target, stage_a, stage_b)
-    allowed = {target: {base, first, second}, stage_a: {first}, stage_b: {second}}
+    target, stage_a, stage_b, marker_a, marker_b = (f"{prefix}-{suffix}" for suffix in
+        ("target", "stage-a", "stage-b", "marker-a", "marker-b"))
+    names = (target, stage_a, stage_b, marker_a, marker_b)
+    allowed = {target: {base, first, second}, stage_a: {first}, stage_b: {second},
+               marker_a: {base, first}, marker_b: {base, second}}
     cleanup_failed = []
     try:
-        for name, sha in zip(names, (base, first, second)):
+        for name, sha in zip(names, (base, first, second, base, base)):
             result = api(["-X", "POST", f"repos/{repo}/git/refs", "--input", "-"],
                          {"ref": f"refs/heads/{name}", "sha": sha})
             if result.returncode:
                 raise RuntimeError(f"Creation of {name} was not confirmed: {result.stderr.strip()}")
             if get_ref(repo, name) != sha:
                 raise RuntimeError(f"Initial value of {name} differs")
+        # A wrong marker precondition must reject the whole mutation, including
+        # the otherwise valid target update. A GraphQL error alone is not proof.
+        wrong_marker = {"query": QUERY, "variables": {"input": {
+            "repositoryId": repo_id, "clientMutationId": f"{prefix}-wrong-marker",
+            "refUpdates": [
+                {"name": f"refs/heads/{target}", "beforeOid": base, "afterOid": first, "force": False},
+                {"name": f"refs/heads/{stage_a}", "beforeOid": first, "afterOid": first, "force": False},
+                {"name": f"refs/heads/{marker_a}", "beforeOid": second, "afterOid": first, "force": False},
+            ],
+        }}}
+        rejected = api(["graphql", "--input", "-"], wrong_marker)
+        try:
+            rejection = json.loads(rejected.stdout)
+        except json.JSONDecodeError:
+            rejection = {}
+        if not rejection.get("errors") or [get_ref(repo, name) for name in names] != [base, first, second, base, base]:
+            raise RuntimeError("Wrong marker precondition did not produce an atomic rejection")
+        print("PASS: wrong marker precondition left all five refs unchanged")
         barrier = threading.Barrier(2)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             tasks = [
-                executor.submit(update, repo_id, prefix, target, stage_a, base, first, "a", barrier),
-                executor.submit(update, repo_id, prefix, target, stage_b, base, second, "b", barrier),
+                executor.submit(update, repo_id, prefix, target, stage_a, marker_a, base, first, "a", barrier),
+                executor.submit(update, repo_id, prefix, target, stage_b, marker_b, base, second, "b", barrier),
             ]
             results = [task.result(timeout=45) for task in tasks]
         refs = [get_ref(repo, name) for name in names]
         print("Results:", json.dumps(results))
         print("Final refs:", json.dumps(refs))
         winners = [result for result in results if result["acknowledged"]]
-        if len(winners) != 1 or refs != [winners[0]["candidate"], first, second]:
-            raise RuntimeError("Expected exactly one acknowledged update and unchanged staging refs")
+        if len(winners) != 1:
+            raise RuntimeError("Expected exactly one acknowledged update")
+        expected = ([first, first, second, first, base] if winners[0]["label"] == "a"
+                    else [second, first, second, base, second])
+        if refs != expected:
+            raise RuntimeError("Target, staging refs or per-operation markers differ from the atomic result")
         loser = next(result for result in results if result is not winners[0])
         if not loser["graphql_error"]:
             raise RuntimeError("The other result was not a GraphQL error; outcome is uncertain")
-        print("PASS: one acknowledged update; exact winner SHA; both staging refs unchanged")
+        print("PASS: exact winner SHA and marker; loser marker and both staging refs unchanged")
     finally:
         for name in names:
             try:

@@ -16,7 +16,7 @@ BASE, FIRST, SECOND, OTHER = (letter * 40 for letter in "abcd")
 
 
 class FakeGitHub:
-    def __init__(self, *, bad_ancestry=False, foreign_ref=False, ambiguous_create=False, race_on_delete=False):
+    def __init__(self, *, bad_ancestry=False, foreign_ref=False, ambiguous_create=False, race_on_delete=False, partial_reject=False):
         self.lock = threading.Lock()
         self.refs = {}
         self.deleted = []
@@ -24,6 +24,7 @@ class FakeGitHub:
         self.foreign_ref = foreign_ref
         self.ambiguous_create = ambiguous_create
         self.race_on_delete = race_on_delete
+        self.partial_reject = partial_reject
         self.changed = False
 
     def __call__(self, args, body=None):
@@ -36,18 +37,23 @@ class FakeGitHub:
                                       "base_commit": {"sha": BASE}, "merge_base_commit": {"sha": BASE}})
             if endpoint == "graphql":
                 update = body["variables"]["input"]
-                target = update["refUpdates"][0]
+                changes = update["refUpdates"]
+                target = changes[0]
                 name = target["name"].removeprefix("refs/heads/")
                 if target["afterOid"] == "0" * 40 and self.race_on_delete and name.endswith("-stage-b"):
                     self.refs[name] = OTHER
                     self.changed = True
-                if self.refs[name] != target["beforeOid"]:
+                if any(self.refs[change["name"].removeprefix("refs/heads/")] != change["beforeOid"] for change in changes):
+                    if self.partial_reject:
+                        self.refs[target["name"].removeprefix("refs/heads/")] = target["afterOid"]
                     return self.response({"data": {"updateRefs": None}, "errors": [{"message": "rejected"}]}, 1)
-                if target["afterOid"] == "0" * 40:
-                    self.deleted.append(name)
-                    del self.refs[name]
-                else:
-                    self.refs[name] = target["afterOid"]
+                for change in changes:
+                    name = change["name"].removeprefix("refs/heads/")
+                    if change["afterOid"] == "0" * 40:
+                        self.deleted.append(name)
+                        del self.refs[name]
+                    else:
+                        self.refs[name] = change["afterOid"]
                 return self.response({"data": {"updateRefs": {"clientMutationId": update["clientMutationId"]}}})
             if endpoint.endswith("/git/refs"):
                 name = body["ref"].removeprefix("refs/heads/")
@@ -81,8 +87,27 @@ class ProbeSafetyTests(unittest.TestCase):
     def test_one_winner_and_confirmed_cleanup(self):
         fake = FakeGitHub()
         self.run_probe(fake)
-        self.assertEqual(len(fake.deleted), 3)
+        self.assertEqual(len(fake.deleted), 5)
         self.assertEqual(fake.refs, {})
+
+    def test_failed_marker_precondition_does_not_advance_target(self):
+        fake = FakeGitHub()
+        fake.refs = {"target": BASE, "stage": FIRST, "marker": OTHER}
+        update = {"variables": {"input": {"clientMutationId": "operation", "refUpdates": [
+            {"name": "refs/heads/target", "beforeOid": BASE, "afterOid": FIRST, "force": False},
+            {"name": "refs/heads/stage", "beforeOid": FIRST, "afterOid": FIRST, "force": False},
+            {"name": "refs/heads/marker", "beforeOid": BASE, "afterOid": FIRST, "force": False},
+        ]}}}
+        response = fake(["graphql"], update)
+        self.assertNotEqual(response.returncode, 0)
+        self.assertEqual(fake.refs, {"target": BASE, "stage": FIRST, "marker": OTHER})
+
+    def test_partial_target_write_after_failed_marker_aborts_probe(self):
+        fake = FakeGitHub(partial_reject=True)
+        with self.assertRaisesRegex(RuntimeError, "atomic rejection"):
+            self.run_probe(fake)
+        self.assertEqual(fake.refs, {})
+        self.assertEqual(len(fake.deleted), 5)
 
     def test_unrelated_ancestry_fails_before_creating_refs(self):
         fake = FakeGitHub(bad_ancestry=True)
@@ -97,7 +122,7 @@ class ProbeSafetyTests(unittest.TestCase):
             self.run_probe(fake)
         self.assertTrue(fake.changed)
         self.assertEqual(list(fake.refs.values()), [OTHER])
-        self.assertEqual(len(fake.deleted), 2)
+        self.assertEqual(len(fake.deleted), 4)
 
     def test_ambiguous_create_is_checked_and_cleaned(self):
         fake = FakeGitHub(ambiguous_create=True)
@@ -112,7 +137,7 @@ class ProbeSafetyTests(unittest.TestCase):
             self.run_probe(fake)
         self.assertTrue(fake.changed)
         self.assertEqual(list(fake.refs.values()), [OTHER])
-        self.assertEqual(len(fake.deleted), 2)
+        self.assertEqual(len(fake.deleted), 4)
 
 
 if __name__ == "__main__":
