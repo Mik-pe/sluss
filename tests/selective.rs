@@ -49,6 +49,10 @@ fn unknown_and_policy_sensitive_changes_require_every_suite() {
         ".github/workflows/ci.yml",
         "Cargo.lock",
         "crates/core/Cargo.toml",
+        "crates/core/.gitattributes",
+        "crates/core/.cargo/config.toml",
+        ".cargo/config",
+        "crates/core/rust-toolchain.toml",
         "ci/build.sh",
         "../secrets",
         "crates/api-extra/file",
@@ -64,6 +68,50 @@ fn unknown_and_policy_sensitive_changes_require_every_suite() {
         Selection::Full { .. }
     ));
 }
+#[test]
+fn changed_selection_semantics_invalidate_previous_policy_digests() {
+    use sha2::{Digest, Sha256};
+    let policy = sample_policy();
+    let mut old = Sha256::new();
+    old.update(b"sluss-selective-policy-v1\0");
+    old.update(serde_json::to_vec(&policy).unwrap());
+    assert_ne!(policy.digest().unwrap(), hex::encode(old.finalize()));
+}
+
+#[test]
+fn a_missing_suite_on_any_affected_component_requires_full_verification() {
+    let mut policy = sample_policy();
+    policy.components[0].suites.clear();
+    assert!(matches!(
+        policy.select(&["crates/core/src/lib.rs".into()]).unwrap(),
+        Selection::Full { .. }
+    ));
+    assert!(matches!(
+        policy
+            .select(&[
+                "crates/core/src/lib.rs".into(),
+                "apps/ui/src/main.rs".into()
+            ])
+            .unwrap(),
+        Selection::Full { .. }
+    ));
+    // Missing suites in an unaffected dependency do not make an unrelated
+    // selected component ambiguous.
+    assert!(matches!(
+        policy.select(&["apps/ui/src/main.rs".into()]).unwrap(),
+        Selection::Selected { .. }
+    ));
+    let mut policy = sample_policy();
+    policy.components[2].suites.clear();
+    assert!(
+        matches!(
+            policy.select(&["crates/api/src/lib.rs".into()]).unwrap(),
+            Selection::Full { .. }
+        ),
+        "an affected dependent without a suite must also trigger the full set"
+    );
+}
+
 #[test]
 fn rejects_invalid_dependency_graphs_and_suite_names() {
     let mut policy = sample_policy();
@@ -177,4 +225,57 @@ fn non_utf8_git_paths_select_full_verification() {
         sample_policy().select_git(repo, &base, &head).unwrap(),
         Selection::Full { .. }
     ));
+}
+
+#[test]
+fn submodule_changes_cannot_be_hidden_by_local_diff_configuration() {
+    let child = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    git(child.path(), &["init", "-b", "main"]);
+    std::fs::write(child.path().join("lib"), "first").unwrap();
+    git(child.path(), &["add", "."]);
+    git(child.path(), &["commit", "-m", "first"]);
+    let first = git(child.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(child.path().join("lib"), "second").unwrap();
+    git(child.path(), &["add", "."]);
+    git(child.path(), &["commit", "-m", "second"]);
+    let second = git(child.path(), &["rev-parse", "HEAD"]);
+    git(parent.path(), &["init", "-b", "main"]);
+    git(
+        parent.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            child.path().to_str().unwrap(),
+            "crates/api/vendor",
+        ],
+    );
+    git(
+        &parent.path().join("crates/api/vendor"),
+        &["checkout", "--detach", &first],
+    );
+    git(parent.path(), &["add", "."]);
+    git(parent.path(), &["commit", "-m", "base"]);
+    let base = git(parent.path(), &["rev-parse", "HEAD"]);
+    git(
+        &parent.path().join("crates/api/vendor"),
+        &["checkout", "--detach", &second],
+    );
+    git(parent.path(), &["add", "crates/api/vendor"]);
+    git(parent.path(), &["commit", "-m", "update submodule"]);
+    let head = git(parent.path(), &["rev-parse", "HEAD"]);
+    git(parent.path(), &["config", "diff.ignoreSubmodules", "all"]);
+    assert!(
+        git(parent.path(), &["diff", "--name-only", &base, &head]).is_empty(),
+        "the fixture really hides the gitlink change by default"
+    );
+    assert_eq!(
+        changed_paths(parent.path(), &base, &head).unwrap(),
+        vec!["crates/api/vendor"]
+    );
+    assert!(
+        matches!(sample_policy().select_git(parent.path(), &base, &head).unwrap(), Selection::Selected { suites, .. } if suites == names(&["api-tests", "ui-tests"]))
+    );
 }

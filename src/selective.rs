@@ -73,7 +73,9 @@ impl Policy {
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|_| SelectionError::InvalidPolicy)?;
         let mut hash = sha2::Sha256::new();
-        hash.update(b"sluss-selective-policy-v1\0");
+        // Bump the domain when selection semantics change so old frozen
+        // decisions cannot be dispatched under a newly parsed policy.
+        hash.update(b"sluss-selective-policy-v2\0");
         hash.update(bytes);
         Ok(hex::encode(hash.finalize()))
     }
@@ -195,6 +197,16 @@ impl Policy {
                 break;
             }
         }
+        if self
+            .components
+            .iter()
+            .any(|component| affected.contains(&component.name) && component.suites.is_empty())
+        {
+            return Ok(Selection::Full {
+                suites: full(),
+                reason: "an affected component has no configured suites".into(),
+            });
+        }
         let suites: BTreeSet<String> = self
             .components
             .iter()
@@ -242,6 +254,14 @@ fn critical_path(path: &str) -> bool {
         )
         || path.ends_with("/Cargo.toml")
         || path.ends_with("/Cargo.lock")
+        || path.ends_with("/.gitattributes")
+        || path == ".cargo/config"
+        || path == ".cargo/config.toml"
+        || path.ends_with("/.cargo/config")
+        || path.ends_with("/.cargo/config.toml")
+        || matches!(path, "rust-toolchain" | "rust-toolchain.toml")
+        || path.ends_with("/rust-toolchain")
+        || path.ends_with("/rust-toolchain.toml")
 }
 fn git(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
@@ -289,6 +309,7 @@ pub fn changed_paths(repo: &Path, base: &str, head: &str) -> Result<Vec<String>,
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
+            "--ignore-submodules=none",
             "--name-only",
             "-z",
             base,

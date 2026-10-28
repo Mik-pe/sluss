@@ -825,6 +825,27 @@ fn selective_staging_freezes_suites_atomically_and_recovers_after_publication() 
         Err(StoreError::PolicyMismatch)
     ));
     assert_eq!(store.batch_selection(id).unwrap().unwrap(), frozen);
+    // Reopen a database bound to the prior algorithm digest. The new policy
+    // cannot silently continue using selections frozen by that version.
+    let legacy = {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"sluss-selective-policy-v1\0");
+        hash.update(serde_json::to_vec(&policy).unwrap());
+        hex::encode(hash.finalize())
+    };
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE staging_selection_config SET mode=?1 WHERE id=1",
+        [&legacy],
+    )
+    .unwrap();
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    assert!(matches!(
+        store.bind_staging_selection(id, Some(&digest)),
+        Err(StoreError::PolicyMismatch)
+    ));
 }
 
 #[test]

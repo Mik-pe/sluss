@@ -1722,6 +1722,43 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(String::from_utf8_lossy(&changed.stderr).contains("verification policy changed"));
     assert_eq!(posts.load(Ordering::SeqCst), 0);
     std::fs::write(&policy, policy_text).unwrap();
+    // Simulate a selection frozen by the previous algorithm version. It must
+    // not be dispatched even when the operator's TOML is unchanged.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM batch_selection WHERE batch_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut legacy: FrozenSelection = serde_json::from_str(&body).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"sluss-selective-policy-v1\0");
+        hash.update(serde_json::to_vec(&Policy::load(&policy).unwrap()).unwrap());
+        legacy.policy_digest = hex::encode(hash.finalize());
+    }
+    conn.execute(
+        "UPDATE batch_selection SET body=?2 WHERE batch_id=?1",
+        rusqlite::params![id, serde_json::to_string(&legacy).unwrap()],
+    )
+    .unwrap();
+    let mut legacy_args = dispatch_args();
+    legacy_args.extend([
+        "--verification-policy".into(),
+        policy.to_str().unwrap().into(),
+    ]);
+    let rejected = launch(legacy_args).await.unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("verification policy changed"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    conn.execute(
+        "UPDATE batch_selection SET body=?2 WHERE batch_id=?1",
+        rusqlite::params![id, body],
+    )
+    .unwrap();
     reads.store(0, Ordering::SeqCst);
     mode.store(30, Ordering::SeqCst);
     let mut changed_base_args = dispatch_args();
