@@ -20,6 +20,10 @@ pub enum IntegrationError {
     AlreadyIntegrated,
     #[error("git could not cleanly merge a PR head")]
     Conflict,
+    #[error("git exceeded the output limit while {0}")]
+    OutputLimit(&'static str),
+    #[error("git timed out while {0}")]
+    Timeout(&'static str),
     #[error("git returned an invalid commit ID")]
     InvalidGitOutput,
     #[error(transparent)]
@@ -80,24 +84,29 @@ pub fn build(source: &Path, base: &str, heads: &[String]) -> Result<Integration,
         .arg("--")
         .arg(&source)
         .arg(&repo);
-    ensure(clone.output()?, "cloning the source")?;
+    ensure(
+        build_command(clone, None, "cloning the source")?,
+        "cloning the source",
+    )?;
     for sha in std::iter::once(base).chain(heads.iter().map(String::as_str)) {
         // Fetch by object ID from this local clone source. There is no network access.
-        let output = git(&repo)
-            .args([
-                "-c",
-                "protocol.file.allow=always",
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--no-recurse-submodules",
-                "origin",
-                sha,
-            ])
-            .output()?;
+        let mut fetch = git(&repo);
+        fetch.args([
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "origin",
+            sha,
+        ]);
+        let output = build_command(fetch, None, "fetching a frozen commit")?;
         ensure(output, "fetching a frozen commit")?;
+        let mut kind = git(&repo);
+        kind.args(["cat-file", "-t", sha]);
         let object = ensure(
-            git(&repo).args(["cat-file", "-t", sha]).output()?,
+            build_command(kind, None, "checking a frozen commit")?,
             "checking a frozen commit",
         )?;
         if object.stdout != b"commit\n" {
@@ -106,17 +115,17 @@ pub fn build(source: &Path, base: &str, heads: &[String]) -> Result<Integration,
     }
     let mut current = base.to_owned();
     for head in heads {
-        let ancestor = git(&repo)
-            .args(["merge-base", "--is-ancestor", head, &current])
-            .output()?;
+        let mut ancestor_cmd = git(&repo);
+        ancestor_cmd.args(["merge-base", "--is-ancestor", head, &current]);
+        let ancestor = build_command(ancestor_cmd, None, "checking ancestry")?;
         match ancestor.status.code() {
             Some(0) => return Err(IntegrationError::AlreadyIntegrated),
             Some(1) => {}
             _ => return Err(IntegrationError::Git("checking ancestry")),
         }
-        let merged = git(&repo)
-            .args(["merge-tree", "--write-tree", &current, head])
-            .output()?;
+        let mut merge = git(&repo);
+        merge.args(["merge-tree", "--write-tree", &current, head]);
+        let merged = build_command(merge, None, "merging trees")?;
         if !merged.status.success() {
             return if merged.status.code() == Some(1) {
                 Err(IntegrationError::Conflict)
@@ -130,7 +139,8 @@ pub fn build(source: &Path, base: &str, heads: &[String]) -> Result<Integration,
         if !valid_sha(tree) {
             return Err(IntegrationError::InvalidGitOutput);
         }
-        let mut child = git(&repo)
+        let mut commit = git(&repo);
+        commit
             .args([
                 "-c",
                 "commit.gpgsign=false",
@@ -146,17 +156,15 @@ pub fn build(source: &Path, base: &str, heads: &[String]) -> Result<Integration,
             .env("GIT_COMMITTER_NAME", "Sluss")
             .env("GIT_COMMITTER_EMAIL", "sluss@localhost")
             .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00+00:00")
-            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00+00:00")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .ok_or(IntegrationError::Git("writing commit message"))?
-            .write_all(b"Sluss integration\n")?;
-        let commit = ensure(child.wait_with_output()?, "creating merge commit")?;
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00+00:00");
+        let commit = ensure(
+            build_command(
+                commit,
+                Some(b"Sluss integration\n"),
+                "creating merge commit",
+            )?,
+            "creating merge commit",
+        )?;
         current = String::from_utf8(commit.stdout)
             .map_err(|_| IntegrationError::InvalidGitOutput)?
             .trim()
@@ -169,6 +177,146 @@ pub fn build(source: &Path, base: &str, heads: &[String]) -> Result<Integration,
         workspace,
         sha: current,
     })
+}
+
+// A malicious or exceptionally large integration must not exhaust memory or
+// hold a worker forever. An output limit or timeout is infrastructure failure,
+// never evidence that a PR has a merge conflict.
+fn build_command(
+    command: Command,
+    input: Option<&[u8]>,
+    context: &'static str,
+) -> Result<Output, IntegrationError> {
+    bounded_local_command(
+        command,
+        input,
+        1024 * 1024,
+        std::time::Duration::from_secs(600),
+    )
+    .map_err(|error| match error {
+        LocalCommandError::Io(error) => IntegrationError::Io(error),
+        LocalCommandError::Limit => IntegrationError::OutputLimit(context),
+        LocalCommandError::Timeout => IntegrationError::Timeout(context),
+    })
+}
+
+#[derive(Debug)]
+enum LocalCommandError {
+    Io(std::io::Error),
+    Limit,
+    Timeout,
+}
+
+fn bounded_local_command(
+    mut command: Command,
+    input: Option<&[u8]>,
+    limit: u64,
+    timeout: std::time::Duration,
+) -> Result<Output, LocalCommandError> {
+    use std::sync::mpsc::{self, TryRecvError};
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(LocalCommandError::Io)?;
+    if let Some(input) = input {
+        let result = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stdin"))
+            .and_then(|mut stdin| stdin.write_all(input));
+        if let Err(error) = result {
+            kill_local_command(&mut child);
+            return Err(LocalCommandError::Io(error));
+        }
+    }
+    let Some(stdout) = child.stdout.take() else {
+        kill_local_command(&mut child);
+        return Err(LocalCommandError::Io(std::io::Error::other(
+            "missing stdout",
+        )));
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut output)
+            .map(|_| output);
+        let _ = sender.send(result);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() as u64 > limit => {
+                    kill_local_command(&mut child);
+                    return Err(LocalCommandError::Limit);
+                }
+                Ok(Ok(bytes)) => output = Some(bytes),
+                Ok(Err(error)) => {
+                    kill_local_command(&mut child);
+                    return Err(LocalCommandError::Io(error));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    kill_local_command(&mut child);
+                    return Err(LocalCommandError::Io(std::io::Error::other(
+                        "stdout reader stopped",
+                    )));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        // Do not reap the group leader until its output pipe closes: keeping
+        // its PID reserved makes a timeout group kill safe even if a helper
+        // inherited stdout after the leader exited.
+        if output.is_some() && status.is_none() {
+            match child.try_wait() {
+                Ok(value) => status = value,
+                Err(error) => {
+                    kill_local_command(&mut child);
+                    return Err(LocalCommandError::Io(error));
+                }
+            }
+        }
+        if let Some(status) = status {
+            return Ok(Output {
+                status,
+                stdout: output.take().ok_or_else(|| {
+                    LocalCommandError::Io(std::io::Error::other("missing captured stdout"))
+                })?,
+                stderr: Vec::new(),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            kill_local_command(&mut child);
+            return Err(LocalCommandError::Timeout);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn kill_local_command(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The subprocess leads its own group, so Git's helpers are stopped too.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn command(dir: &Path) -> Command {
@@ -947,4 +1095,49 @@ fn fetch_inputs(
         )?;
     }
     Ok(FetchedInputs { workspace })
+}
+
+#[cfg(all(test, unix))]
+mod build_process_tests {
+    use super::{IntegrationError, LocalCommandError, bounded_local_command, build_command};
+    use std::{process::Command, time::Duration};
+
+    #[test]
+    fn bounded_build_command_distinguishes_success_failure_and_oversized_output() {
+        let mut success = Command::new("sh");
+        success.args(["-c", "printf small"]);
+        let output = bounded_local_command(success, None, 8, Duration::from_secs(2)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"small");
+
+        let mut conflict = Command::new("sh");
+        conflict.args(["-c", "exit 1"]);
+        let output = bounded_local_command(conflict, None, 8, Duration::from_secs(2)).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+
+        let mut noisy = Command::new("sh");
+        noisy.args(["-c", "printf 123456789"]);
+        assert!(matches!(
+            bounded_local_command(noisy, None, 8, Duration::from_secs(2)),
+            Err(LocalCommandError::Limit)
+        ));
+        let mut excessive = Command::new("sh");
+        excessive.args(["-c", "yes x"]);
+        assert!(matches!(
+            build_command(excessive, None, "merging trees"),
+            Err(IntegrationError::OutputLimit("merging trees"))
+        ));
+    }
+
+    #[test]
+    fn bounded_build_command_terminates_a_process_holding_its_stdout_open() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10 & exit 0"]);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            bounded_local_command(command, None, 64, Duration::from_millis(100)),
+            Err(LocalCommandError::Timeout)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 }
