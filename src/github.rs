@@ -315,14 +315,23 @@ impl App {
         )
         .await
     }
-    /// A separate repository-scoped Checks-write credential. It is used by
-    /// the experimental failure-only publisher; it never issues success.
-    pub async fn failed_check_token(
+    /// A separate repository-scoped Checks-write credential. Current publishers
+    /// only create failure or nonpassing in-progress checks, never success.
+    pub async fn checks_write_token(
         &self,
         installation_id: u64,
         repository_id: u64,
     ) -> Result<InstallationToken, GitHubError> {
         self.mint_token(installation_id, repository_id, TokenPurpose::FailedCheck)
+            .await
+    }
+    /// Compatibility alias for the failure-only reporting path.
+    pub async fn failed_check_token(
+        &self,
+        installation_id: u64,
+        repository_id: u64,
+    ) -> Result<InstallationToken, GitHubError> {
+        self.checks_write_token(installation_id, repository_id)
             .await
     }
     async fn mint_token(
@@ -1645,6 +1654,19 @@ impl App {
         trusted_ci: &crate::landing::TrustedCiPolicy,
         batch_id: &str,
     ) -> Result<crate::landing::CiEvidenceRecord, LandingRefreshError> {
+        self.verify_staged_ci_inner(journal, tokens, policy, trusted_ci, batch_id)
+            .await
+            .map(|(record, _)| record)
+    }
+
+    async fn verify_staged_ci_inner(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        tokens: (&InstallationToken, &InstallationToken),
+        policy: &crate::reconcile::RepositoryPolicy,
+        trusted_ci: &crate::landing::TrustedCiPolicy,
+        batch_id: &str,
+    ) -> Result<(crate::landing::CiEvidenceRecord, i64), LandingRefreshError> {
         let app = self.observe_app_identity().await?;
         let target = journal.preview_target(batch_id, trusted_ci)?;
         let snapshot = self
@@ -1659,9 +1681,8 @@ impl App {
             .as_millis()
             .try_into()
             .map_err(|_| GitHubError::Clock)?;
-        journal
-            .record_ci_candidate(&target, trusted_ci, &snapshot, &app, now)
-            .map_err(Into::into)
+        let record = journal.record_ci_candidate(&target, trusted_ci, &snapshot, &app, now)?;
+        Ok((record, target.delivery_revision))
     }
 
     async fn refresh_landing_provider(
@@ -1883,6 +1904,238 @@ pub struct AppCheckIssuer {
 pub struct AppCheckSuite {
     pub id: u64,
 }
+#[derive(Debug, Error)]
+pub enum PendingCheckError {
+    #[error("pending check credentials or repository scope do not match")]
+    Scope,
+    #[error("the check request may have succeeded; reconcile without retrying")]
+    Uncertain,
+    #[error("the supplied check does not match the frozen nonpassing intent")]
+    CandidateMismatch,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Refresh(#[from] LandingRefreshError),
+    #[error(transparent)]
+    Journal(#[from] crate::landing::LandingError),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingCheckOutcome {
+    Created(u64),
+    AlreadyCreated(u64),
+    Recovered(u64),
+}
+const PENDING_CHECK_TITLE: &str = "Staging CI verification in progress";
+fn pending_check_summary(intent: &crate::landing::PendingCiCheckIntent) -> String {
+    format!(
+        "CI run {} matched candidate {}. This in-progress check is not a CI attestation and does not authorize a merge.",
+        intent.candidate.snapshot.run.id, intent.candidate_digest
+    )
+}
+fn pending_check_matches(
+    intent: &crate::landing::PendingCiCheckIntent,
+    check: &AppCheckObservation,
+) -> bool {
+    check.id != 0
+        && check.check_suite.id != 0
+        && check.name == "sluss/verified"
+        && check.head_sha == intent.candidate.plan.staged_sha
+        && check.external_id.as_deref() == Some(intent.candidate.plan.batch_id.as_str())
+        && check.status == "in_progress"
+        && check.conclusion.is_none()
+        && check.app.id == intent.candidate.app_id
+        && check.app.node_id == intent.candidate.app_node_id
+        && check.output.as_ref().is_some_and(|o| {
+            o.title.as_deref() == Some(PENDING_CHECK_TITLE)
+                && o.summary.as_deref() == Some(pending_check_summary(intent).as_str())
+        })
+}
+
+impl App {
+    /// Create a nonpassing in-progress check after fresh provider verification.
+    /// A crash or ambiguous POST remains uncertain and is never retried.
+    pub async fn start_staged_check(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        tokens: (&InstallationToken, &InstallationToken, &InstallationToken),
+        policy: &crate::reconcile::RepositoryPolicy,
+        trusted_ci: &crate::landing::TrustedCiPolicy,
+        batch_id: &str,
+    ) -> Result<PendingCheckOutcome, PendingCheckError> {
+        use crate::landing::{PendingCiCheckClaim, PendingCiCheckState};
+        let (read, security, write) = tokens;
+        if !write.checks_write
+            || write.repository_id != read.repository_id
+            || write.installation_id != read.installation_id
+            || write.app_client_id != self.client_id
+            || write.api_origin != self.api.as_str()
+        {
+            return Err(PendingCheckError::Scope);
+        }
+        let (record, revision) = self
+            .verify_staged_ci_inner(journal, (read, security), policy, trusted_ci, batch_id)
+            .await?;
+        let intent = match journal.claim_pending_ci_check(&record, revision)? {
+            PendingCiCheckClaim::Send(intent) => intent,
+            PendingCiCheckClaim::Existing(
+                intent,
+                PendingCiCheckState::Created {
+                    check_id,
+                    suite_id,
+                    direct,
+                    recovered,
+                },
+            ) => {
+                let observed = self
+                    .read_pending_ci_check(read, (&policy.owner, &policy.name), &intent, check_id)
+                    .await?;
+                if observed.check_suite.id != suite_id {
+                    return Err(PendingCheckError::CandidateMismatch);
+                }
+                return if !direct && recovered {
+                    Ok(PendingCheckOutcome::Recovered(check_id))
+                } else {
+                    Ok(PendingCheckOutcome::AlreadyCreated(check_id))
+                };
+            }
+            PendingCiCheckClaim::Existing(_, _) => return Err(PendingCheckError::Uncertain),
+        };
+        let url = self
+            .api
+            .join(&format!(
+                "repos/{}/{}/check-runs",
+                policy.owner, policy.name
+            ))
+            .map_err(|_| PendingCheckError::Scope)?;
+        let body = serde_json::json!({"name":"sluss/verified","head_sha":intent.candidate.plan.staged_sha,"external_id":batch_id,"status":"in_progress","output":{"title":PENDING_CHECK_TITLE,"summary":pending_check_summary(&intent)}});
+        let mut response = self
+            .client
+            .post(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(write.secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| PendingCheckError::Uncertain)?;
+        if response.status() != reqwest::StatusCode::CREATED {
+            return Err(PendingCheckError::Uncertain);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| PendingCheckError::Uncertain)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 65536 {
+                return Err(PendingCheckError::Uncertain);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let observed: AppCheckObservation =
+            serde_json::from_slice(&bytes).map_err(|_| PendingCheckError::Uncertain)?;
+        if !pending_check_matches(&intent, &observed) {
+            return Err(PendingCheckError::Uncertain);
+        }
+        journal
+            .record_pending_ci_receipt(batch_id, observed.id, observed.check_suite.id, true)
+            .map_err(|_| PendingCheckError::Uncertain)?;
+        Ok(PendingCheckOutcome::Created(observed.id))
+    }
+
+    async fn read_pending_ci_check(
+        &self,
+        token: &InstallationToken,
+        repository: (&str, &str),
+        intent: &crate::landing::PendingCiCheckIntent,
+        check_id: u64,
+    ) -> Result<AppCheckObservation, PendingCheckError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        let (owner, name) = repository;
+        if !token.checks_read
+            || !valid_name(owner)
+            || !valid_name(name)
+            || check_id == 0
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+            || i64::try_from(token.repository_id).ok() != Some(intent.candidate.plan.repository_id)
+            || i64::try_from(token.installation_id).ok()
+                != Some(intent.candidate.plan.installation_id)
+        {
+            return Err(PendingCheckError::Scope);
+        }
+        let app = self.observe_app_identity().await?;
+        let root = format!("repos/{owner}/{name}");
+        let first_repo: Identity = self.get_json(token, &root, None).await?;
+        let path = format!("{root}/check-runs/{check_id}");
+        let first: AppCheckObservation = self.get_json(token, &path, None).await?;
+        let last: AppCheckObservation = self.get_json(token, &path, None).await?;
+        let last_repo: Identity = self.get_json(token, &root, None).await?;
+        let last_app = self.observe_app_identity().await?;
+        if first_repo != last_repo
+            || first_repo.id != token.repository_id
+            || first_repo.node_id != intent.candidate.plan.repository_node_id
+            || app != last_app
+            || app.id != intent.candidate.app_id
+            || app.node_id != intent.candidate.app_node_id
+            || first != last
+            || first.id != check_id
+            || !pending_check_matches(intent, &first)
+        {
+            return Err(PendingCheckError::CandidateMismatch);
+        }
+        Ok(first)
+    }
+
+    /// Associate an explicitly identified historical in-progress check without
+    /// reissuing the POST; metadata equality does not establish request origin.
+    pub async fn recover_staged_check(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        repository: (&str, &str),
+        batch_id: &str,
+        check_id: u64,
+    ) -> Result<PendingCheckOutcome, PendingCheckError> {
+        use crate::landing::PendingCiCheckState;
+        let (intent, state) = journal
+            .pending_ci_check(batch_id)?
+            .ok_or(PendingCheckError::Uncertain)?;
+        let known_suite = match state {
+            PendingCiCheckState::Sending => None,
+            PendingCiCheckState::Created {
+                check_id: known,
+                suite_id,
+                ..
+            } if known == check_id => Some(suite_id),
+            _ => return Err(PendingCheckError::Uncertain),
+        };
+        let observed = self
+            .read_pending_ci_check(token, repository, &intent, check_id)
+            .await?;
+        if known_suite.is_some_and(|suite| suite != observed.check_suite.id) {
+            return Err(PendingCheckError::CandidateMismatch);
+        }
+        let state = journal.record_pending_ci_receipt(
+            batch_id,
+            observed.id,
+            observed.check_suite.id,
+            false,
+        )?;
+        match state {
+            PendingCiCheckState::Created { direct: true, .. } => {
+                Ok(PendingCheckOutcome::AlreadyCreated(check_id))
+            }
+            PendingCiCheckState::Created { .. } => Ok(PendingCheckOutcome::Recovered(check_id)),
+            _ => Err(PendingCheckError::Uncertain),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FailureCheckError {
     #[error("check publisher credentials or repository scope do not match")]

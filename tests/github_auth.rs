@@ -12,10 +12,15 @@ use std::{
     collections::BTreeMap,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
 };
+
+static PENDING_CHECK_STUB: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
+fn pending_check_stub() -> &'static Mutex<Option<Value>> {
+    PENDING_CHECK_STUB.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Deserialize)]
 struct Claims {
@@ -148,7 +153,7 @@ async fn actions_jobs(
     } else {
         1
     };
-    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
+    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103 | 129) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
 async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
@@ -213,7 +218,7 @@ async fn dispatched_run(
     };
     let conclusion = if matches!(mode, 31 | 32) {
         None
-    } else if matches!(mode, 40 | 95..=100 | 103) {
+    } else if matches!(mode, 40 | 95..=100 | 103 | 129) {
         Some("failure")
     } else if mode == 43 {
         Some("cancelled")
@@ -380,7 +385,7 @@ async fn doctor_ruleset(State(state): State<ServerState>, headers: HeaderMap) ->
         body["bypass_actors"] =
             json!([{"actor_type":"Integration","actor_id":null,"bypass_mode":"always"}]);
     }
-    if mode == 73 {
+    if mode == 73 || (125..=127).contains(&mode) || matches!(mode, 132..=134) {
         body["bypass_actors"] = json!([]);
     }
     if mode == 77 {
@@ -435,6 +440,9 @@ async fn failed_check_post(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    if body["status"] == "in_progress" {
+        return pending_check_post(state, body).await;
+    }
     assert_eq!(body["name"], "sluss/verified");
     assert_eq!(body["head_sha"], "a".repeat(40));
     assert_eq!(body["external_id"], "batch-0123456789abcdef");
@@ -476,6 +484,48 @@ async fn failed_check_post(
         ),
     )
 }
+async fn pending_check_post(state: ServerState, body: Value) -> (StatusCode, Json<Value>) {
+    assert_eq!(body["name"], "sluss/verified");
+    assert_eq!(body["head_sha"], "a".repeat(40));
+    assert_eq!(body["external_id"], "batch-0123456789abcdef");
+    assert_eq!(body["status"], "in_progress");
+    assert!(body.get("conclusion").is_none());
+    assert!(
+        body["output"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("does not authorize a merge")
+    );
+    let mode = state.mode.load(Ordering::SeqCst);
+    let candidate_id = if mode == 125 { 555 } else { 556 };
+    let value = json!({"id":candidate_id,"name":body["name"],"head_sha":body["head_sha"],"external_id":body["external_id"],"status":"in_progress","conclusion":null,"app":{"id":17,"node_id":"A_app"},"check_suite":{"id":44},"output":body["output"]});
+    *pending_check_stub().lock().unwrap() = Some(value.clone());
+    state.permissions.fetch_add(1, Ordering::SeqCst);
+    if mode == 126 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ambiguous"})),
+        );
+    }
+    if matches!(mode, 125 | 127 | 132 | 133 | 134) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.mode.load(Ordering::SeqCst) == mode {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending-check race must release sender");
+    }
+    let mut response = value;
+    if mode == 127 {
+        response["id"] = json!(557);
+    }
+    if mode == 132 {
+        response["check_suite"]["id"] = json!(99);
+    }
+    (StatusCode::CREATED, Json(response))
+}
+
 async fn failed_check_get(
     State(state): State<ServerState>,
     Path(check_id): Path<u64>,
@@ -483,6 +533,22 @@ async fn failed_check_get(
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
+    if check_id >= 555 {
+        let stored = pending_check_stub().lock().unwrap().clone();
+        let mut value = stored.unwrap_or_else(|| json!({"id":check_id,"name":"unknown"}));
+        if value["id"].as_u64() != Some(check_id) {
+            value["name"] = json!("unknown");
+            value["id"] = json!(check_id);
+        }
+        if mode == 130 {
+            value["status"] = json!("completed");
+            value["conclusion"] = json!("success");
+        }
+        if mode == 131 {
+            value["check_suite"]["id"] = json!(99);
+        }
+        return Json(value);
+    }
     Json(
         json!({"id":check_id,"name":"sluss/verified","head_sha":if mode==101 {"b".repeat(40)} else {"a".repeat(40)},"external_id":"batch-0123456789abcdef","status":"completed","conclusion":if mode==97 {"neutral"} else {"failure"},"app":{"id":if mode==96 {18} else {17},"node_id":"A_app"},"check_suite":{"id":45},"output":{"title":"Staging CI failed","summary":format!("Recorded CI run {} failed. This check is not an attestation and does not authorize a merge.",if mode==102 {124} else {123})}}),
     )
@@ -2560,7 +2626,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(restarted.conflict_release_recorded(id).is_err());
     posts.store(0, Ordering::SeqCst);
     let check_token = fixture_app.failed_check_token(42, 7).await.unwrap();
-    for check_mode in [40, 95, 96, 97, 98, 99, 103] {
+    for check_mode in [40, 95, 96, 97, 98, 99, 103, 129] {
         mode.store(0, Ordering::SeqCst);
         reads.store(0, Ordering::SeqCst);
         let failure_db = data
@@ -2617,6 +2683,11 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         posts.store(0, Ordering::SeqCst);
         let mut first = sluss::scheduler::Scheduler::open(&failure_db, one_host.clone()).unwrap();
         let mut second = sluss::scheduler::Scheduler::open(&failure_db, one_host.clone()).unwrap();
+        if check_mode == 129 {
+            let _journal = sluss::landing::LandingJournal::open(&failure_db).unwrap();
+            let conn = rusqlite::Connection::open(&failure_db).unwrap();
+            conn.execute("INSERT INTO pending_ci_checks_v1(batch_id,body,state,check_id,suite_id,direct,recovered) VALUES('other','{}','created','444','44',1,0)", []).unwrap();
+        }
         assert!(matches!(
             fixture_app
                 .publish_failed_check(
@@ -3711,6 +3782,531 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .unwrap();
     assert!(inspect_cli.status.success());
     assert!(String::from_utf8_lossy(&inspect_cli.stdout).contains(&recorded.digest));
+    // The first App check is always nonpassing and exactly one POST can be
+    // claimed, even with concurrent clients or a restart after a lost reply.
+    let posts_before_pending = posts.load(Ordering::SeqCst);
+    let pending_db = data.path().join("pending-check.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [pending_db.to_str().unwrap()])
+        .unwrap();
+    let mut pending_a = sluss::landing::LandingJournal::open(&pending_db).unwrap();
+    assert!(matches!(
+        observer_app
+            .start_staged_check(
+                &mut pending_a,
+                (&fixture_token, &security_token, &fixture_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Scope)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), posts_before_pending);
+    let mut pending_b = sluss::landing::LandingJournal::open(&pending_db).unwrap();
+    let done_a = std::sync::atomic::AtomicBool::new(false);
+    let done_b = std::sync::atomic::AtomicBool::new(false);
+    mode.store(125, Ordering::SeqCst);
+    let (one, two, _) = tokio::join!(
+        async {
+            let result = observer_app
+                .start_staged_check(
+                    &mut pending_a,
+                    (&fixture_token, &security_token, &check_token),
+                    &observer_policy,
+                    &selected_trust,
+                    id,
+                )
+                .await;
+            done_a.store(true, Ordering::SeqCst);
+            result
+        },
+        async {
+            let result = observer_app
+                .start_staged_check(
+                    &mut pending_b,
+                    (&fixture_token, &security_token, &check_token),
+                    &observer_policy,
+                    &selected_trust,
+                    id,
+                )
+                .await;
+            done_b.store(true, Ordering::SeqCst);
+            result
+        },
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while posts.load(Ordering::SeqCst) == posts_before_pending
+                    || !(done_a.load(Ordering::SeqCst) || done_b.load(Ordering::SeqCst))
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            mode.store(73, Ordering::SeqCst);
+        }
+    );
+    assert_eq!(
+        [&one, &two]
+            .iter()
+            .filter(|r| matches!(r, Ok(sluss::github::PendingCheckOutcome::Created(555))))
+            .count(),
+        1,
+        "{one:?} {two:?}"
+    );
+    assert!(
+        [&one, &two]
+            .iter()
+            .any(|r| matches!(r, Err(sluss::github::PendingCheckError::Uncertain))),
+        "{one:?} {two:?}"
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), posts_before_pending + 1);
+    drop(pending_a);
+    drop(pending_b);
+    let mut pending = sluss::landing::LandingJournal::open(&pending_db).unwrap();
+    assert!(matches!(
+        pending.pending_ci_check(id).unwrap().unwrap().1,
+        sluss::landing::PendingCiCheckState::Created {
+            check_id: 555,
+            direct: true,
+            recovered: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        observer_app
+            .start_staged_check(
+                &mut pending,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await,
+        Ok(sluss::github::PendingCheckOutcome::AlreadyCreated(555))
+    ));
+    mode.store(131, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .recover_staged_check(&mut pending, &fixture_token, ("owner", "repo"), id, 555)
+            .await,
+        Err(sluss::github::PendingCheckError::CandidateMismatch)
+    ));
+    mode.store(130, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .recover_staged_check(&mut pending, &fixture_token, ("owner", "repo"), id, 555)
+            .await,
+        Err(sluss::github::PendingCheckError::CandidateMismatch)
+    ));
+    mode.store(73, Ordering::SeqCst);
+    let pending_report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&pending_db)
+        .args(["staged-check", "--batch-id", id])
+        .output()
+        .unwrap();
+    assert!(pending_report.status.success());
+    assert!(String::from_utf8_lossy(&pending_report.stdout).contains("no CI attestation"));
+    let lost_db = data.path().join("pending-check-lost.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [lost_db.to_str().unwrap()])
+        .unwrap();
+    let mut lost = sluss::landing::LandingJournal::open(&lost_db).unwrap();
+    mode.store(126, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .start_staged_check(
+                &mut lost,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    assert!(matches!(
+        lost.pending_ci_check(id).unwrap().unwrap().1,
+        sluss::landing::PendingCiCheckState::Sending
+    ));
+    drop(lost);
+    let mut lost = sluss::landing::LandingJournal::open(&lost_db).unwrap();
+    mode.store(73, Ordering::SeqCst);
+    let after_lost = posts.load(Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .start_staged_check(
+                &mut lost,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await,
+        Err(sluss::github::PendingCheckError::Uncertain)
+    ));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        after_lost,
+        "uncertain POST must not be resent"
+    );
+    assert!(
+        observer_app
+            .recover_staged_check(&mut lost, &fixture_token, ("owner", "repo"), id, 555)
+            .await
+            .is_err()
+    );
+    let lost_arg = lost_db.clone();
+    let config_arg = config.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let recover_cli = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(lost_arg)
+            .args([
+                "recover-staged-check",
+                "--batch-id",
+                id,
+                "--check-id",
+                "556",
+                "--config",
+            ])
+            .arg(config_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        recover_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recover_cli.stderr)
+    );
+    assert!(String::from_utf8_lossy(&recover_cli.stdout).contains("does not prove request origin"));
+    assert!(matches!(
+        lost.pending_ci_check(id).unwrap().unwrap().1,
+        sluss::landing::PendingCiCheckState::Created {
+            check_id: 556,
+            direct: false,
+            recovered: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        observer_app
+            .start_staged_check(
+                &mut lost,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await,
+        Ok(sluss::github::PendingCheckOutcome::Recovered(556))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), after_lost);
+    for race_mode in [127, 132, 133] {
+        let late_db = data
+            .path()
+            .join(format!("pending-check-late-{race_mode}.sqlite"));
+        candidate_conn
+            .execute("VACUUM INTO ?1", [late_db.to_str().unwrap()])
+            .unwrap();
+        let mut sender = sluss::landing::LandingJournal::open(&late_db).unwrap();
+        let mut recovery = sluss::landing::LandingJournal::open(&late_db).unwrap();
+        let before_late = posts.load(Ordering::SeqCst);
+        mode.store(race_mode, Ordering::SeqCst);
+        let (direct, recovered) = tokio::join!(
+            observer_app.start_staged_check(
+                &mut sender,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            ),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while posts.load(Ordering::SeqCst) == before_late {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let recovered = observer_app
+                    .recover_staged_check(&mut recovery, &fixture_token, ("owner", "repo"), id, 556)
+                    .await;
+                mode.store(73, Ordering::SeqCst);
+                recovered
+            }
+        );
+        assert!(matches!(
+            recovered,
+            Ok(sluss::github::PendingCheckOutcome::Recovered(556))
+        ));
+        drop(sender);
+        let mut sender = sluss::landing::LandingJournal::open(&late_db).unwrap();
+        if race_mode == 133 {
+            assert!(matches!(
+                direct,
+                Ok(sluss::github::PendingCheckOutcome::Created(556))
+            ));
+            assert!(matches!(
+                sender.pending_ci_check(id).unwrap().unwrap().1,
+                sluss::landing::PendingCiCheckState::Created {
+                    check_id: 556,
+                    direct: true,
+                    recovered: true,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                observer_app
+                    .start_staged_check(
+                        &mut sender,
+                        (&fixture_token, &security_token, &check_token),
+                        &observer_policy,
+                        &selected_trust,
+                        id
+                    )
+                    .await,
+                Ok(sluss::github::PendingCheckOutcome::AlreadyCreated(556))
+            ));
+        } else {
+            assert!(matches!(
+                direct,
+                Err(sluss::github::PendingCheckError::Uncertain)
+            ));
+            let expected_other = if race_mode == 127 { 557 } else { 556 };
+            assert!(
+                matches!(sender.pending_ci_check(id).unwrap().unwrap().1, sluss::landing::PendingCiCheckState::Conflict { check_id:Some(556), other_check_id, .. } if other_check_id == expected_other)
+            );
+            assert!(
+                observer_app
+                    .start_staged_check(
+                        &mut sender,
+                        (&fixture_token, &security_token, &check_token),
+                        &observer_policy,
+                        &selected_trust,
+                        id
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(posts.load(Ordering::SeqCst), before_late + 1);
+    }
+    let stale_send_db = data.path().join("pending-check-stale-send.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [stale_send_db.to_str().unwrap()])
+        .unwrap();
+    let mut stale_sender = sluss::landing::LandingJournal::open(&stale_send_db).unwrap();
+    let mut stale_inbox = Inbox::open(&stale_send_db).unwrap();
+    let before_stale_send = posts.load(Ordering::SeqCst);
+    mode.store(134, Ordering::SeqCst);
+    let (sent, _) = tokio::join!(
+        observer_app.start_staged_check(
+            &mut stale_sender,
+            (&fixture_token, &security_token, &check_token),
+            &observer_policy,
+            &selected_trust,
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while posts.load(Ordering::SeqCst) == before_stale_send {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            stale_inbox
+                .record("check-send-review", "pull_request_review", &[67; 32], 42, 7)
+                .unwrap();
+            let event = stale_inbox.pending().unwrap().remove(0);
+            let mut reconciled = Store::open(&stale_send_db).unwrap();
+            sluss::reconcile::reconcile_once(
+                &observer_app,
+                &fixture_token,
+                &mut reconciled,
+                &event,
+                &observer_policy,
+            )
+            .await
+            .unwrap();
+            mode.store(73, Ordering::SeqCst);
+        }
+    );
+    assert!(matches!(
+        sent,
+        Ok(sluss::github::PendingCheckOutcome::Created(556))
+    ));
+    assert_eq!(
+        stale_sender
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        stale_sender.pending_ci_check(id).unwrap().unwrap().1,
+        sluss::landing::PendingCiCheckState::Created { check_id: 556, .. }
+    ));
+    assert_eq!(
+        pending_check_stub().lock().unwrap().as_ref().unwrap()["status"],
+        "in_progress"
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), before_stale_send + 1);
+    let stale_report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&stale_send_db)
+        .args(["staged-check", "--batch-id", id])
+        .output()
+        .unwrap();
+    assert!(stale_report.status.success());
+    assert!(String::from_utf8_lossy(&stale_report.stdout).contains("no current local evidence"));
+    let cli_db = data.path().join("pending-check-cli.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [cli_db.to_str().unwrap()])
+        .unwrap();
+    let cli_db_arg = cli_db.clone();
+    let config_arg = config.clone();
+    let policy_arg = trust_file.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let start_cli = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(cli_db_arg)
+            .args(["start-staged-check", "--batch-id", id, "--config"])
+            .arg(config_arg)
+            .arg("--policy")
+            .arg(policy_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        start_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start_cli.stderr)
+    );
+    assert!(String::from_utf8_lossy(&start_cli.stdout).contains("not an attestation"));
+    let legacy_db = data.path().join("pending-check-legacy.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [legacy_db.to_str().unwrap()])
+        .unwrap();
+    let legacy_conn = rusqlite::Connection::open(&legacy_db).unwrap();
+    legacy_conn
+        .execute("DROP TABLE failure_check_conflicts", [])
+        .unwrap();
+    let mut legacy = sluss::landing::LandingJournal::open(&legacy_db).unwrap();
+    let before_legacy = posts.load(Ordering::SeqCst);
+    assert!(
+        observer_app
+            .start_staged_check(
+                &mut legacy,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .is_err()
+    );
+    assert!(legacy.pending_ci_check(id).unwrap().is_none());
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        before_legacy,
+        "legacy check namespace must fail before POST"
+    );
+    let corrupt_pending_db = data.path().join("pending-check-corrupt.sqlite");
+    let pending_conn = rusqlite::Connection::open(&pending_db).unwrap();
+    pending_conn
+        .execute("VACUUM INTO ?1", [corrupt_pending_db.to_str().unwrap()])
+        .unwrap();
+    let corrupt_pending_conn = rusqlite::Connection::open(&corrupt_pending_db).unwrap();
+    corrupt_pending_conn
+        .execute(
+            "UPDATE pending_ci_checks_v1 SET body='{}' WHERE batch_id=?1",
+            [id],
+        )
+        .unwrap();
+    let corrupt_pending =
+        sluss::landing::LandingJournal::open_read_only(&corrupt_pending_db).unwrap();
+    assert!(corrupt_pending.pending_ci_check(id).is_err());
+    for namespace in ["pending", "failure"] {
+        let collision_db = data
+            .path()
+            .join(format!("pending-namespace-{namespace}.sqlite"));
+        candidate_conn
+            .execute("VACUUM INTO ?1", [collision_db.to_str().unwrap()])
+            .unwrap();
+        let mut collision = sluss::landing::LandingJournal::open(&collision_db).unwrap();
+        let conn = rusqlite::Connection::open(&collision_db).unwrap();
+        if namespace == "pending" {
+            conn.execute("INSERT INTO pending_ci_checks_v1(batch_id,body,state,check_id,suite_id,direct,recovered) VALUES('other','{}','created','556','44',1,0)", []).unwrap();
+        } else {
+            conn.execute("INSERT INTO failure_check_intents(id,body,state,app_id,check_id) VALUES('other','{}','created','17','556')", []).unwrap();
+        }
+        assert!(matches!(
+            observer_app
+                .start_staged_check(
+                    &mut collision,
+                    (&fixture_token, &security_token, &check_token),
+                    &observer_policy,
+                    &selected_trust,
+                    id
+                )
+                .await,
+            Err(sluss::github::PendingCheckError::Uncertain)
+        ));
+        assert!(matches!(
+            collision.pending_ci_check(id).unwrap().unwrap().1,
+            sluss::landing::PendingCiCheckState::Conflict {
+                check_id: None,
+                other_check_id: 556,
+                ..
+            }
+        ));
+        drop(collision);
+        let collision = sluss::landing::LandingJournal::open(&collision_db).unwrap();
+        assert!(matches!(
+            collision.pending_ci_check(id).unwrap().unwrap().1,
+            sluss::landing::PendingCiCheckState::Conflict {
+                check_id: None,
+                other_check_id: 556,
+                ..
+            }
+        ));
+    }
+    // Simulate an event between the persisted provider scan and the send claim.
+    let barrier_db = data.path().join("pending-check-revision.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [barrier_db.to_str().unwrap()])
+        .unwrap();
+    let barrier_conn = rusqlite::Connection::open(&barrier_db).unwrap();
+    barrier_conn.execute_batch("CREATE TRIGGER test_advance_revision AFTER UPDATE ON ci_evidence_candidate_heads_v1 BEGIN INSERT INTO webhook_deliveries(delivery_id,event,digest) VALUES('test-intervening','__test__',zeroblob(32)); DELETE FROM webhook_deliveries WHERE delivery_id='test-intervening'; END;").unwrap();
+    let mut barrier_journal = sluss::landing::LandingJournal::open(&barrier_db).unwrap();
+    let before_barrier = posts.load(Ordering::SeqCst);
+    assert!(
+        observer_app
+            .start_staged_check(
+                &mut barrier_journal,
+                (&fixture_token, &security_token, &check_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .is_err()
+    );
+    assert!(barrier_journal.pending_ci_check(id).unwrap().is_none());
+    assert_eq!(posts.load(Ordering::SeqCst), before_barrier);
+    posts.store(posts_before_pending, Ordering::SeqCst);
+    mode.store(73, Ordering::SeqCst);
     let mut completed_scheduler =
         sluss::scheduler::Scheduler::open(&candidate_db, observer_capacity.clone()).unwrap();
     completed_scheduler.complete_ci_only(id).unwrap();

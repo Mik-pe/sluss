@@ -75,6 +75,8 @@ pub enum LandingError {
     BatchBound,
     #[error("operator CI trust policy is missing, changed or inconsistent with the recorded run")]
     TrustPolicy,
+    #[error("pending check receipt is inconsistent or belongs to another intent")]
+    PendingCheckConflict,
     #[error("could not read operator CI trust policy")]
     TrustPolicyRead,
     #[error("invalid operator CI trust policy TOML")]
@@ -291,6 +293,36 @@ pub struct CiEvidenceRecord {
     pub digest: String,
     pub first_observed_ms: u64,
 }
+
+/// An App-owned nonpassing check associated with one frozen CI candidate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingCiCheckIntent {
+    pub candidate: CiEvidenceCandidate,
+    pub candidate_digest: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingCiCheckState {
+    Sending,
+    Created {
+        check_id: u64,
+        suite_id: u64,
+        direct: bool,
+        recovered: bool,
+    },
+    Conflict {
+        check_id: Option<u64>,
+        suite_id: Option<u64>,
+        other_check_id: u64,
+        other_suite_id: u64,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingCiCheckClaim {
+    Send(PendingCiCheckIntent),
+    Existing(PendingCiCheckIntent, PendingCiCheckState),
+}
+
 fn ci_candidate_digest(body: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"sluss-ci-evidence-candidate-v1\0");
@@ -462,6 +494,143 @@ impl LandingJournal {
         }))
     }
 
+    /// Inspect a nonpassing check journal without authenticating provider state.
+    pub fn pending_ci_check(
+        &self,
+        id: &str,
+    ) -> Result<Option<(PendingCiCheckIntent, PendingCiCheckState)>, LandingError> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_ci_checks_v1')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        pending_ci_check_from_conn(&self.conn, id)
+    }
+
+    /// Bind the already provider-refreshed evidence and claim exactly one
+    /// nonpassing POST. An intervening delivery or local change stops the send.
+    pub(crate) fn claim_pending_ci_check(
+        &mut self,
+        record: &CiEvidenceRecord,
+        revision: i64,
+    ) -> Result<PendingCiCheckClaim, LandingError> {
+        validate_ci_candidate(&record.candidate)?;
+        let body = serde_json::to_string(&record.candidate)?;
+        if ci_candidate_digest(&body) != record.digest
+            || delivery_revision_from_conn(&self.conn)? != revision
+        {
+            return Err(LandingError::StaleBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if delivery_revision(&tx)? != revision {
+            return Err(LandingError::StaleBatch);
+        }
+        // Both check publishers share GitHub's global check-ID namespace.
+        // A legacy schema unable to detect collisions must fail before POST.
+        let check_tables: i64 = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('failure_check_intents','failure_check_conflicts','pending_ci_checks_v1','pending_ci_check_conflicts_v1')", [], |r| r.get(0))?;
+        if check_tables != 4 {
+            return Err(LandingError::PendingCheckConflict);
+        }
+        let candidate = &record.candidate;
+        let batch = &candidate.plan.batch_id;
+        let policy_digest = candidate.policy.digest()?;
+        let head: Option<String> = tx.query_row("SELECT digest FROM ci_evidence_candidate_heads_v1 WHERE batch_id=?1 AND policy_digest=?2", params![batch,policy_digest], |r| r.get(0)).optional()?;
+        let saved: Option<String> = tx.query_row("SELECT body FROM ci_evidence_candidates_v1 WHERE batch_id=?1 AND policy_digest=?2 AND digest=?3", params![batch,policy_digest,record.digest], |r| r.get(0)).optional()?;
+        if head.as_deref() != Some(record.digest.as_str())
+            || saved.as_deref() != Some(body.as_str())
+        {
+            return Err(LandingError::StaleBatch);
+        }
+        let mut plan = observed_plan(
+            &tx,
+            &candidate.plan.operation_id,
+            batch,
+            &candidate.policy.repository_node_id,
+        )?;
+        verify_trusted_policy(&tx, &plan, &candidate.policy)?;
+        let current = refresh_target_details(&tx, plan.clone())?;
+        plan.trusted_ci_policy_digest = Some(policy_digest);
+        if candidate.plan != plan
+            || candidate.snapshot != current.snapshot
+            || current.delivery_revision != revision
+        {
+            return Err(LandingError::StaleBatch);
+        }
+        let intent = PendingCiCheckIntent {
+            candidate: candidate.clone(),
+            candidate_digest: record.digest.clone(),
+        };
+        if let Some((existing, state)) = pending_ci_check_from_conn(&tx, batch)? {
+            if existing != intent {
+                return Err(LandingError::PendingCheckConflict);
+            }
+            tx.commit()?;
+            return Ok(PendingCiCheckClaim::Existing(existing, state));
+        }
+        let intent_body = serde_json::to_string(&intent)?;
+        if intent_body.len() > 8_000_000 {
+            return Err(LandingError::Corrupt);
+        }
+        tx.execute(
+            "INSERT INTO pending_ci_checks_v1(batch_id,body,state) VALUES(?1,?2,'sending')",
+            params![batch, intent_body],
+        )?;
+        tx.commit()?;
+        Ok(PendingCiCheckClaim::Send(intent))
+    }
+
+    /// Preserve a direct or operator-recovered receipt, including a later
+    /// conflicting direct ID. This never upgrades the nonpassing check.
+    pub(crate) fn record_pending_ci_receipt(
+        &mut self,
+        id: &str,
+        check_id: u64,
+        suite_id: u64,
+        direct: bool,
+    ) -> Result<PendingCiCheckState, LandingError> {
+        if check_id == 0 || suite_id == 0 {
+            return Err(LandingError::PendingCheckConflict);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, state) =
+            pending_ci_check_from_conn(&tx, id)?.ok_or(LandingError::PendingCheckConflict)?;
+        match state {
+            PendingCiCheckState::Sending => {
+                let owned: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ci_checks_v1 WHERE batch_id<>?1 AND check_id=?2) OR EXISTS(SELECT 1 FROM pending_ci_check_conflicts_v1 WHERE batch_id<>?1 AND other_check_id=?2) OR EXISTS(SELECT 1 FROM failure_check_intents WHERE check_id=?2) OR EXISTS(SELECT 1 FROM failure_check_conflicts WHERE other_check_id=?2)", params![id,check_id.to_string()], |r| r.get(0))?;
+                if owned {
+                    tx.execute("INSERT INTO pending_ci_check_conflicts_v1(batch_id,other_check_id,other_suite_id) VALUES(?1,?2,?3)", params![id,check_id.to_string(),suite_id.to_string()])?;
+                    tx.commit()?;
+                    return Err(LandingError::PendingCheckConflict);
+                }
+                tx.execute("UPDATE pending_ci_checks_v1 SET state='created',check_id=?2,suite_id=?3,direct=?4,recovered=?5 WHERE batch_id=?1 AND state='sending'", params![id,check_id.to_string(),suite_id.to_string(),direct,!direct])?;
+            }
+            PendingCiCheckState::Created {
+                check_id: known,
+                suite_id: known_suite,
+                ..
+            } if known == check_id && known_suite == suite_id => {
+                tx.execute("UPDATE pending_ci_checks_v1 SET direct=MAX(direct,?2),recovered=MAX(recovered,?3) WHERE batch_id=?1", params![id,direct,!direct])?;
+            }
+            PendingCiCheckState::Created {
+                check_id: known,
+                suite_id: known_suite,
+                ..
+            } if direct && (known != check_id || known_suite != suite_id) => {
+                tx.execute("INSERT OR IGNORE INTO pending_ci_check_conflicts_v1(batch_id,other_check_id,other_suite_id) VALUES(?1,?2,?3)", params![id,check_id.to_string(),suite_id.to_string()])?;
+                tx.commit()?;
+                return Err(LandingError::PendingCheckConflict);
+            }
+            _ => return Err(LandingError::PendingCheckConflict),
+        }
+        let (_, new_state) =
+            pending_ci_check_from_conn(&tx, id)?.ok_or(LandingError::PendingCheckConflict)?;
+        tx.commit()?;
+        Ok(new_state)
+    }
+
     /// Compare a frozen local batch to an operator policy without creating a
     /// journal intent or querying the provider. The database is opened read-only.
     pub fn inspect_trusted_batch(
@@ -496,6 +665,9 @@ impl LandingJournal {
         CREATE INDEX IF NOT EXISTS landing_recovery_by_id_v1 ON landing_recovery_observations_v1(id,sequence);
         CREATE TABLE IF NOT EXISTS ci_evidence_candidates_v1 (batch_id TEXT NOT NULL, policy_digest TEXT NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL, first_observed_ms INTEGER NOT NULL, PRIMARY KEY(batch_id,digest));
         CREATE TABLE IF NOT EXISTS ci_evidence_candidate_heads_v1 (batch_id TEXT NOT NULL, policy_digest TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id,policy_digest));
+        CREATE TABLE IF NOT EXISTS pending_ci_checks_v1 (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','created')), check_id TEXT, suite_id TEXT, direct INTEGER NOT NULL DEFAULT 0 CHECK(direct IN (0,1)), recovered INTEGER NOT NULL DEFAULT 0 CHECK(recovered IN (0,1)));
+        CREATE UNIQUE INDEX IF NOT EXISTS pending_ci_check_unique_id_v1 ON pending_ci_checks_v1(check_id) WHERE check_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS pending_ci_check_conflicts_v1 (batch_id TEXT PRIMARY KEY NOT NULL, other_check_id TEXT NOT NULL, other_suite_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
         CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);",
         )?;
@@ -937,11 +1109,74 @@ impl LandingJournal {
     }
 }
 
-/// The AUTOINCREMENT value also advances for internal scans whose temporary
-/// delivery row has already been deleted. It therefore detects ABA changes
-/// even when the reconciliation has completed before a provider scan ends.
-fn delivery_revision(tx: &rusqlite::Transaction<'_>) -> Result<i64, LandingError> {
-    let seq: Option<i64> = tx
+fn pending_ci_check_from_conn(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<(PendingCiCheckIntent, PendingCiCheckState)>, LandingError> {
+    type PendingCheckRow = (String, String, Option<String>, Option<String>, bool, bool);
+    let row: Option<PendingCheckRow> = conn.query_row("SELECT body,state,check_id,suite_id,direct,recovered FROM pending_ci_checks_v1 WHERE batch_id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let Some((body, state, check, suite, direct, recovered)) = row else {
+        return Ok(None);
+    };
+    if body.len() > 8_000_000 {
+        return Err(LandingError::Corrupt);
+    }
+    let intent: PendingCiCheckIntent = serde_json::from_str(&body)?;
+    validate_ci_candidate(&intent.candidate)?;
+    let candidate_body = serde_json::to_string(&intent.candidate)?;
+    if intent.candidate.plan.batch_id != id
+        || ci_candidate_digest(&candidate_body) != intent.candidate_digest
+    {
+        return Err(LandingError::Corrupt);
+    }
+    let parse = |v: Option<String>| {
+        v.and_then(|s| {
+            s.parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0 && n.to_string() == s)
+        })
+        .ok_or(LandingError::Corrupt)
+    };
+    let result = match (state.as_str(), check, suite, direct, recovered) {
+        ("sending", None, None, false, false) => PendingCiCheckState::Sending,
+        ("created", Some(check), Some(suite), direct, recovered) if direct || recovered => {
+            PendingCiCheckState::Created {
+                check_id: parse(Some(check))?,
+                suite_id: parse(Some(suite))?,
+                direct,
+                recovered,
+            }
+        }
+        _ => return Err(LandingError::Corrupt),
+    };
+    let conflict: Option<(String,String)> = conn.query_row("SELECT other_check_id,other_suite_id FROM pending_ci_check_conflicts_v1 WHERE batch_id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let result = if let Some((other, suite)) = conflict {
+        let other = parse(Some(other))?;
+        let other_suite = parse(Some(suite))?;
+        let known = match result {
+            PendingCiCheckState::Sending => None,
+            PendingCiCheckState::Created {
+                check_id, suite_id, ..
+            } => Some((check_id, suite_id)),
+            _ => return Err(LandingError::Corrupt),
+        };
+        if known == Some((other, other_suite)) {
+            return Err(LandingError::Corrupt);
+        }
+        PendingCiCheckState::Conflict {
+            check_id: known.map(|(id, _)| id),
+            suite_id: known.map(|(_, suite)| suite),
+            other_check_id: other,
+            other_suite_id: other_suite,
+        }
+    } else {
+        result
+    };
+    Ok(Some((intent, result)))
+}
+
+fn delivery_revision_from_conn(conn: &Connection) -> Result<i64, LandingError> {
+    let seq: Option<i64> = conn
         .query_row(
             "SELECT seq FROM sqlite_sequence WHERE name='webhook_deliveries'",
             [],
@@ -953,6 +1188,13 @@ fn delivery_revision(tx: &rusqlite::Transaction<'_>) -> Result<i64, LandingError
         return Err(LandingError::Corrupt);
     }
     Ok(seq)
+}
+
+/// The AUTOINCREMENT value also advances for internal scans whose temporary
+/// delivery row has already been deleted. It therefore detects ABA changes
+/// even when the reconciliation has completed before a provider scan ends.
+fn delivery_revision(tx: &rusqlite::Transaction<'_>) -> Result<i64, LandingError> {
+    delivery_revision_from_conn(tx)
 }
 
 fn refresh_target_details(

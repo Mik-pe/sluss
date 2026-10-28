@@ -1653,6 +1653,25 @@ impl Scheduler {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, state) =
             failure_check_state(&tx, id)?.ok_or(SchedulerError::FailureCheckConflict)?;
+        for (table, column) in [
+            ("pending_ci_checks_v1", "check_id"),
+            ("pending_ci_check_conflicts_v1", "other_check_id"),
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if exists
+                && tx.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?1)"),
+                    [check_id.to_string()],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                return Err(SchedulerError::FailureCheckConflict);
+            }
+        }
         let legacy_direct = matches!(state, FailureCheckState::Created { .. })
             && tx.query_row(
                 "SELECT NOT EXISTS(SELECT 1 FROM failure_check_receipt_sources WHERE id=?1)",

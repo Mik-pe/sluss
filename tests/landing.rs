@@ -347,6 +347,14 @@ fn offline_recovery_inspection_does_not_create_or_migrate_a_database() {
         .unwrap();
     assert!(!output.status.success());
     assert!(!missing.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&missing)
+        .args(["staged-check", "--batch-id", "batch-123"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!missing.exists());
     let db = dir.path().join("legacy.sqlite");
     let mut journal = LandingJournal::open(&db).unwrap();
     journal.prepare(&plan("land-one")).unwrap();
@@ -368,5 +376,22 @@ fn offline_recovery_inspection_does_not_create_or_migrate_a_database() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("no recorded ref observation"));
     let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='landing_recovery_observations_v1')", [], |r| r.get(0)).unwrap();
+    assert!(!exists);
+    conn.execute("DROP TABLE pending_ci_checks_v1", []).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["staged-check", "--batch-id", "batch-123"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no staged check intent"));
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='pending_ci_checks_v1')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(!exists);
 }

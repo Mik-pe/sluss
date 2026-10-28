@@ -144,6 +144,29 @@ enum Command {
         #[arg(long)]
         policy: PathBuf,
     },
+    /// Start a nonpassing App check for freshly verified staging CI.
+    StartStagedCheck {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Recover an explicitly identified nonpassing check after an uncertain send.
+    RecoverStagedCheck {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        check_id: u64,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Inspect the local nonpassing check journal without contacting GitHub.
+    StagedCheck {
+        #[arg(long)]
+        batch_id: String,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -912,6 +935,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
+    if let Command::StagedCheck { batch_id } = &cli.command {
+        let mut journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        if let Some((intent, state)) = journal.pending_ci_check(batch_id)? {
+            println!(
+                "staged check {batch_id}: {state:?}; commit {}, CI run {}, evidence {}",
+                intent.candidate.plan.staged_sha,
+                intent.candidate.snapshot.run.id,
+                intent.candidate_digest
+            );
+            match journal.inspect_ci_candidate(batch_id, &intent.candidate.policy) {
+                Ok(Some(current)) if current.digest == intent.candidate_digest => {
+                    println!("local evidence matches; provider state may have changed")
+                }
+                Ok(_) => println!("no current local evidence for this check"),
+                Err(error) => println!("local evidence unavailable: {error}"),
+            }
+        } else {
+            println!("no staged check intent for {batch_id}");
+        }
+        println!("local journal only; no CI attestation or merge authorization");
+        return Ok(());
+    }
     if let Command::InspectStagedCi { batch_id, policy } = &cli.command {
         let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
         let mut journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
@@ -1542,6 +1587,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("planning settings already match; Sluss remains paused");
             }
         }
+        Command::StartStagedCheck {
+            batch_id,
+            config,
+            policy,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let trust = sluss::landing::TrustedCiPolicy::load(&policy)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let read = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let security = app
+                .runner_inventory_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let write = app
+                .checks_write_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+            let outcome = app
+                .start_staged_check(
+                    &mut journal,
+                    (&read, &security, &write),
+                    &config.policy(),
+                    &trust,
+                    &batch_id,
+                )
+                .await?;
+            println!(
+                "nonpassing staged check: {outcome:?}; not an attestation or merge authorization"
+            );
+        }
+        Command::RecoverStagedCheck {
+            batch_id,
+            check_id,
+            config,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let read = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+            let outcome = app
+                .recover_staged_check(
+                    &mut journal,
+                    &read,
+                    (&config.github.owner, &config.github.repository),
+                    &batch_id,
+                    check_id,
+                )
+                .await?;
+            println!(
+                "nonpassing staged check recovery: {outcome:?}; a match does not prove request origin or authorize a merge"
+            );
+        }
+        Command::StagedCheck { .. } => unreachable!(),
         Command::VerifyStagedCi {
             batch_id,
             config,
