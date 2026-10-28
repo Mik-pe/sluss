@@ -196,6 +196,15 @@ enum Command {
         #[arg(long)]
         capacity: PathBuf,
     },
+    /// Publish a failure-only check for an observed failed staging run.
+    ReportFailedCheck {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Request cancellation of a known run for an invalidated batch.
     CancelStale {
         #[arg(long)]
@@ -927,6 +936,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "unknown".into());
             println!("receipt source: {source}");
             println!("observation does not authorize landing or release reserved capacity");
+        }
+        Command::ReportFailedCheck {
+            batch_id,
+            config,
+            capacity,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let installation = config.github.installation_id as u64;
+            let repository = config.github.repository_id as u64;
+            if store.repository_scope()? != (installation, repository) {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app =
+                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let read = app.read_token(installation, repository).await?;
+            let write = app.failed_check_token(installation, repository).await?;
+            let outcome = app
+                .publish_failed_check(
+                    &mut scheduler,
+                    (&read, &write),
+                    &config.github.owner,
+                    &config.github.repository,
+                    &batch_id,
+                )
+                .await?;
+            println!("failure-only staging check: {outcome:?}; this does not authorize a merge");
         }
         Command::CancelStale {
             batch_id,

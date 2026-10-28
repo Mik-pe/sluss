@@ -147,7 +147,7 @@ async fn actions_jobs(
     } else {
         1
     };
-    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if mode == 40 { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
+    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=98) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
 async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
@@ -208,7 +208,7 @@ async fn dispatched_run(
     };
     let conclusion = if mode == 31 {
         None
-    } else if mode == 40 {
+    } else if matches!(mode, 40 | 95..=98) {
         Some("failure")
     } else if mode == 43 {
         Some("cancelled")
@@ -388,6 +388,44 @@ async fn verified_check(State(state): State<ServerState>, headers: HeaderMap) ->
         "check_suite":{"id":if mode == 92 {0} else {44}}
     }))
 }
+async fn failed_check_post(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(body["name"], "sluss/verified");
+    assert_eq!(body["head_sha"], "a".repeat(40));
+    assert_eq!(body["external_id"], "batch-0123456789abcdef");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["conclusion"], "failure");
+    assert!(
+        body["output"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("does not authorize")
+    );
+    assert!(
+        body["output"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("run 123")
+    );
+    state.permissions.fetch_add(1, Ordering::SeqCst);
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 95 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message":"ambiguous"})),
+        );
+    }
+    (
+        StatusCode::CREATED,
+        Json(
+            json!({"id":444,"name":"sluss/verified","head_sha":"a".repeat(40),"external_id":"batch-0123456789abcdef","status":"completed","conclusion":if mode==97 {"neutral"} else {"failure"},"app":{"id":if mode==96 {18} else {17},"node_id":"A_app"},"check_suite":{"id":45}}),
+        ),
+    )
+}
 async fn repository_runners(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -449,8 +487,11 @@ async fn token(
     let write = body["permissions"]["actions"] == "write";
     let staging = body["permissions"]["contents"] == "write";
     let inventory = body["permissions"]["administration"] == "read";
+    let checks_write = body["permissions"]["checks"] == "write";
     if inventory {
         assert_eq!(body["permissions"], json!({"administration":"read"}));
+    } else if checks_write {
+        assert_eq!(body["permissions"], json!({"checks":"write"}));
     } else if staging {
         assert_eq!(body["permissions"], json!({"contents":"write"}));
     } else if write {
@@ -515,6 +556,9 @@ async fn token(
     }
     if inventory {
         permissions = BTreeMap::from([("administration", "read"), ("metadata", "read")]);
+    }
+    if checks_write {
+        permissions = BTreeMap::from([("checks", "write"), ("metadata", "read")]);
     }
     if mode == 3 {
         permissions.insert("contents", "write");
@@ -1519,6 +1563,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .route("/graphql", post(graphql_schema))
         .route("/repos/owner/repo", get(dispatch_repo))
         .route("/repos/owner/repo/check-runs/333", get(verified_check))
+        .route("/repos/owner/repo/check-runs", post(failed_check_post))
         .route("/repos/owner/repo/actions/runners", get(repository_runners))
         .route("/repos/owner/repo/branches/main", get(doctor_branch))
         .route("/repos/owner/repo/pulls", get(open_pulls))
@@ -2025,6 +2070,205 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         sluss::landing::IntentState::Prepared
     );
     posts.store(0, Ordering::SeqCst);
+    let check_token = fixture_app.failed_check_token(42, 7).await.unwrap();
+    for check_mode in [40, 95, 96, 97, 98] {
+        mode.store(0, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        let failure_db = data
+            .path()
+            .join(format!("failed-check-{check_mode}.sqlite"));
+        let mut failure_inbox = Inbox::open(&failure_db).unwrap();
+        let mut failure_store = Store::open(&failure_db).unwrap();
+        failure_inbox
+            .record("failure", "pull_request", &[11; 32], 42, 7)
+            .unwrap();
+        let event = failure_inbox.pending().unwrap().remove(0);
+        sluss::reconcile::reconcile_once(
+            &fixture_app,
+            &fixture_token,
+            &mut failure_store,
+            &event,
+            &fixture_policy,
+        )
+        .await
+        .unwrap();
+        failure_store
+            .plan_batch(id, &"b".repeat(40), 1, 1)
+            .unwrap()
+            .unwrap();
+        failure_store
+            .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+            .unwrap();
+        failure_store.start_integration(id).unwrap();
+        failure_store
+            .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+            .unwrap();
+        mode.store(check_mode, Ordering::SeqCst);
+        assert!(matches!(
+            sluss::dispatch::batch(
+                &failure_db,
+                &fixture_app,
+                &fixture_policy,
+                &one_host,
+                &settings,
+                id
+            )
+            .await
+            .unwrap(),
+            sluss::dispatch::Outcome::Sent { run: 123, .. }
+        ));
+        sluss::worker::observe_dispatches_once(
+            &fixture_app,
+            &failure_db,
+            &one_host,
+            &fixture_policy,
+        )
+        .await
+        .unwrap();
+        posts.store(0, Ordering::SeqCst);
+        let mut first = sluss::scheduler::Scheduler::open(&failure_db, one_host.clone()).unwrap();
+        let mut second = sluss::scheduler::Scheduler::open(&failure_db, one_host.clone()).unwrap();
+        assert!(matches!(
+            fixture_app
+                .publish_failed_check(
+                    &mut first,
+                    (&fixture_token, &fixture_token),
+                    "owner",
+                    "repo",
+                    id
+                )
+                .await,
+            Err(sluss::github::FailureCheckError::Scope)
+        ));
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        if check_mode == 40 {
+            failure_inbox
+                .record("pending-change", "pull_request_review", &[12; 32], 42, 7)
+                .unwrap();
+            assert!(
+                fixture_app
+                    .publish_failed_check(
+                        &mut first,
+                        (&fixture_token, &check_token),
+                        "owner",
+                        "repo",
+                        id
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                posts.load(Ordering::SeqCst),
+                0,
+                "pending review refresh must stop the POST"
+            );
+            let pending = failure_inbox.pending().unwrap().remove(0);
+            sluss::reconcile::reconcile_once(
+                &fixture_app,
+                &fixture_token,
+                &mut failure_store,
+                &pending,
+                &fixture_policy,
+            )
+            .await
+            .unwrap();
+        }
+        if check_mode == 98 {
+            let db_arg = failure_db.clone();
+            let config_arg = config.clone();
+            let capacity_arg = capacity.clone();
+            let key_arg = key_dir.path().join("test-key.pem");
+            let output = tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_sluss"))
+                    .arg("--db")
+                    .arg(db_arg)
+                    .args(["report-failed-check", "--batch-id", id, "--config"])
+                    .arg(config_arg)
+                    .arg("--capacity")
+                    .arg(capacity_arg)
+                    .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Created(444)"));
+        } else {
+            let (a, b) = tokio::join!(
+                fixture_app.publish_failed_check(
+                    &mut first,
+                    (&fixture_token, &check_token),
+                    "owner",
+                    "repo",
+                    id
+                ),
+                fixture_app.publish_failed_check(
+                    &mut second,
+                    (&fixture_token, &check_token),
+                    "owner",
+                    "repo",
+                    id
+                ),
+            );
+            assert_eq!(
+                posts.load(Ordering::SeqCst),
+                1,
+                "one POST for mode {check_mode}"
+            );
+            if check_mode == 40 {
+                assert_eq!(
+                    [&a, &b]
+                        .iter()
+                        .filter(|result| matches!(
+                            result,
+                            Ok(sluss::github::FailureCheckOutcome::Created(444))
+                        ))
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(
+                    a.is_err() && b.is_err(),
+                    "ambiguous result cannot be called created"
+                );
+            }
+        }
+        drop(first);
+        drop(second);
+        let mut restarted =
+            sluss::scheduler::Scheduler::open(&failure_db, one_host.clone()).unwrap();
+        let recovery = fixture_app
+            .publish_failed_check(
+                &mut restarted,
+                (&fixture_token, &check_token),
+                "owner",
+                "repo",
+                id,
+            )
+            .await;
+        if matches!(check_mode, 40 | 98) {
+            assert!(matches!(
+                recovery,
+                Ok(sluss::github::FailureCheckOutcome::AlreadyCreated(444))
+            ));
+        } else {
+            assert!(matches!(
+                recovery,
+                Err(sluss::github::FailureCheckError::Uncertain)
+            ));
+        }
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "restart must not resend for mode {check_mode}"
+        );
+    }
+    posts.store(0, Ordering::SeqCst);
     // A previously prepared intent is pinned to a now-busy host. A second
     // batch must still reach the other idle host, without resending the first.
     mode.store(46, Ordering::SeqCst);
@@ -2445,6 +2689,24 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     )
     .await
     .unwrap();
+    let before_posts = posts.load(Ordering::SeqCst);
+    let mut no_success_publisher =
+        sluss::scheduler::Scheduler::open(&db, observer_capacity.clone()).unwrap();
+    assert!(matches!(
+        observer_app
+            .publish_failed_check(
+                &mut no_success_publisher,
+                (&fixture_token, &check_token),
+                "owner",
+                "repo",
+                id
+            )
+            .await,
+        Err(sluss::github::FailureCheckError::Scheduler(
+            sluss::scheduler::SchedulerError::FailureCheckConflict
+        ))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), before_posts);
     // A fresh provider read must match the frozen run, including the latest
     // attempt and repository node identity, before this experimental claim.
     let mut landing = sluss::landing::LandingJournal::open(&db).unwrap();

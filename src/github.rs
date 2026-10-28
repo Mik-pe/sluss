@@ -49,6 +49,7 @@ pub struct InstallationToken {
     contents_write: bool,
     runner_inventory_read: bool,
     checks_read: bool,
+    checks_write: bool,
     app_client_id: String,
     api_origin: String,
 }
@@ -71,6 +72,7 @@ enum TokenPurpose {
     Dispatch,
     Staging,
     RunnerInventory,
+    FailedCheck,
 }
 #[derive(Serialize)]
 struct Claims<'a> {
@@ -250,6 +252,9 @@ impl App {
         let client = reqwest::Client::builder()
             .user_agent("sluss/0.1")
             .redirect(reqwest::redirect::Policy::none())
+            // Mutating requests are journaled as a single attempt. Disable
+            // even reqwest's default retry of protocol-level NACKs.
+            .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| GitHubError::InvalidConfiguration)?;
@@ -310,6 +315,16 @@ impl App {
         )
         .await
     }
+    /// A separate repository-scoped Checks-write credential. It is used by
+    /// the experimental failure-only publisher; it never issues success.
+    pub async fn failed_check_token(
+        &self,
+        installation_id: u64,
+        repository_id: u64,
+    ) -> Result<InstallationToken, GitHubError> {
+        self.mint_token(installation_id, repository_id, TokenPurpose::FailedCheck)
+            .await
+    }
     async fn mint_token(
         &self,
         installation_id: u64,
@@ -328,6 +343,7 @@ impl App {
             TokenPurpose::Dispatch => BTreeMap::from([("actions", "write"), ("contents", "read")]),
             TokenPurpose::Staging => BTreeMap::from([("contents", "write")]),
             TokenPurpose::RunnerInventory => BTreeMap::from([("administration", "read")]),
+            TokenPurpose::FailedCheck => BTreeMap::from([("checks", "write")]),
             TokenPurpose::Read => BTreeMap::from([
                 ("actions", "read"),
                 ("checks", "read"),
@@ -398,6 +414,7 @@ impl App {
             contents_write: matches!(purpose, TokenPurpose::Staging),
             runner_inventory_read: matches!(purpose, TokenPurpose::RunnerInventory),
             checks_read: matches!(purpose, TokenPurpose::Read),
+            checks_write: matches!(purpose, TokenPurpose::FailedCheck),
             app_client_id: self.client_id.clone(),
             api_origin: self.api.as_str().to_owned(),
         })
@@ -1430,7 +1447,130 @@ pub struct AppCheckIssuer {
 pub struct AppCheckSuite {
     pub id: u64,
 }
+#[derive(Debug, Error)]
+pub enum FailureCheckError {
+    #[error("check publisher credentials or repository scope do not match")]
+    Scope,
+    #[error("the check request may have succeeded; reconcile without retrying")]
+    Uncertain,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Dispatch(#[from] DispatchError),
+    #[error(transparent)]
+    Scheduler(#[from] crate::scheduler::SchedulerError),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureCheckOutcome {
+    Created(u64),
+    AlreadyCreated(u64),
+}
 impl App {
+    /// Publish only a failed CI observation to the exact staged commit. The
+    /// intent is durably claimed before one POST; no ambiguous outcome is
+    /// retried. This does not issue a positive attestation or authorize merge.
+    pub async fn publish_failed_check(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        tokens: (&InstallationToken, &InstallationToken),
+        owner: &str,
+        repository: &str,
+        batch_id: &str,
+    ) -> Result<FailureCheckOutcome, FailureCheckError> {
+        use crate::scheduler::FailureCheckState;
+        let (read, write) = tokens;
+        if !read.checks_read
+            || !write.checks_write
+            || !valid_name(owner)
+            || !valid_name(repository)
+            || !valid_name(batch_id)
+            || read.installation_id != write.installation_id
+            || read.repository_id != write.repository_id
+            || read.app_client_id != self.client_id
+            || write.app_client_id != self.client_id
+            || read.api_origin != self.api.as_str()
+            || write.api_origin != self.api.as_str()
+        {
+            return Err(FailureCheckError::Scope);
+        }
+        let app = self.observe_app_identity().await?;
+        let (intent, state) = scheduler.prepare_failure_check(batch_id)?;
+        if intent.installation_id != read.installation_id
+            || intent.repository_id != read.repository_id
+        {
+            return Err(FailureCheckError::Scope);
+        }
+        match state {
+            FailureCheckState::Sending { .. } => return Err(FailureCheckError::Uncertain),
+            FailureCheckState::Created { app_id, check_id } if app_id == app.id => {
+                return Ok(FailureCheckOutcome::AlreadyCreated(check_id));
+            }
+            FailureCheckState::Created { .. } => return Err(FailureCheckError::Scope),
+            FailureCheckState::Prepared => {}
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let repo: Repository = self.get_json(read, &root, None).await?;
+        if repo.id != read.repository_id {
+            return Err(FailureCheckError::Scope);
+        }
+        let snapshot = self
+            .reconcile_dispatch(scheduler, read, owner, repository, batch_id)
+            .await?;
+        if snapshot.run.id != intent.run_id || snapshot.run.head_sha != intent.integration_sha {
+            return Err(FailureCheckError::Scope);
+        }
+        if !scheduler.claim_failure_check(batch_id, app.id, &snapshot)? {
+            return Err(FailureCheckError::Uncertain);
+        }
+        let url = self
+            .api
+            .join(&format!("{root}/check-runs"))
+            .map_err(|_| FailureCheckError::Uncertain)?;
+        let body = serde_json::json!({"name":"sluss/verified","head_sha":intent.integration_sha,"external_id":batch_id,
+            "status":"completed","conclusion":"failure","output":{"title":"Staging CI failed","summary":format!("Recorded CI run {} failed. This check is not an attestation and does not authorize a merge.",intent.run_id)}});
+        let mut response = self
+            .client
+            .post(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(write.secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| FailureCheckError::Uncertain)?;
+        if response.status() != reqwest::StatusCode::CREATED {
+            return Err(FailureCheckError::Uncertain);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| FailureCheckError::Uncertain)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 65536 {
+                return Err(FailureCheckError::Uncertain);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let result: AppCheckObservation =
+            serde_json::from_slice(&bytes).map_err(|_| FailureCheckError::Uncertain)?;
+        if result.id == 0
+            || result.name != "sluss/verified"
+            || result.head_sha != intent.integration_sha
+            || result.external_id.as_deref() != Some(batch_id)
+            || result.status != "completed"
+            || result.conclusion.as_deref() != Some("failure")
+            || result.app.id != app.id
+            || result.app.node_id != app.node_id
+            || result.check_suite.id == 0
+        {
+            return Err(FailureCheckError::Uncertain);
+        }
+        scheduler
+            .record_failure_check(batch_id, app.id, result.id)
+            .map_err(|_| FailureCheckError::Uncertain)?;
+        Ok(FailureCheckOutcome::Created(result.id))
+    }
     /// Read an already existing successful `sluss/verified` check twice and
     /// compare GitHub's issuing App and exact SHA with independently scoped
     /// identity observations. This does not create a check, prove its CI

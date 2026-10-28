@@ -72,6 +72,8 @@ pub enum SchedulerError {
     NotStale,
     #[error("stored reservation refers to an unknown host or pool")]
     Corrupt,
+    #[error("failure check evidence is missing, stale or conflicting")]
+    FailureCheckConflict,
 }
 
 pub struct Scheduler {
@@ -95,6 +97,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_branch_rules (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_branch_security (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS failure_check_intents (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','sending','created')), app_id TEXT, check_id TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS failure_check_unique_receipt ON failure_check_intents(check_id) WHERE check_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
@@ -1250,6 +1254,212 @@ pub struct CiObservationRecord {
     #[serde(default)]
     pub runner_id: Option<u64>,
 }
+/// Durable, non-authorizing report of a failed integration run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureCheckIntent {
+    pub batch_id: String,
+    pub installation_id: u64,
+    pub repository_id: u64,
+    pub run_id: u64,
+    pub integration_sha: String,
+    pub evidence_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureCheckState {
+    Prepared,
+    Sending { app_id: u64 },
+    Created { app_id: u64, check_id: u64 },
+}
+fn failure_check_state(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<Option<(FailureCheckIntent, FailureCheckState)>, SchedulerError> {
+    let row: Option<(String, String, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT body,state,app_id,check_id FROM failure_check_intents WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(body, state, app, check)| {
+        let intent: FailureCheckIntent = serde_json::from_str(&body)?;
+        if intent.batch_id != id
+            || intent.installation_id == 0
+            || intent.repository_id == 0
+            || intent.run_id == 0
+            || intent.integration_sha.len() != 40
+            || intent.evidence_digest.len() != 64
+            || !intent
+                .integration_sha
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            || !intent.integration_sha.bytes().any(|c| c != b'0')
+            || !intent
+                .evidence_digest
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err(SchedulerError::Corrupt);
+        }
+        let number = |v: Option<String>| v.and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0);
+        let state = match (state.as_str(), app, check) {
+            ("prepared", None, None) => FailureCheckState::Prepared,
+            ("sending", Some(app), None) => FailureCheckState::Sending {
+                app_id: number(Some(app)).ok_or(SchedulerError::Corrupt)?,
+            },
+            ("created", Some(app), Some(check)) => FailureCheckState::Created {
+                app_id: number(Some(app)).ok_or(SchedulerError::Corrupt)?,
+                check_id: number(Some(check)).ok_or(SchedulerError::Corrupt)?,
+            },
+            _ => return Err(SchedulerError::Corrupt),
+        };
+        Ok((intent, state))
+    })
+    .transpose()
+}
+fn current_failure(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<(FailureCheckIntent, crate::github::ActionsSnapshot), SchedulerError> {
+    use sha2::{Digest, Sha256};
+    let row: Option<(String,String,String,Option<String>,String,String)> = tx.query_row(
+        "SELECT c.body,d.plan,d.state,d.run_id,s.source,w.path FROM ci_observations c JOIN dispatch_batches b ON b.id=c.id AND b.batch_id=?1 JOIN dispatch_intents d ON d.id=c.id JOIN dispatch_receipt_sources s ON s.id=c.id JOIN dispatch_workflows w ON w.id=c.id WHERE c.id=?1", [id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+    ).optional()?;
+    let (body, plan_body, state, run_id, source, workflow) =
+        row.ok_or(SchedulerError::FailureCheckConflict)?;
+    let record: CiObservationRecord = serde_json::from_str(&body)?;
+    let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
+    let snapshot = record
+        .snapshot
+        .as_ref()
+        .ok_or(SchedulerError::FailureCheckConflict)?;
+    let expected = crate::verification::CiObservation::Failed {
+        conclusion: "failure".into(),
+    };
+    if source != "direct"
+        || state != "observed"
+        || record.plan != plan
+        || !plan.valid()
+        || run_id.as_deref().and_then(|s| s.parse::<u64>().ok()) != Some(record.run_id)
+        || record.workflow_path.as_deref() != Some(workflow.as_str())
+        || !crate::github::workflow_path_matches(&workflow, &snapshot.run.path)
+        || !record.runner_id.is_some_and(|runner| {
+            snapshot
+                .jobs
+                .iter()
+                .any(|job| job.runner_id == Some(runner))
+        })
+        || record.observation != expected
+        || crate::verification::observe_ci(&plan, record.run_id, snapshot).ok() != Some(expected)
+    {
+        return Err(SchedulerError::FailureCheckConflict);
+    }
+    let conflicted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if conflicted {
+        return Err(SchedulerError::FailureCheckConflict);
+    }
+    validate_batch_dispatch(tx, id, &plan)?;
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-failed-check-v1\0");
+    hash.update(body.as_bytes());
+    Ok((
+        FailureCheckIntent {
+            batch_id: id.into(),
+            installation_id: plan.installation_id,
+            repository_id: plan.repository_id,
+            run_id: record.run_id,
+            integration_sha: plan.integration_sha,
+            evidence_digest: hex::encode(hash.finalize()),
+        },
+        snapshot.clone(),
+    ))
+}
+impl Scheduler {
+    /// Record at most one failure-only check intent. This is not attestation.
+    pub fn prepare_failure_check(
+        &mut self,
+        id: &str,
+    ) -> Result<(FailureCheckIntent, FailureCheckState), SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((intent, state)) = failure_check_state(&tx, id)? {
+            if state == FailureCheckState::Prepared && current_failure(&tx, id)?.0 != intent {
+                return Err(SchedulerError::FailureCheckConflict);
+            }
+            tx.commit()?;
+            return Ok((intent, state));
+        }
+        let (intent, _) = current_failure(&tx, id)?;
+        tx.execute(
+            "INSERT INTO failure_check_intents(id,body,state) VALUES(?1,?2,'prepared')",
+            params![id, serde_json::to_string(&intent)?],
+        )?;
+        tx.commit()?;
+        Ok((intent, FailureCheckState::Prepared))
+    }
+    /// Claim before a single POST. A restarted sender never claims it again.
+    pub(crate) fn claim_failure_check(
+        &mut self,
+        id: &str,
+        app_id: u64,
+        fresh: &crate::github::ActionsSnapshot,
+    ) -> Result<bool, SchedulerError> {
+        if app_id == 0 {
+            return Err(SchedulerError::FailureCheckConflict);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stored, state) =
+            failure_check_state(&tx, id)?.ok_or(SchedulerError::FailureCheckConflict)?;
+        if state != FailureCheckState::Prepared {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let (current, observed) = current_failure(&tx, id)?;
+        if stored != current || canonical_snapshot(fresh) != observed {
+            return Err(SchedulerError::FailureCheckConflict);
+        }
+        if tx.execute("UPDATE failure_check_intents SET state='sending',app_id=?2 WHERE id=?1 AND state='prepared'",params![id,app_id.to_string()])? != 1 { return Err(SchedulerError::FailureCheckConflict); }
+        tx.commit()?;
+        Ok(true)
+    }
+    /// Only a validated direct provider response may be passed here.
+    pub(crate) fn record_failure_check(
+        &mut self,
+        id: &str,
+        app_id: u64,
+        check_id: u64,
+    ) -> Result<(), SchedulerError> {
+        if app_id == 0 || check_id == 0 {
+            return Err(SchedulerError::FailureCheckConflict);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, state) =
+            failure_check_state(&tx, id)?.ok_or(SchedulerError::FailureCheckConflict)?;
+        match state {
+            FailureCheckState::Sending { app_id: known } if known == app_id => {
+                tx.execute("UPDATE failure_check_intents SET state='created',check_id=?2 WHERE id=?1 AND state='sending'",params![id,check_id.to_string()])?;
+            }
+            FailureCheckState::Created {
+                app_id: known,
+                check_id: known_check,
+            } if known == app_id && known_check == check_id => {}
+            _ => return Err(SchedulerError::FailureCheckConflict),
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 impl Scheduler {
     /// Persist a provider result comparison for a still-current batch. This is
     /// deliberately not an attestation and does not authorize landing.
