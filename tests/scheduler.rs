@@ -439,10 +439,12 @@ fn dispatch_overview_shows_uncertain_and_orphaned_work_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.sqlite");
     assert!(Scheduler::dispatch_overview(&missing).is_err());
+    assert!(Scheduler::rerun_scan_issues(&missing).is_err());
     assert!(!missing.exists());
     let fresh = dir.path().join("fresh.sqlite");
     sluss::store::Store::open(&fresh).unwrap();
     assert!(Scheduler::dispatch_overview(&fresh).unwrap().is_empty());
+    assert!(Scheduler::rerun_scan_issues(&fresh).unwrap().is_empty());
     let partial = dir.path().join("partial.sqlite");
     let partial_db = rusqlite::Connection::open(&partial).unwrap();
     partial_db.execute_batch("CREATE TABLE dispatch_receipt_conflicts(id TEXT); INSERT INTO dispatch_receipt_conflicts VALUES ('orphan');").unwrap();

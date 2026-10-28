@@ -4281,6 +4281,59 @@ async fn cli_dispatches_fixture() {
         4,
         "a checkpoint should avoid re-reading completed attempts"
     );
+    // An inconsistent provider read is durable and visible after reopening.
+    mode.store(251, Ordering::SeqCst);
+    for _ in 0..2 {
+        reads.store(0, Ordering::SeqCst);
+        assert_eq!(
+            sluss::worker::observe_reruns_once(&fixture_app, &rerun_db, &one_host, &fixture_policy)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    let issues = sluss::scheduler::Scheduler::rerun_scan_issues(&rerun_db).unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        (
+            &issues[0].batch_id,
+            issues[0].run_id,
+            issues[0].kind.as_str(),
+            issues[0].occurrences
+        ),
+        (&id.to_string(), 123, "unstable_provider", 2)
+    );
+    let report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&rerun_db)
+        .arg("rerun-status")
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    assert!(String::from_utf8_lossy(&report.stdout).contains("unstable_provider"));
+    let totals = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&rerun_db)
+        .arg("metrics")
+        .output()
+        .unwrap();
+    assert!(totals.status.success());
+    assert!(
+        String::from_utf8_lossy(&totals.stdout).contains("locally recorded rerun scan errors: 1")
+    );
+    mode.store(21, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::observe_reruns_once(&fixture_app, &rerun_db, &one_host, &fixture_policy)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        sluss::scheduler::Scheduler::rerun_scan_issues(&rerun_db)
+            .unwrap()
+            .is_empty()
+    );
     let mut wrong_policy = fixture_policy.clone();
     wrong_policy.repository = 8;
     assert!(

@@ -506,7 +506,7 @@ async fn observe_reruns_inner(
 ) -> Result<usize, ObservationPassError> {
     use crate::{
         github::{GitHubError, RerunMetricsError},
-        scheduler::SchedulerError,
+        scheduler::{RerunIssueKind, SchedulerError},
     };
     let store = Store::open(db).map_err(|e| e.to_string())?;
     observation_scope(&store, policy)?;
@@ -515,7 +515,7 @@ async fn observe_reruns_inner(
     let mut token = None;
     let mut recorded = 0usize;
     for _ in 0..4 {
-        let Some((id, run, after)) = scheduler.next_rerun_scan().map_err(|e| e.to_string())? else {
+        let Some(claim) = scheduler.next_rerun_scan().map_err(|e| e.to_string())? else {
             break;
         };
         if token.is_none() {
@@ -531,8 +531,8 @@ async fn observe_reruns_inner(
                 token.as_ref().expect("initialized"),
                 &policy.owner,
                 &policy.name,
-                &id,
-                after,
+                &claim.id,
+                claim.after,
             )
             .await
         {
@@ -541,24 +541,45 @@ async fn observe_reruns_inner(
                     .contiguous_attempt
                     .ok_or("missing rerun scan progress")?;
                 scheduler
-                    .advance_rerun_scan(&id, run, completed)
+                    .advance_rerun_scan(&claim, completed)
                     .map_err(|e| e.to_string())?;
                 recorded = recorded
                     .checked_add(report.new_jobs)
                     .ok_or("rerun metric count overflow")?;
+            }
+            Err(RerunMetricsError::Scheduler(SchedulerError::DispatchReceiptConflict)) => {
+                eprintln!(
+                    "rerun accounting skipped batch {}: conflicting receipts",
+                    claim.id
+                );
             }
             Err(
                 error @ (RerunMetricsError::GitHub(
                     GitHubError::Status(404) | GitHubError::UnstableObservation,
                 )
                 | RerunMetricsError::Scheduler(
-                    SchedulerError::DispatchTransition
-                    | SchedulerError::DispatchReceiptConflict
-                    | SchedulerError::Metrics(_),
+                    SchedulerError::DispatchTransition | SchedulerError::Metrics(_),
                 )
                 | RerunMetricsError::Limit),
             ) => {
-                eprintln!("rerun accounting skipped batch {id}: {error}");
+                let kind = match &error {
+                    RerunMetricsError::GitHub(GitHubError::Status(404)) => RerunIssueKind::Missing,
+                    RerunMetricsError::GitHub(GitHubError::UnstableObservation) => {
+                        RerunIssueKind::Unstable
+                    }
+                    RerunMetricsError::Scheduler(SchedulerError::DispatchTransition) => {
+                        RerunIssueKind::Identity
+                    }
+                    RerunMetricsError::Scheduler(SchedulerError::Metrics(_)) => {
+                        RerunIssueKind::Measurement
+                    }
+                    RerunMetricsError::Limit => RerunIssueKind::Limit,
+                    _ => unreachable!("matched error category"),
+                };
+                scheduler
+                    .note_rerun_issue(&claim, kind)
+                    .map_err(|e| e.to_string())?;
+                eprintln!("rerun accounting skipped batch {}: {error}", claim.id);
             }
             Err(error) => return Err(error.to_string().into()),
         }

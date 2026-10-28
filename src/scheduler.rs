@@ -94,6 +94,40 @@ pub enum SchedulerError {
     FailureCheckConflict,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerunScanIssue {
+    pub batch_id: String,
+    pub run_id: u64,
+    pub kind: String,
+    pub occurrences: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RerunScanClaim {
+    pub id: String,
+    pub run: u64,
+    pub after: u32,
+    pub revision: i64,
+}
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RerunIssueKind {
+    Missing,
+    Unstable,
+    Identity,
+    Measurement,
+    Limit,
+}
+impl RerunIssueKind {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Missing => "missing_run",
+            Self::Unstable => "unstable_provider",
+            Self::Identity => "identity_mismatch",
+            Self::Measurement => "measurement_error",
+            Self::Limit => "collection_limit",
+        }
+    }
+}
+
 pub struct Scheduler {
     conn: Connection,
     capacity: Capacity,
@@ -230,6 +264,55 @@ impl Scheduler {
             });
         }
         Ok(result)
+    }
+
+    /// Read persisted per-run scan problems without creating or migrating a database.
+    pub fn rerun_scan_issues(
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<RerunScanIssue>, SchedulerError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_rerun_scan_issues')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare("SELECT id,run_id,kind,occurrences FROM ci_rerun_scan_issues ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut issues = Vec::new();
+        for row in rows {
+            let (batch_id, run, kind, occurrences) = row?;
+            let run_id = run
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0 && n.to_string() == run)
+                .ok_or(SchedulerError::Corrupt)?;
+            if !matches!(
+                kind.as_str(),
+                "missing_run"
+                    | "unstable_provider"
+                    | "identity_mismatch"
+                    | "measurement_error"
+                    | "collection_limit"
+            ) || occurrences <= 0
+            {
+                return Err(SchedulerError::Corrupt);
+            }
+            issues.push(RerunScanIssue {
+                batch_id,
+                run_id,
+                kind,
+                occurrences: occurrences as u64,
+            });
+        }
+        Ok(issues)
     }
 
     /// Inspect the currently bound capacity without creating or migrating a database.
@@ -379,6 +462,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, previous_body TEXT NOT NULL, next_body TEXT NOT NULL, migrated_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_rerun_scan_cursor (id INTEGER PRIMARY KEY CHECK(id=1), after_rowid INTEGER NOT NULL CHECK(after_rowid>=0));
             CREATE TABLE IF NOT EXISTS ci_rerun_scan_progress (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, completed_attempt INTEGER NOT NULL CHECK(completed_attempt BETWEEN 1 AND 100));
+            CREATE TABLE IF NOT EXISTS ci_rerun_scan_claims (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0));
+            CREATE TABLE IF NOT EXISTS ci_rerun_scan_issues (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, occurrences INTEGER NOT NULL CHECK(occurrences>0));
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
@@ -1653,7 +1738,7 @@ fn compatible_snapshot(
 impl Scheduler {
     /// Advance a durable round-robin cursor before network reads. A crash may
     /// defer this item until the next sweep; no send or reservation is changed.
-    pub(crate) fn next_rerun_scan(&mut self) -> Result<Option<(String, u64, u32)>, SchedulerError> {
+    pub(crate) fn next_rerun_scan(&mut self) -> Result<Option<RerunScanClaim>, SchedulerError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1716,23 +1801,42 @@ impl Scheduler {
             }
             Some(_) => return Err(SchedulerError::Corrupt),
         };
+        let prior: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT run_id,revision FROM ci_rerun_scan_claims WHERE id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let revision = match prior {
+            None => 1,
+            Some((saved, revision)) if saved == run.to_string() && revision > 0 => {
+                revision.checked_add(1).ok_or(SchedulerError::Corrupt)?
+            }
+            Some(_) => return Err(SchedulerError::Corrupt),
+        };
+        tx.execute("INSERT INTO ci_rerun_scan_claims(id,run_id,revision) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision", params![id,run.to_string(),revision])?;
         tx.execute(
             "UPDATE ci_rerun_scan_cursor SET after_rowid=?1 WHERE id=1",
             [rowid],
         )?;
         tx.commit()?;
-        Ok(Some((id, run, completed)))
+        Ok(Some(RerunScanClaim {
+            id,
+            run,
+            after: completed,
+            revision,
+        }))
     }
 
     /// Advance only a verified contiguous completed prefix. Competing observers
     /// may report the same prefix; the transaction never moves it backwards.
     pub(crate) fn advance_rerun_scan(
         &mut self,
-        id: &str,
-        run: u64,
+        claim: &RerunScanClaim,
         completed: u32,
-    ) -> Result<(), SchedulerError> {
-        if !(1..=100).contains(&completed) {
+    ) -> Result<bool, SchedulerError> {
+        if !(1..=100).contains(&completed) || completed < claim.after {
             return Err(SchedulerError::Invalid);
         }
         let tx = self
@@ -1745,26 +1849,84 @@ impl Scheduler {
         if config != self.encoded {
             return Err(SchedulerError::ConfigChanged);
         }
-        let (_, current, _) = direct_metric_identity(&tx, id)?;
-        if current != run {
+        if !rerun_claim_current(&tx, claim)? {
+            return Ok(false);
+        }
+        let (_, current, _) = direct_metric_identity(&tx, &claim.id)?;
+        if current != claim.run {
             return Err(SchedulerError::DispatchTransition);
         }
         let existing: Option<String> = tx
             .query_row(
                 "SELECT run_id FROM ci_rerun_scan_progress WHERE id=?1",
-                [id],
+                [&claim.id],
                 |r| r.get(0),
             )
             .optional()?;
         if existing
             .as_deref()
-            .is_some_and(|saved| saved != run.to_string())
+            .is_some_and(|saved| saved != claim.run.to_string())
         {
             return Err(SchedulerError::Corrupt);
         }
-        tx.execute("INSERT INTO ci_rerun_scan_progress(id,run_id,completed_attempt) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET completed_attempt=MAX(completed_attempt,excluded.completed_attempt)", params![id,run.to_string(),completed])?;
+        let issue_run: Option<String> = tx
+            .query_row(
+                "SELECT run_id FROM ci_rerun_scan_issues WHERE id=?1",
+                [&claim.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if issue_run
+            .as_deref()
+            .is_some_and(|saved| saved != claim.run.to_string())
+        {
+            return Err(SchedulerError::Corrupt);
+        }
+        tx.execute("INSERT INTO ci_rerun_scan_progress(id,run_id,completed_attempt) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET completed_attempt=MAX(completed_attempt,excluded.completed_attempt)", params![claim.id,claim.run.to_string(),completed])?;
+        tx.execute("DELETE FROM ci_rerun_scan_issues WHERE id=?1", [&claim.id])?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Persist a sanitized per-run problem only for the latest scan claim.
+    pub(crate) fn note_rerun_issue(
+        &mut self,
+        claim: &RerunScanClaim,
+        kind: RerunIssueKind,
+    ) -> Result<bool, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if config != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        if !rerun_claim_current(&tx, claim)? {
+            return Ok(false);
+        }
+        let (_, run, _) = direct_metric_identity(&tx, &claim.id)?;
+        if run != claim.run {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT run_id FROM ci_rerun_scan_issues WHERE id=?1",
+                [&claim.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing
+            .as_deref()
+            .is_some_and(|saved| saved != claim.run.to_string())
+        {
+            return Err(SchedulerError::Corrupt);
+        }
+        tx.execute("INSERT INTO ci_rerun_scan_issues(id,run_id,kind,occurrences) VALUES(?1,?2,?3,1) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,occurrences=CASE WHEN occurrences<9223372036854775807 THEN occurrences+1 ELSE occurrences END", params![claim.id,claim.run.to_string(),kind.code()])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Identify a directly acknowledged historical run. This does not read
@@ -2038,6 +2200,18 @@ impl Scheduler {
         tx.commit()?;
         Ok(inserted)
     }
+}
+
+fn rerun_claim_current(conn: &Connection, claim: &RerunScanClaim) -> Result<bool, SchedulerError> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT run_id,revision FROM ci_rerun_scan_claims WHERE id=?1",
+            [&claim.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .is_some_and(|(run, revision)| run == claim.run.to_string() && revision == claim.revision))
 }
 
 fn validate_metric_run(
@@ -3593,20 +3767,48 @@ mod rerun_scan_tests {
         }
         drop(conn);
         let first = scheduler.next_rerun_scan().unwrap().unwrap();
-        assert_eq!(first, ("batch-0000000000000001".into(), 1, 1));
-        scheduler.advance_rerun_scan(&first.0, first.1, 2).unwrap();
-        scheduler.advance_rerun_scan(&first.0, first.1, 1).unwrap();
-        assert!(scheduler.advance_rerun_scan(&first.0, 99, 3).is_err());
-        assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().1, 2);
+        assert_eq!(
+            (&first.id, first.run, first.after, first.revision),
+            (&"batch-0000000000000001".to_string(), 1, 1, 1)
+        );
+        assert!(scheduler.advance_rerun_scan(&first, 2).unwrap());
+        assert!(scheduler.advance_rerun_scan(&first, 1).unwrap());
+        let mut wrong = first.clone();
+        wrong.run = 99;
+        assert!(!scheduler.advance_rerun_scan(&wrong, 3).unwrap());
+        assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().run, 2);
         drop(scheduler);
         let mut scheduler = Scheduler::open(&db, capacity).unwrap();
         for n in 3..=5 {
-            assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().1, n);
+            assert_eq!(scheduler.next_rerun_scan().unwrap().unwrap().run, n);
         }
         assert!(scheduler.next_rerun_scan().unwrap().is_none());
+        let next = scheduler.next_rerun_scan().unwrap().unwrap();
         assert_eq!(
-            scheduler.next_rerun_scan().unwrap().unwrap(),
-            (first.0, 1, 2)
+            (&next.id, next.run, next.after, next.revision),
+            (&first.id, 1, 2, 2)
         );
+        assert!(
+            !scheduler
+                .note_rerun_issue(&first, super::RerunIssueKind::Unstable)
+                .unwrap()
+        );
+        assert!(!scheduler.advance_rerun_scan(&first, 2).unwrap());
+        assert!(Scheduler::rerun_scan_issues(&db).unwrap().is_empty());
+        assert!(
+            scheduler
+                .note_rerun_issue(&next, super::RerunIssueKind::Unstable)
+                .unwrap()
+        );
+        assert_eq!(Scheduler::rerun_scan_issues(&db).unwrap()[0].occurrences, 1);
+        assert!(
+            scheduler
+                .note_rerun_issue(&next, super::RerunIssueKind::Unstable)
+                .unwrap()
+        );
+        assert!(!scheduler.advance_rerun_scan(&first, 2).unwrap());
+        assert_eq!(Scheduler::rerun_scan_issues(&db).unwrap()[0].occurrences, 2);
+        assert!(scheduler.advance_rerun_scan(&next, 2).unwrap());
+        assert!(Scheduler::rerun_scan_issues(&db).unwrap().is_empty());
     }
 }

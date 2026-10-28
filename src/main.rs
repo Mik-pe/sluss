@@ -522,6 +522,8 @@ enum Command {
     },
     /// Show unresolved local dispatches and reservations without modifying the database.
     Dispatches,
+    /// Show locally recorded rerun-accounting problems without modifying the database.
+    RerunStatus,
     /// Show historical local observations that a PR version met admission.
     AdmissionHistory {
         #[arg(long)]
@@ -917,6 +919,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "Local journal only; GitHub may have changed and a reservation does not prove a run has stopped."
+        );
+        return Ok(());
+    }
+    if let Command::RerunStatus = &cli.command {
+        let issues = sluss::scheduler::Scheduler::rerun_scan_issues(&cli.db)?;
+        if issues.is_empty() {
+            println!("no locally recorded rerun scan errors");
+        }
+        for issue in issues {
+            println!(
+                "batch {:?}; run {}; issue {}; observations {}",
+                issue.batch_id, issue.run_id, issue.kind, issue.occurrences
+            );
+        }
+        println!(
+            "Local errors only: absence of errors does not prove that all reruns were observed."
         );
         return Ok(());
     }
@@ -3052,6 +3070,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics.rerun_jobs,
                 metrics.rerun_milliseconds as f64 / 60_000.0
             );
+            let rerun_issues = sluss::scheduler::Scheduler::rerun_scan_issues(&cli.db)?;
+            println!(
+                "locally recorded rerun scan errors: {} (inspect with sluss rerun-status)",
+                rerun_issues.len()
+            );
             for (pool, wait) in metrics.capacity_waits {
                 println!(
                     "observed scheduling delay for requests including pool {pool}: {:.2} minutes ({} intervals)",
@@ -3071,6 +3094,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Dispatches => {
             unreachable!("dispatches is handled before opening the database")
+        }
+        Command::RerunStatus => {
+            unreachable!("rerun-status is handled before opening the database")
         }
         Command::AdmissionHistory { .. } => {
             unreachable!("history is handled before opening the database")
