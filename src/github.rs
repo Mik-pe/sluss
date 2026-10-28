@@ -867,6 +867,12 @@ impl App {
                 return Err(DispatchError::StaleBase);
             }
         }
+        if target_base.is_some() {
+            let workflow = self
+                .observe_registered_workflow(token, owner, repository, pending.plan.workflow_id)
+                .await?;
+            scheduler.validate_dispatch_workflow(id, &workflow.path)?;
+        }
         if !scheduler.claim_dispatch(id)? {
             return Err(DispatchError::AlreadyClaimed);
         }
@@ -1260,6 +1266,35 @@ impl App {
             return Err(GitHubError::UnstableObservation);
         }
         Ok(info)
+    }
+
+    /// Read the registered workflow twice before batch dispatch. This does not
+    /// establish workflow contents, immutable configuration or execution trust.
+    pub async fn observe_registered_workflow(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        workflow_id: u64,
+    ) -> Result<WorkflowInfo, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) || workflow_id == 0 {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let path = format!("repos/{owner}/{repository}/actions/workflows/{workflow_id}");
+        let first: WorkflowInfo = self.get_json(token, &path, None).await?;
+        let last: WorkflowInfo = self.get_json(token, &path, None).await?;
+        let filename = last.path.strip_prefix(".github/workflows/");
+        if first != last
+            || last.id != workflow_id
+            || last.state != "active"
+            || !crate::integration::valid_policy_path(&last.path)
+            || filename.is_none_or(|name| {
+                name.contains('/') || !(name.ends_with(".yml") || name.ends_with(".yaml"))
+            })
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(last)
     }
 
     /// Inspect current branch, workflow registration and active branch rules.

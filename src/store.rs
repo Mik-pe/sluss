@@ -87,6 +87,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS batch_policy_paths (batch_id TEXT PRIMARY KEY NOT NULL, paths TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_selection (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observed_target (id INTEGER PRIMARY KEY CHECK(id=1), branch TEXT NOT NULL);
@@ -1256,7 +1257,7 @@ impl Store {
                 return Err(StoreError::MigrationBusy);
             }
         }
-        if current == next {
+        if current == next && active.is_empty() {
             tx.commit()?;
             return Ok(false);
         }
@@ -1415,6 +1416,17 @@ impl Store {
         }
         match &batch.state {
             State::Building => {
+                let paths: Option<String> = tx
+                    .query_row("SELECT paths FROM staging_config WHERE id=1", [], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                if let Some(paths) = paths {
+                    tx.execute(
+                        "INSERT INTO batch_policy_paths(batch_id,paths) VALUES(?1,?2)",
+                        params![id, paths],
+                    )?;
+                }
                 batch
                     .begin_testing(sha.into())
                     .map_err(|_| StoreError::InvalidBatch)?;

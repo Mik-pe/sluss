@@ -66,6 +66,8 @@ pub enum SchedulerError {
     DispatchTransition,
     #[error("batch, queue, or repository changed before dispatch")]
     StaleBatch,
+    #[error("registered workflow is not in the frozen policy file list")]
+    WorkflowPolicyMismatch,
     #[error("dispatch is not attached to an invalidated batch with a known run")]
     NotStale,
     #[error("stored reservation refers to an unknown host or pool")]
@@ -554,6 +556,44 @@ impl Scheduler {
                 }
             }
             _ => return Err(SchedulerError::StaleBatch),
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recheck a registered workflow against the exact file list bound when
+    /// staging. This is policy coverage, not proof that the workflow is trusted.
+    pub fn validate_dispatch_workflow(
+        &mut self,
+        id: &str,
+        workflow_path: &str,
+    ) -> Result<(), SchedulerError> {
+        if !crate::integration::valid_policy_path(workflow_path) {
+            return Err(SchedulerError::WorkflowPolicyMismatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String)> = tx.query_row(
+            "SELECT b.batch_id,d.plan FROM dispatch_batches b JOIN dispatch_intents d ON d.id=b.id WHERE b.id=?1 AND d.state='prepared'",
+            [id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let (batch, body) = row.ok_or(SchedulerError::StaleBatch)?;
+        let plan: DispatchPlan = serde_json::from_str(&body)?;
+        validate_batch_dispatch(&tx, &batch, &plan)?;
+        let paths: Option<String> = tx
+            .query_row(
+                "SELECT paths FROM batch_policy_paths WHERE batch_id=?1",
+                [&batch],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let paths: Vec<String> = paths
+            .map(|body| serde_json::from_str(&body))
+            .transpose()?
+            .unwrap_or_default();
+        if !paths.iter().any(|path| path == workflow_path) {
+            return Err(SchedulerError::WorkflowPolicyMismatch);
         }
         tx.commit()?;
         Ok(())

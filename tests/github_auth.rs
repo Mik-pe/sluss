@@ -242,9 +242,21 @@ async fn doctor_branch(State(state): State<ServerState>, headers: HeaderMap) -> 
     };
     Json(json!({"name":"main","protected":true,"commit":{"sha":sha.repeat(40)}}))
 }
-async fn doctor_workflow(headers: HeaderMap) -> Json<Value> {
+async fn doctor_workflow(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
-    Json(json!({"id":17,"path":".github/workflows/ci.yml","state":"active"}))
+    let mode = state.mode.load(Ordering::SeqCst);
+    let path = if mode == 48 || (mode == 50 && state.pulls.fetch_add(1, Ordering::SeqCst) % 2 == 1)
+    {
+        ".github/workflows/other.yml"
+    } else {
+        ".github/workflows/ci.yml"
+    };
+    let status = if mode == 49 {
+        "disabled_manually"
+    } else {
+        "active"
+    };
+    Json(json!({"id":17,"path":path,"state":status}))
 }
 async fn doctor_rules(
     headers: HeaderMap,
@@ -1477,6 +1489,9 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .plan_batch(id, &"b".repeat(40), 1, 1)
         .unwrap()
         .unwrap();
+    independent_store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
     independent_store.start_integration(id).unwrap();
     independent_store
         .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
@@ -1508,6 +1523,73 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     );
     assert_eq!(posts.load(Ordering::SeqCst), 0);
     mode.store(44, Ordering::SeqCst);
+    let snapshot_conn = rusqlite::Connection::open(&independent_db).unwrap();
+    let frozen_paths: String = snapshot_conn
+        .query_row(
+            "SELECT paths FROM batch_policy_paths WHERE batch_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    snapshot_conn
+        .execute("DELETE FROM batch_policy_paths WHERE batch_id=?1", [id])
+        .unwrap();
+    let uncovered = sluss::dispatch::batch(
+        &independent_db,
+        &fixture_app,
+        &fixture_policy,
+        &independent_capacity,
+        &settings,
+        id,
+    )
+    .await;
+    assert!(matches!(
+        uncovered,
+        Err(sluss::dispatch::Error::Dispatch(
+            sluss::github::DispatchError::Scheduler(
+                sluss::scheduler::SchedulerError::WorkflowPolicyMismatch
+            )
+        ))
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    snapshot_conn
+        .execute(
+            "INSERT INTO batch_policy_paths(batch_id,paths) VALUES(?1,?2)",
+            rusqlite::params![id, frozen_paths],
+        )
+        .unwrap();
+    for rejected_mode in [48, 49, 50] {
+        reads.store(0, Ordering::SeqCst);
+        mode.store(rejected_mode, Ordering::SeqCst);
+        let rejected = sluss::dispatch::batch(
+            &independent_db,
+            &fixture_app,
+            &fixture_policy,
+            &independent_capacity,
+            &settings,
+            id,
+        )
+        .await;
+        assert!(rejected.is_err(), "mode {rejected_mode}");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "untrusted registration must not be dispatched"
+        );
+        let scheduler =
+            sluss::scheduler::Scheduler::open(&independent_db, independent_capacity.clone())
+                .unwrap();
+        assert!(
+            scheduler
+                .pending_dispatches()
+                .unwrap()
+                .iter()
+                .any(|item| item.reservation.id == id
+                    && item.state == sluss::scheduler::DispatchState::Prepared)
+        );
+    }
+    mode.store(44, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
     assert_eq!(
         sluss::dispatch::batch(
             &independent_db,
@@ -1562,6 +1644,9 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         queue_store
             .plan_batch(batch_id, &"b".repeat(40), 1, 2)
             .unwrap()
+            .unwrap();
+        queue_store
+            .bind_policy_paths(batch_id, &[".github/workflows/ci.yml".into()])
             .unwrap();
         queue_store.start_integration(batch_id).unwrap();
         queue_store
@@ -1650,6 +1735,9 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         store.batch(id).unwrap().unwrap().0.state,
         sluss::batch::State::Planned
     );
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
     store.start_integration(id).unwrap();
     store
         .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
@@ -2167,6 +2255,9 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         auto_store
             .plan_batch(id, &"b".repeat(40), 1, 1)
             .unwrap()
+            .unwrap();
+        auto_store
+            .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
             .unwrap();
         auto_store.start_integration(id).unwrap();
         auto_store

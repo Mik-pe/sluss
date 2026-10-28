@@ -1236,3 +1236,98 @@ fn capacity_wait_measurements_survive_restart_and_do_not_double_count() {
         summary.capacity_waits
     );
 }
+
+#[test]
+fn workflow_policy_paths_must_have_been_frozen_before_staging() {
+    use sluss::scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError};
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let id = "batch-0123456789abcdef";
+    store
+        .plan_batch(id, &"a".repeat(40), 2, 1)
+        .unwrap()
+        .unwrap();
+    store.bind_staging_selection(id, None).unwrap();
+    store.start_integration(id).unwrap();
+    // Simulate a legacy/manual batch completed without a frozen file list.
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &db,
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: BTreeSet::from([7]),
+                    pools: pools.clone(),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    let request = Request { pools };
+    let plan = |batch_id: &str| DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{batch_id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    scheduler
+        .reserve_batch_dispatch(id, &request, &plan(id))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        scheduler.validate_dispatch_workflow(id, ".github/workflows/ci.yml"),
+        Err(SchedulerError::WorkflowPolicyMismatch)
+    ));
+    assert!(scheduler.cancel_prepared(id).unwrap());
+    store.set_paused(true).unwrap();
+    assert!(
+        store
+            .migrate_staging_selection("full", "full", true)
+            .unwrap()
+    );
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    store.set_paused(false).unwrap();
+    let next = "batch-1123456789abcdef";
+    store
+        .plan_batch(next, &"a".repeat(40), 2, 1)
+        .unwrap()
+        .unwrap();
+    store
+        .bind_policy_paths(next, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(next).unwrap();
+    store
+        .finish_integration(next, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    scheduler
+        .reserve_batch_dispatch(next, &request, &plan(next))
+        .unwrap()
+        .unwrap();
+    scheduler
+        .validate_dispatch_workflow(next, ".github/workflows/ci.yml")
+        .unwrap();
+    assert!(matches!(
+        scheduler.validate_dispatch_workflow(next, ".github/workflows/other.yml"),
+        Err(SchedulerError::WorkflowPolicyMismatch)
+    ));
+}

@@ -776,6 +776,16 @@ fn selective_staging_freezes_suites_atomically_and_recovers_after_publication() 
     assert_eq!(store.batch(id).unwrap().unwrap().0.state, State::Building);
     assert!(store.batch_selection(id).unwrap().is_none());
     assert!(store.batch_policy_digest(id).unwrap().is_none());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert!(
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM batch_policy_paths WHERE batch_id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
     // Simulate interruption after publishing the staging ref but before saving Testing.
     let published = built.stage_local(remote.path(), id).unwrap();
     drop(store);
@@ -813,6 +823,17 @@ fn selective_staging_freezes_suites_atomically_and_recovers_after_publication() 
     let frozen = store.batch_selection(id).unwrap().unwrap();
     assert_eq!(frozen.base_sha, base);
     assert_eq!(frozen.integration_sha, published.sha);
+    let paths: String = conn
+        .query_row(
+            "SELECT paths FROM batch_policy_paths WHERE batch_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&paths).unwrap(),
+        ["shared"]
+    );
     assert_eq!(frozen.policy_digest, digest);
     assert_eq!(
         frozen.selection.suites(),
