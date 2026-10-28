@@ -90,10 +90,10 @@ pub async fn reconcile_once(
         .open_pull_numbers(token, &config.owner, &config.name)
         .await?;
     let mut candidates = Vec::new();
-    for number in &numbers {
-        let observed = app
-            .observe_authorized_pull(token, &config.owner, &config.name, *number)
-            .await?;
+    let observations = app
+        .observe_authorized_pulls(token, &config.owner, &config.name, &numbers)
+        .await?;
+    for observed in observations {
         if observed.snapshot.pull.base.branch == config.target_branch
             && observed.snapshot.pull.base.repo.id == config.repository as u64
             && observed.snapshot.pull.base.sha != base.commit.sha

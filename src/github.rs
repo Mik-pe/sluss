@@ -630,6 +630,36 @@ struct PermissionObservation {
     user: PullUser,
 }
 
+fn decision_reviewers(snapshot: &PullSnapshot) -> Result<BTreeMap<u64, String>, GitHubError> {
+    let mut reviewers = BTreeMap::new();
+    for review in &snapshot.reviews {
+        match review.state.as_str() {
+            "PENDING" | "COMMENTED" => continue,
+            "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" => {}
+            _ => return Err(GitHubError::UnstableObservation),
+        }
+        let user = review
+            .user
+            .as_ref()
+            .ok_or(GitHubError::UnstableObservation)?;
+        if user.id == 0 || !valid_name(&user.login) {
+            return Err(GitHubError::UnstableObservation);
+        }
+        if user.kind != "User" {
+            continue;
+        }
+        if let Some(old) = reviewers.insert(user.id, user.login.clone())
+            && !old.eq_ignore_ascii_case(&user.login)
+        {
+            return Err(GitHubError::UnstableObservation);
+        }
+    }
+    if reviewers.len() > 100 {
+        return Err(GitHubError::UnstableObservation);
+    }
+    Ok(reviewers)
+}
+
 impl App {
     /// Recheck each human reviewer's effective GitHub repository permission,
     /// then reread the PR. This is still not an atomic authorization snapshot.
@@ -641,32 +671,7 @@ impl App {
         number: u64,
     ) -> Result<AuthorizedPullObservation, GitHubError> {
         let first = self.observe_pull(token, owner, repository, number).await?;
-        let mut reviewers = BTreeMap::new();
-        for review in &first.reviews {
-            match review.state.as_str() {
-                "PENDING" | "COMMENTED" => continue,
-                "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" => {}
-                _ => return Err(GitHubError::UnstableObservation),
-            }
-            let user = review
-                .user
-                .as_ref()
-                .ok_or(GitHubError::UnstableObservation)?;
-            if user.id == 0 || !valid_name(&user.login) {
-                return Err(GitHubError::UnstableObservation);
-            }
-            if user.kind != "User" {
-                continue;
-            }
-            if let Some(old) = reviewers.insert(user.id, user.login.clone())
-                && !old.eq_ignore_ascii_case(&user.login)
-            {
-                return Err(GitHubError::UnstableObservation);
-            }
-        }
-        if reviewers.len() > 100 {
-            return Err(GitHubError::UnstableObservation);
-        }
+        let reviewers = decision_reviewers(&first)?;
         let mut first_permissions = BTreeMap::new();
         for (id, login) in &reviewers {
             first_permissions.insert(
@@ -702,6 +707,95 @@ impl App {
             authorized_reviewers: authorized,
             reviewer_permissions,
         })
+    }
+
+    /// Read all PRs around a shared, double-checked reviewer permission scan.
+    /// Each PR retains the same independently repeated snapshot as the
+    /// single-PR path. This is a non-atomic observation, not merge authority.
+    pub async fn observe_authorized_pulls(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        numbers: &[u64],
+    ) -> Result<Vec<AuthorizedPullObservation>, GitHubError> {
+        if numbers.len() > 10_000 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        let mut all_reviewers: BTreeMap<u64, String> = BTreeMap::new();
+        let mut first = Vec::with_capacity(numbers.len());
+        let mut total_reviews = 0usize;
+        for number in numbers {
+            if !unique.insert(*number) {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let snapshot = self.observe_pull(token, owner, repository, *number).await?;
+            total_reviews = total_reviews
+                .checked_add(snapshot.reviews.len())
+                .ok_or(GitHubError::UnstableObservation)?;
+            if total_reviews > 50_000 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let reviewers = decision_reviewers(&snapshot)?;
+            for (id, login) in &reviewers {
+                if let Some(old) = all_reviewers.insert(*id, login.clone())
+                    && !old.eq_ignore_ascii_case(login)
+                {
+                    return Err(GitHubError::UnstableObservation);
+                }
+            }
+            if all_reviewers.len() > 10_000 {
+                return Err(GitHubError::UnstableObservation);
+            }
+            first.push((snapshot, reviewers));
+        }
+        let mut permissions = BTreeMap::new();
+        for (id, login) in &all_reviewers {
+            permissions.insert(
+                *id,
+                self.permission(token, owner, repository, *id, login)
+                    .await?,
+            );
+        }
+        for (id, login) in &all_reviewers {
+            let current = self
+                .permission(token, owner, repository, *id, login)
+                .await?;
+            if permissions.get(id) != Some(&current)
+                || !matches!(
+                    current.permission.as_str(),
+                    "admin" | "write" | "read" | "none"
+                )
+            {
+                return Err(GitHubError::UnstableObservation);
+            }
+        }
+        let mut observations = Vec::with_capacity(numbers.len());
+        for (number, (snapshot, reviewers)) in numbers.iter().zip(first) {
+            let last = self.observe_pull(token, owner, repository, *number).await?;
+            if last != snapshot {
+                return Err(GitHubError::UnstableObservation);
+            }
+            let mut authorized_reviewers = std::collections::BTreeSet::new();
+            let mut reviewer_permissions = BTreeMap::new();
+            for id in reviewers.keys() {
+                let permission = &permissions
+                    .get(id)
+                    .ok_or(GitHubError::UnstableObservation)?
+                    .permission;
+                if matches!(permission.as_str(), "admin" | "write") {
+                    authorized_reviewers.insert(*id);
+                }
+                reviewer_permissions.insert(*id, permission.clone());
+            }
+            observations.push(AuthorizedPullObservation {
+                snapshot: last,
+                authorized_reviewers,
+                reviewer_permissions,
+            });
+        }
+        Ok(observations)
     }
     async fn permission(
         &self,

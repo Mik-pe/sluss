@@ -62,7 +62,8 @@ async fn dispatch_permission(State(state): State<ServerState>, headers: HeaderMa
 async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    let sha = if state.mode.load(Ordering::SeqCst) == 5 && count > 0 {
+    let mode = state.mode.load(Ordering::SeqCst);
+    let sha = if (mode == 5 && count > 0) || (mode == 216 && count >= 6) {
         "c".repeat(40)
     } else {
         "a".repeat(40)
@@ -905,6 +906,8 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .route("/repos/owner/repo/branches/main", get(reconcile_branch))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route("/repos/owner/repo/pulls/20", get(pull20))
+        .route("/repos/owner/repo/pulls/20/reviews", get(reviews))
         .route("/repos/owner/repo/pulls", get(open_pulls))
         .route(
             "/repos/owner/repo/actions/runs/123/attempts/2",
@@ -932,6 +935,90 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let token = client.read_token(42, 7).await.unwrap();
     assert_eq!(token.secret(), "fake-installation-token");
     assert!(!format!("{token:?}").contains(token.secret()));
+    permissions.store(0, Ordering::SeqCst);
+    let shared = client
+        .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+        .await
+        .unwrap();
+    assert_eq!(shared.len(), 2);
+    assert_eq!(
+        permissions.load(Ordering::SeqCst),
+        2,
+        "shared reviewer must be checked twice in total"
+    );
+    let separately = vec![
+        client
+            .observe_authorized_pull(&token, "owner", "repo", 19)
+            .await
+            .unwrap(),
+        client
+            .observe_authorized_pull(&token, "owner", "repo", 20)
+            .await
+            .unwrap(),
+    ];
+    assert_eq!(shared, separately);
+    assert_eq!(permissions.load(Ordering::SeqCst), 6);
+    permissions.store(0, Ordering::SeqCst);
+    mode.store(9, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+            .await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    mode.store(216, Ordering::SeqCst);
+    pulls.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
+            .await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    mode.store(0, Ordering::SeqCst);
+    assert!(
+        client
+            .observe_authorized_pulls(&token, "owner", "repo", &[19, 19])
+            .await
+            .is_err()
+    );
+    let scan_dir = tempfile::tempdir().unwrap();
+    let scan_db = scan_dir.path().join("shared.sqlite");
+    let mut scan_inbox = sluss::webhook::Inbox::open(&scan_db).unwrap();
+    let mut scan_store = sluss::store::Store::open(&scan_db).unwrap();
+    let scan_policy = sluss::reconcile::RepositoryPolicy {
+        installation: 42,
+        repository: 7,
+        owner: "owner".into(),
+        name: "repo".into(),
+        target_branch: "main".into(),
+        required_reviews: 1,
+        block_labels: Default::default(),
+    };
+    scan_inbox
+        .record("shared", "pull_request", &[31; 32], 42, 7)
+        .unwrap();
+    let job = scan_inbox.pending().unwrap().remove(0);
+    mode.store(46, Ordering::SeqCst);
+    permissions.store(0, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut scan_store, &job, &scan_policy)
+        .await
+        .unwrap();
+    assert_eq!(scan_store.candidates().unwrap().len(), 2);
+    assert_eq!(permissions.load(Ordering::SeqCst), 2);
+    scan_inbox
+        .record("shared-changed", "pull_request_review", &[32; 32], 42, 7)
+        .unwrap();
+    let job = scan_inbox.pending().unwrap().remove(0);
+    permissions.store(0, Ordering::SeqCst);
+    mode.store(9, Ordering::SeqCst);
+    assert!(
+        sluss::reconcile::reconcile_once(&client, &token, &mut scan_store, &job, &scan_policy)
+            .await
+            .is_err()
+    );
+    assert_eq!(scan_store.candidates().unwrap().len(), 2);
+    assert_eq!(scan_inbox.pending().unwrap().len(), 1);
+    mode.store(0, Ordering::SeqCst);
     let actions = client
         .observe_actions_attempt(&token, "owner", "repo", 123, 2)
         .await
