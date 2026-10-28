@@ -51,6 +51,32 @@ fn incomplete_empty_and_missing_ready_data_are_reported_honestly() {
     empty["baseline"]["deliveries"] = json!([]);
     assert_eq!(report(empty).unwrap().runner_time_change_percent, None);
 }
+
+#[test]
+fn locally_observed_admission_is_separate_from_exact_ready_time() {
+    let mut value = input();
+    value["sluss"]["deliveries"][0]["observed_ready_at"] = json!("2026-01-02T00:55:00Z");
+    value["sluss"]["deliveries"][1]["ready_at"] = Value::Null;
+    let result = report(value.clone()).unwrap();
+    assert_eq!(result.sluss.latency_samples, 1);
+    assert_eq!(result.sluss.observed_latency_samples, 1);
+    assert_eq!(result.sluss.observed_median_latency_ms, Some(15 * 60_000));
+    let dir = tempfile::tempdir().unwrap();
+    let input_path = dir.path().join("observed.json");
+    std::fs::write(&input_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .args(["benchmark", "--input"])
+        .arg(input_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("locally observed admission-to-merge: median 15.00 minutes")
+    );
+    value["sluss"]["deliveries"][0]["observed_ready_at"] = json!("2026-01-02T01:11:00Z");
+    assert!(report(value).is_err());
+}
 #[test]
 fn rejects_duplicate_cross_cohort_identity_and_invalid_timing_or_associations() {
     let mut cases = Vec::new();

@@ -51,6 +51,21 @@ pub struct AdmissionCandidate {
     pub candidate: Candidate,
     pub evidence_digest: String,
 }
+/// Local observations of an eligible PR version, not a continuous provider
+/// guarantee or the exact instant it first became eligible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionObservation {
+    pub number: u64,
+    pub head_sha: String,
+    pub evidence_digest: String,
+    pub base_sha: String,
+    pub first_observed_ms: i64,
+    pub last_observed_ms: i64,
+    pub ended_ms: Option<i64>,
+    pub first_revision: i64,
+    pub last_revision: i64,
+    pub clock_uncertain: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedCandidate {
     pub number: u64,
@@ -121,6 +136,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS ci_investigations (batch_id TEXT PRIMARY KEY, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_candidate_completions (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, base_sha TEXT NOT NULL, batch_id TEXT NOT NULL, conclusion TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS admission_observations_v1 (id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, head_sha TEXT NOT NULL, evidence_digest TEXT NOT NULL, base_sha TEXT NOT NULL, first_observed_ms INTEGER NOT NULL, last_observed_ms INTEGER NOT NULL, ended_ms INTEGER, first_revision INTEGER NOT NULL, last_revision INTEGER NOT NULL, clock_uncertain INTEGER NOT NULL CHECK(clock_uncertain IN (0,1)));
+            CREATE UNIQUE INDEX IF NOT EXISTS admission_observations_active_v1 ON admission_observations_v1(number) WHERE ended_ms IS NULL;
+            CREATE INDEX IF NOT EXISTS admission_observations_history_v1 ON admission_observations_v1(number,id DESC);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_policy_paths (batch_id TEXT PRIMARY KEY NOT NULL, paths TEXT NOT NULL);
@@ -145,6 +163,69 @@ impl Store {
     /// Summarize completed jobs observed by Sluss, not all repository CI.
     pub fn metrics(&self) -> Result<crate::metrics::Summary, StoreError> {
         Ok(crate::metrics::summarize(&self.conn)?)
+    }
+
+    /// Inspect up to 100 historical observations without creating a database
+    /// or migrating an older schema. Later provider changes remain possible.
+    pub fn admission_history(
+        path: impl AsRef<Path>,
+        number: u64,
+    ) -> Result<Vec<AdmissionObservation>, StoreError> {
+        let number = i64::try_from(number)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or(StoreError::InvalidCandidate)?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='admission_observations_v1')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare("SELECT number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,ended_ms,first_revision,last_revision,clock_uncertain FROM admission_observations_v1 WHERE number=?1 ORDER BY id DESC LIMIT 100")?;
+        let rows = stmt.query_map([number], |r| {
+            Ok(AdmissionObservation {
+                number: r.get::<_, i64>(0)? as u64,
+                head_sha: r.get(1)?,
+                evidence_digest: r.get(2)?,
+                base_sha: r.get(3)?,
+                first_observed_ms: r.get(4)?,
+                last_observed_ms: r.get(5)?,
+                ended_ms: r.get(6)?,
+                first_revision: r.get(7)?,
+                last_revision: r.get(8)?,
+                clock_uncertain: r.get(9)?,
+            })
+        })?;
+        let observations = rows.collect::<Result<Vec<_>, _>>()?;
+        if observations.iter().any(|o| {
+            o.number != number as u64
+                || o.head_sha.is_empty()
+                || o.evidence_digest.len() != 64
+                || o.base_sha.len() != 40
+                || o.first_observed_ms < 0
+                || o.last_observed_ms < o.first_observed_ms
+                || o.ended_ms.is_some_and(|end| end < o.last_observed_ms)
+                || o.first_revision <= 0
+                || o.last_revision < o.first_revision
+        }) {
+            return Err(StoreError::InvalidCandidate);
+        }
+        Ok(observations)
+    }
+
+    /// Read the durable repository and policy binding without opening a writer.
+    pub fn admission_history_binding(
+        path: impl AsRef<Path>,
+    ) -> Result<(i64, i64, String), StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.query_row(
+            "SELECT installation,repository,policy_digest FROM repository_binding WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(StoreError::Unbound)
     }
 
     /// Read a completed CI observation without constructing a scheduler.
@@ -242,6 +323,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        close_admission_observation(&tx, candidate.number, now)?;
         tx.execute("INSERT INTO candidate_stability(number,changed_ms) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET changed_ms=excluded.changed_ms", params![candidate.number as i64,now])?;
         tx.execute(
             "INSERT INTO candidates (number, head_sha, sequence)
@@ -273,9 +355,11 @@ impl Store {
 
     pub fn remove_candidate(&mut self, number: u64) -> Result<bool, StoreError> {
         let sql_number = i64::try_from(number).map_err(|_| StoreError::InvalidCandidate)?;
+        let now = now_ms()?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        close_admission_observation(&tx, number, now)?;
         let removed = tx.execute("DELETE FROM candidates WHERE number=?1", [sql_number])? != 0;
         tx.execute(
             "DELETE FROM candidate_evidence WHERE number=?1",
@@ -430,6 +514,7 @@ impl Store {
             "INSERT OR IGNORE INTO repository_binding(id,installation,repository,policy_digest) VALUES(1,?1,?2,?3)",
             params![job.installation, job.repository, policy_digest],
         )?;
+        record_admission_observations(&tx, candidates, digests, base_sha, now, job.revision)?;
         let old_base: Option<String> = tx
             .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
             .optional()?;
@@ -1978,6 +2063,74 @@ fn invalidate_stale_ci_investigations(tx: &Transaction<'_>) -> Result<(), StoreE
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+fn close_admission_observation(
+    tx: &Transaction<'_>,
+    number: u64,
+    now: i64,
+) -> Result<(), StoreError> {
+    tx.execute("UPDATE admission_observations_v1 SET clock_uncertain=CASE WHEN ?2<last_observed_ms THEN 1 ELSE clock_uncertain END, ended_ms=MAX(last_observed_ms,?2) WHERE number=?1 AND ended_ms IS NULL", params![number as i64,now])?;
+    Ok(())
+}
+
+fn record_admission_observations(
+    tx: &Transaction<'_>,
+    candidates: &[Candidate],
+    digests: Option<&[String]>,
+    base: Option<(&str, &str)>,
+    now: i64,
+    revision: i64,
+) -> Result<(), StoreError> {
+    use std::collections::BTreeMap;
+    let mut current = BTreeMap::new();
+    if let (Some(digests), Some((base_sha, _))) = (digests, base) {
+        if digests.len() != candidates.len() {
+            return Err(StoreError::InvalidCandidate);
+        }
+        for (candidate, digest) in candidates.iter().zip(digests) {
+            current.insert(
+                candidate.number,
+                (candidate.head_sha.as_str(), digest.as_str(), base_sha),
+            );
+        }
+    }
+    type Active = (i64, String, String, String, i64, i64);
+    let active: Vec<Active> = {
+        let mut stmt = tx.prepare("SELECT number,head_sha,evidence_digest,base_sha,last_observed_ms,last_revision FROM admission_observations_v1 WHERE ended_ms IS NULL")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (number, head, digest, old_base, last, last_revision) in active {
+        if number <= 0 || last < 0 || last_revision <= 0 || revision < last_revision {
+            return Err(StoreError::InvalidCandidate);
+        }
+        let number = number as u64;
+        if current
+            .get(&number)
+            .is_some_and(|value| *value == (head.as_str(), digest.as_str(), old_base.as_str()))
+        {
+            tx.execute("UPDATE admission_observations_v1 SET last_observed_ms=MAX(last_observed_ms,?2),last_revision=?3,clock_uncertain=CASE WHEN ?2<last_observed_ms THEN 1 ELSE clock_uncertain END WHERE number=?1 AND ended_ms IS NULL", params![number as i64,now,revision])?;
+            current.remove(&number);
+        } else {
+            close_admission_observation(tx, number, now)?;
+        }
+    }
+    for (number, (head, digest, base_sha)) in current {
+        let previous_end: Option<i64> = tx.query_row("SELECT ended_ms FROM admission_observations_v1 WHERE number=?1 ORDER BY id DESC LIMIT 1", [number as i64], |r| r.get(0)).optional()?.flatten();
+        let uncertain = previous_end.is_some_and(|end| now < end);
+        tx.execute("INSERT INTO admission_observations_v1(number,head_sha,evidence_digest,base_sha,first_observed_ms,last_observed_ms,first_revision,last_revision,clock_uncertain) VALUES(?1,?2,?3,?4,?5,?5,?6,?6,?7)", params![number as i64,head,digest,base_sha,now,revision,uncertain])?;
     }
     Ok(())
 }

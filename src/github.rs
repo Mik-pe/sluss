@@ -898,6 +898,7 @@ pub struct BenchmarkCollectionNotes {
     pub jobs_outside_interval: usize,
     pub boundary_crossing_jobs: usize,
     pub excluded_jobs: Vec<BenchmarkExcludedJob>,
+    pub merged_heads: BTreeMap<u64, String>,
     attempts_seen: usize,
     job_ids_seen: std::collections::BTreeSet<u64>,
 }
@@ -940,6 +941,12 @@ struct BenchmarkPull {
     merged: bool,
     merged_at: Option<String>,
     base: BenchmarkPullBase,
+    #[serde(default)]
+    head: Option<BenchmarkPullHead>,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+struct BenchmarkPullHead {
+    sha: String,
 }
 #[derive(Deserialize, PartialEq, Eq)]
 struct BenchmarkPullBase {
@@ -1124,9 +1131,13 @@ impl App {
             if merged_ms < start || merged_ms >= end {
                 return Err(BenchmarkCollectionError::Mismatch);
             }
+            if let Some(head) = first.head.filter(|head| commit_sha(&head.sha)) {
+                notes.merged_heads.insert(*number, head.sha);
+            }
             deliveries.push(Delivery {
                 pr: *number,
                 ready_at: None,
+                observed_ready_at: None,
                 merged_at,
                 run_id: None,
                 attempt: None,

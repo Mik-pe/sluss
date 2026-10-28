@@ -55,6 +55,9 @@ pub struct Job {
 pub struct Delivery {
     pub pr: u64,
     pub ready_at: Option<String>,
+    /// First local eligible observation; not necessarily the true ready time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_ready_at: Option<String>,
     pub merged_at: String,
     /// Optional operator-supplied run association, not proof of verification.
     pub run_id: Option<u64>,
@@ -140,6 +143,9 @@ pub struct CohortReport {
     pub latency_samples: usize,
     pub median_latency_ms: Option<u64>,
     pub p90_latency_ms: Option<u64>,
+    pub observed_latency_samples: usize,
+    pub observed_median_latency_ms: Option<u64>,
+    pub observed_p90_latency_ms: Option<u64>,
     pub complete: bool,
 }
 #[derive(Debug, PartialEq)]
@@ -275,6 +281,7 @@ fn cohort(
     }
     previous_runs.extend(runs);
     let mut latencies = Vec::new();
+    let mut observed_latencies = Vec::new();
     let mut associated = BTreeSet::new();
     let mut attributed = 0;
     for delivery in &input.deliveries {
@@ -292,6 +299,17 @@ fn cohort(
                 .filter(|v| *v >= 0)
                 .ok_or(BenchmarkError::Invalid("ready time follows merge"))?;
             latencies.push(elapsed as u64);
+        }
+        if let Some(ready) = &delivery.observed_ready_at {
+            let ready = instant(ready)?;
+            let elapsed =
+                merged
+                    .checked_sub(ready)
+                    .filter(|v| *v >= 0)
+                    .ok_or(BenchmarkError::Invalid(
+                        "observed admission time follows merge",
+                    ))?;
+            observed_latencies.push(elapsed as u64);
         }
         match (delivery.run_id, delivery.attempt) {
             (None, None) => {}
@@ -311,6 +329,7 @@ fn cohort(
         }
     }
     latencies.sort_unstable();
+    observed_latencies.sort_unstable();
     let percentile = |numerator: usize| -> Option<u64> {
         if latencies.is_empty() {
             None
@@ -329,6 +348,11 @@ fn cohort(
         latency_samples: latencies.len(),
         median_latency_ms: percentile(50),
         p90_latency_ms: percentile(90),
+        observed_latency_samples: observed_latencies.len(),
+        observed_median_latency_ms: (!observed_latencies.is_empty())
+            .then(|| observed_latencies[(observed_latencies.len() * 50).div_ceil(100) - 1]),
+        observed_p90_latency_ms: (!observed_latencies.is_empty())
+            .then(|| observed_latencies[(observed_latencies.len() * 90).div_ceil(100) - 1]),
         complete: input.jobs_complete && input.deliveries_complete,
     })
 }

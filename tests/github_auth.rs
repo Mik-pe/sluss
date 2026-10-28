@@ -6381,7 +6381,7 @@ async fn benchmark_pull(
     Json(
         json!({"number":number,"state":"closed","merged":mode != 203,
         "merged_at":format!("2026-01-{day}T03:{}:00Z", if mode == 207 && read % 2 == 1 {"01"} else {"00"}),
-        "base":{"ref":"main","repo":{"id":if mode == 204 {8} else {7}}}}),
+        "base":{"ref":"main","repo":{"id":if mode == 204 {8} else {7}}},"head":if mode == 210 {Value::Null} else {json!({"sha":"a".repeat(40)})}}),
     )
 }
 
@@ -6469,6 +6469,13 @@ async fn benchmark_collection_fetches_attempts_and_merges_without_claiming_compl
     assert_eq!(notes.jobs_without_timing, 1);
     assert_eq!(notes.excluded_jobs[0].reason, "missing-runner-or-timing");
     assert_eq!(partial.baseline.jobs.len(), 1);
+    mode.store(210, Ordering::SeqCst);
+    let (partial, notes) = app
+        .collect_benchmark(&token, &policy, &request)
+        .await
+        .unwrap();
+    assert_eq!(partial.sluss.deliveries.len(), 1);
+    assert!(notes.merged_heads.is_empty());
     mode.store(0, Ordering::SeqCst);
     let request_path = dir.path().join("selection.json");
     std::fs::write(&request_path, serde_json::to_vec(&request_json).unwrap()).unwrap();
@@ -6501,15 +6508,18 @@ async fn benchmark_collection_fetches_attempts_and_merges_without_claiming_compl
     assert_eq!(output.baseline.jobs.len(), 2);
     mode.store(205, Ordering::SeqCst);
     let db_arg = db_path.clone();
+    let request_arg = request_path.clone();
+    let config_arg = config.clone();
+    let key_arg = key_path.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_sluss"))
             .arg("--db")
             .arg(db_arg)
             .args(["collect-benchmark", "--request"])
-            .arg(request_path)
+            .arg(request_arg)
             .arg("--config")
-            .arg(config)
-            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_path)
+            .arg(config_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
             .output()
             .unwrap()
     })
@@ -6522,6 +6532,123 @@ async fn benchmark_collection_fetches_attempts_and_merges_without_claiming_compl
     );
     let partial: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(partial.baseline.jobs.len(), 1);
+    mode.store(0, Ordering::SeqCst);
+    let admission_db = dir.path().join("admission.sqlite");
+    let mut admission_inbox = sluss::webhook::Inbox::open(&admission_db).unwrap();
+    let mut admission_store = sluss::store::Store::open(&admission_db).unwrap();
+    admission_inbox
+        .record("observed", "pull_request", &[9; 32], 42, 7)
+        .unwrap();
+    let event = admission_inbox.pending().unwrap().remove(0);
+    admission_store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &sluss::reconcile::policy_digest(&app, &policy).unwrap(),
+            &[sluss::store::AdmissionCandidate {
+                candidate: sluss::batch::Candidate {
+                    number: 20,
+                    head_sha: "a".repeat(40),
+                },
+                evidence_digest: "d".repeat(64),
+            }],
+            &"b".repeat(40),
+            "main",
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(&admission_db).unwrap();
+    conn.execute("UPDATE admission_observations_v1 SET first_observed_ms=1767314400000,last_observed_ms=1767315600000", []).unwrap();
+    let run_collection = |request_path: std::path::PathBuf,
+                          config: std::path::PathBuf,
+                          key_path: std::path::PathBuf,
+                          admission_db: std::path::PathBuf,
+                          db: std::path::PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db)
+            .args(["collect-benchmark", "--request"])
+            .arg(request_path)
+            .arg("--config")
+            .arg(config)
+            .arg("--admission-db")
+            .arg(admission_db)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_path)
+            .output()
+            .unwrap()
+    };
+    let output = tokio::task::spawn_blocking({
+        let request_path = request_path.clone();
+        let config = config.clone();
+        let key_path = key_path.clone();
+        let admission_db = admission_db.clone();
+        let db_path = db_path.clone();
+        move || run_collection(request_path, config, key_path, admission_db, db_path)
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let annotated: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        annotated.sluss.deliveries[0].observed_ready_at.as_deref(),
+        Some("2026-01-02T00:40:00Z")
+    );
+    assert_eq!(annotated.sluss.deliveries[0].ready_at, None);
+    assert_eq!(
+        annotated.report().unwrap().sluss.observed_median_latency_ms,
+        Some(140 * 60_000)
+    );
+    // An observation known to have ended before the merge cannot be matched.
+    conn.execute(
+        "UPDATE admission_observations_v1 SET ended_ms=1767322800000",
+        [],
+    )
+    .unwrap();
+    let output = tokio::task::spawn_blocking({
+        let request_path = request_path.clone();
+        let config = config.clone();
+        let key_path = key_path.clone();
+        let admission_db = admission_db.clone();
+        let db_path = db_path.clone();
+        move || run_collection(request_path, config, key_path, admission_db, db_path)
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    let annotated: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(annotated.sluss.deliveries[0].observed_ready_at, None);
+    conn.execute("UPDATE admission_observations_v1 SET ended_ms=NULL", [])
+        .unwrap();
+    conn.execute("UPDATE repository_binding SET repository=8 WHERE id=1", [])
+        .unwrap();
+    let output = tokio::task::spawn_blocking({
+        let request_path = request_path.clone();
+        let config = config.clone();
+        let key_path = key_path.clone();
+        let admission_db = admission_db.clone();
+        let db_path = db_path.clone();
+        move || run_collection(request_path, config, key_path, admission_db, db_path)
+    })
+    .await
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    conn.execute("UPDATE repository_binding SET repository=7 WHERE id=1", [])
+        .unwrap();
+    // A clock anomaly cannot be silently converted into a latency sample.
+    conn.execute("UPDATE admission_observations_v1 SET clock_uncertain=1", [])
+        .unwrap();
+    let output = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || run_collection(request_path, config, key_path, admission_db, db_path)
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    let annotated: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(annotated.sluss.deliveries[0].observed_ready_at, None);
     assert!(!db_path.exists());
     server.abort();
 }

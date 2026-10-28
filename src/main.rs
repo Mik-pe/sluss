@@ -412,6 +412,14 @@ enum Command {
         /// GitHub App installation and repository configuration.
         #[arg(long)]
         config: PathBuf,
+        /// Optional local Sluss database for observed admission times.
+        #[arg(long)]
+        admission_db: Option<PathBuf>,
+    },
+    /// Show historical local observations that a PR version met admission.
+    AdmissionHistory {
+        #[arg(long)]
+        pr: u64,
     },
     /// Show reconciled PR observations.
     Queue,
@@ -602,6 +610,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     p90 as f64 / 60_000.0
                 );
             }
+            if let (Some(median), Some(p90)) = (
+                cohort.observed_median_latency_ms,
+                cohort.observed_p90_latency_ms,
+            ) {
+                println!(
+                    "  locally observed admission-to-merge: median {:.2} minutes, p90 {:.2} minutes ({}/{} deliveries); observation is not the exact ready time",
+                    median as f64 / 60_000.0,
+                    p90 as f64 / 60_000.0,
+                    cohort.observed_latency_samples,
+                    cohort.delivered
+                );
+            }
             if cohort.complete && cohort.delivered > 0 {
                 println!(
                     "  runner-minutes per delivered PR: {:.2}",
@@ -623,7 +643,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    if let Command::CollectBenchmark { request, config } = &cli.command {
+    if let Command::CollectBenchmark {
+        request,
+        config,
+        admission_db,
+    } = &cli.command
+    {
         let request = sluss::benchmark::CollectionRequest::load(request)?;
         let config = sluss::config::Config::load(config)?;
         let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
@@ -639,9 +664,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.github.repository_id as u64,
             )
             .await?;
-        let (input, notes) = app
+        let (mut input, notes) = app
             .collect_benchmark(&token, &config.policy(), &request)
             .await?;
+        if let Some(path) = admission_db {
+            let binding = Store::admission_history_binding(path)?;
+            let expected = sluss::reconcile::policy_digest(&app, &config.policy())?;
+            if binding
+                != (
+                    config.github.installation_id,
+                    config.github.repository_id,
+                    expected,
+                )
+            {
+                return Err("admission database repository or policy binding differs".into());
+            }
+            let mut matched = 0;
+            for delivery in &mut input.sluss.deliveries {
+                let Some(head) = notes.merged_heads.get(&delivery.pr) else {
+                    continue;
+                };
+                let merged = time::OffsetDateTime::parse(
+                    &delivery.merged_at,
+                    &time::format_description::well_known::Rfc3339,
+                )?;
+                let merged_ms = i64::try_from(merged.unix_timestamp_nanos().div_euclid(1_000_000))?;
+                let observations = Store::admission_history(path, delivery.pr)?;
+                if let Some(observed) = observations.iter().find(|o| {
+                    o.head_sha == *head
+                        && !o.clock_uncertain
+                        && o.first_observed_ms < merged_ms
+                        && o.last_observed_ms < merged_ms
+                        && o.ended_ms.is_none_or(|end| end > merged_ms)
+                }) {
+                    delivery.observed_ready_at = Some(format_unix_ms(observed.first_observed_ms)?);
+                    matched += 1;
+                }
+            }
+            eprintln!(
+                "Matched {matched}/{} Sluss deliveries to local admission observations; these are not exact ready times or proof of continuous eligibility.",
+                input.sluss.deliveries.len()
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&input)?);
         eprintln!(
             "Selected GitHub observations only: {} jobs lack timing, {} are outside their cohort, {} cross its boundary. Both completeness flags are false; no run-to-PR associations or ready times were inferred.",
@@ -653,6 +717,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 job.job_id, job.run_id, job.attempt, job.reason, job.started_at, job.completed_at
             );
         }
+        return Ok(());
+    }
+    if let Command::AdmissionHistory { pr } = &cli.command {
+        let observations = Store::admission_history(&cli.db, *pr)?;
+        println!(
+            "PR {pr}: {} local admission observations (latest 100)",
+            observations.len()
+        );
+        for observation in observations {
+            println!(
+                "head {} base {} evidence {}",
+                observation.head_sha, observation.base_sha, observation.evidence_digest
+            );
+            println!(
+                "  first observed {}; last observed {}; revisions {}–{}",
+                format_unix_ms(observation.first_observed_ms)?,
+                format_unix_ms(observation.last_observed_ms)?,
+                observation.first_revision,
+                observation.last_revision
+            );
+            if let Some(ended) = observation.ended_ms {
+                println!("  local observation ended {}", format_unix_ms(ended)?);
+            } else {
+                println!("  latest local observation remains open");
+            }
+            if observation.clock_uncertain {
+                println!("  clock moved backwards; do not use these times for latency");
+            }
+        }
+        println!(
+            "Local observation times are not the exact time the PR became ready or proof that it remained eligible; no merge authorization is provided."
+        );
         return Ok(());
     }
     if let Command::Serve {
@@ -2060,6 +2156,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::CollectBenchmark { .. } => {
             unreachable!("collection is handled before opening the database")
         }
+        Command::AdmissionHistory { .. } => {
+            unreachable!("history is handled before opening the database")
+        }
         Command::InspectCiPolicy { .. } => {
             unreachable!("policy inspection is handled before opening the database")
         }
@@ -2120,6 +2219,12 @@ fn load_capacity(
         return Err("capacity configuration is too large".into());
     }
     Ok(toml::from_str(std::str::from_utf8(&bytes)?)?)
+}
+fn format_unix_ms(value: i64) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(value) * 1_000_000)?
+            .format(&time::format_description::well_known::Rfc3339)?,
+    )
 }
 fn parse_pools(
     values: &[String],
