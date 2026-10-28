@@ -86,6 +86,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS stale_cancellations (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL);")?;
         crate::metrics::ensure_schema(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -575,8 +576,20 @@ impl Scheduler {
                     && old == run => {}
             _ => return Err(SchedulerError::DispatchTransition),
         }
+        tx.execute("INSERT INTO dispatch_receipt_sources(id,source) VALUES(?1,'direct') ON CONFLICT(id) DO UPDATE SET source='direct'", [id])?;
         tx.commit()?;
         Ok(())
+    }
+    /// The source describes how the run ID was learned, not trusted CI evidence.
+    pub fn receipt_source(&self, id: &str) -> Result<Option<String>, SchedulerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT source FROM dispatch_receipt_sources WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
     /// Bind a provider-observed run. The caller must authenticate and verify
     /// the run identity against the frozen plan before recording it.
@@ -600,6 +613,10 @@ impl Scheduler {
                 tx.execute(
                     "UPDATE dispatch_intents SET state='observed',run_id=?2 WHERE id=?1",
                     params![id, run],
+                )?;
+                tx.execute(
+                    "INSERT INTO dispatch_receipt_sources(id,source) VALUES(?1,'recovered')",
+                    [id],
                 )?;
             }
             Some((state, Some(old))) if state == "accepted" && old == run => {

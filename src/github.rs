@@ -881,7 +881,7 @@ impl App {
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2026-03-10")
             .bearer_auth(token.secret())
-            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "inputs": {"sluss_host": host_label, "sluss_suites": pending.plan.suites.iter().cloned().collect::<Vec<_>>().join(",")}}))
+            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "return_run_details": true, "inputs": {"sluss_host": host_label, "sluss_suites": pending.plan.suites.iter().cloned().collect::<Vec<_>>().join(",")}}))
             .send()
             .await
             .map_err(|_| DispatchError::Uncertain)?;
@@ -939,6 +939,54 @@ impl App {
             DispatchState::Accepted { run_id } | DispatchState::Observed { run_id } => run_id,
             _ => return Err(DispatchError::Invalid),
         };
+        let snapshot = self
+            .verify_dispatch_run(token, owner, repository, &pending, run_id)
+            .await?;
+        scheduler.observe_dispatch(id, run_id)?;
+        Ok(snapshot)
+    }
+
+    /// Reassociate an operator-supplied run ID with an uncertain send after
+    /// checking its provider identity. This is recovery, not proof that this
+    /// request created the run and not an attestation.
+    pub async fn recover_uncertain_dispatch(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        run_id: u64,
+    ) -> Result<ActionsSnapshot, DispatchError> {
+        if !valid_name(owner) || !valid_name(repository) || run_id == 0 {
+            return Err(DispatchError::Invalid);
+        }
+        let pending = scheduler
+            .pending_dispatches()?
+            .into_iter()
+            .find(|p| p.reservation.id == id)
+            .ok_or(DispatchError::Invalid)?;
+        if pending.plan.repository_id != token.repository_id
+            || pending.plan.installation_id != token.installation_id
+            || pending.state != crate::scheduler::DispatchState::Sending
+        {
+            return Err(DispatchError::Invalid);
+        }
+        let snapshot = self
+            .verify_dispatch_run(token, owner, repository, &pending, run_id)
+            .await?;
+        scheduler.observe_dispatch(id, run_id)?;
+        Ok(snapshot)
+    }
+
+    async fn verify_dispatch_run(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        pending: &crate::scheduler::PendingDispatch,
+        run_id: u64,
+    ) -> Result<ActionsSnapshot, DispatchError> {
         let path = format!("repos/{owner}/{repository}/actions/runs/{run_id}");
         let first: ActionsRun = self.get_json(token, &path, None).await?;
         let snapshot = self
@@ -963,7 +1011,6 @@ impl App {
         {
             return Err(DispatchError::RunMismatch);
         }
-        scheduler.observe_dispatch(id, run_id)?;
         Ok(snapshot)
     }
 }

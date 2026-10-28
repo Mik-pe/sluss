@@ -256,11 +256,13 @@ async fn dispatch_post(
     };
     assert_eq!(
         body,
-        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "inputs":{"sluss_host":"sluss-host-test","sluss_suites":suites}})
+        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "return_run_details":true, "inputs":{"sluss_host":"sluss-host-test","sluss_suites":suites}})
     );
     state.permissions.fetch_add(1, Ordering::SeqCst);
     if state.mode.load(Ordering::SeqCst) == 17 {
         (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+    } else if state.mode.load(Ordering::SeqCst) == 39 {
+        (StatusCode::NO_CONTENT, Json(json!({})))
     } else {
         (StatusCode::OK, Json(json!({"workflow_run_id":123})))
     }
@@ -1108,6 +1110,106 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         DispatchState::Prepared
     );
     assert_eq!(posts.load(Ordering::SeqCst), 2);
+    let no_content_db = tempfile::tempdir().unwrap();
+    let mut no_content_scheduler = Scheduler::open(
+        no_content_db.path().join("db"),
+        Capacity {
+            pools: BTreeMap::from([("rust".into(), 1)]),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: Default::default(),
+                    pools: BTreeMap::from([("rust".into(), 1)]),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    no_content_scheduler
+        .reserve_dispatch("no-content", &req, &plan)
+        .unwrap()
+        .unwrap();
+    mode.store(39, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .issue_dispatch(
+                &mut no_content_scheduler,
+                &write_token,
+                "owner",
+                "repo",
+                "no-content"
+            )
+            .await,
+        Err(DispatchError::Uncertain)
+    ));
+    assert_eq!(
+        no_content_scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Sending
+    );
+    assert!(matches!(
+        client
+            .issue_dispatch(
+                &mut no_content_scheduler,
+                &write_token,
+                "owner",
+                "repo",
+                "no-content"
+            )
+            .await,
+        Err(DispatchError::AlreadyClaimed)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 3);
+    mode.store(23, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .recover_uncertain_dispatch(
+                &mut no_content_scheduler,
+                &read_token,
+                "owner",
+                "repo",
+                "no-content",
+                123
+            )
+            .await,
+        Err(DispatchError::RunMismatch)
+    ));
+    assert_eq!(
+        no_content_scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Sending
+    );
+    assert_eq!(
+        no_content_scheduler.receipt_source("no-content").unwrap(),
+        None
+    );
+    mode.store(0, Ordering::SeqCst);
+    client
+        .recover_uncertain_dispatch(
+            &mut no_content_scheduler,
+            &read_token,
+            "owner",
+            "repo",
+            "no-content",
+            123,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        no_content_scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Observed { run_id: 123 }
+    );
+    assert_eq!(
+        no_content_scheduler
+            .receipt_source("no-content")
+            .unwrap()
+            .as_deref(),
+        Some("recovered")
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        scheduler.receipt_source("good").unwrap().as_deref(),
+        Some("direct")
+    );
     server.abort();
 }
 
@@ -1854,6 +1956,48 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             before + 1,
             "a restarted worker must not retry an accepted or uncertain POST"
         );
+        if fail_after_post {
+            let key = key_dir.path().join("test-key.pem");
+            let path = auto_db.clone();
+            let cfg = config.clone();
+            let limits_path = capacity.clone();
+            let recovered = tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_sluss"))
+                    .arg("--db")
+                    .arg(path)
+                    .args([
+                        "recover-dispatch",
+                        "--batch-id",
+                        id,
+                        "--run-id",
+                        "123",
+                        "--config",
+                    ])
+                    .arg(cfg)
+                    .arg("--capacity")
+                    .arg(limits_path)
+                    .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                recovered.status.success(),
+                "{}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&recovered.stdout).contains("receipt source: recovered")
+            );
+            let scheduler =
+                sluss::scheduler::Scheduler::open(&auto_db, observer_capacity.clone()).unwrap();
+            assert_eq!(
+                scheduler.receipt_source(id).unwrap().as_deref(),
+                Some("recovered")
+            );
+            assert_eq!(posts.load(Ordering::SeqCst), before + 1);
+        }
     }
     server.abort();
 }

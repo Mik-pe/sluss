@@ -152,6 +152,17 @@ enum Command {
         #[arg(long)]
         verification_policy: Option<PathBuf>,
     },
+    /// Reassociate an uncertain send with an operator-supplied provider run ID.
+    RecoverDispatch {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Observe a dispatched run and check the reserved host's runner IDs.
     ObserveDispatch {
         #[arg(long)]
@@ -637,6 +648,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::RecoverDispatch {
+            batch_id,
+            run_id,
+            config,
+            capacity,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            if store.repository_scope()?
+                != (
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+            {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app =
+                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let token = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let snapshot = app
+                .recover_uncertain_dispatch(
+                    &mut scheduler,
+                    &token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &batch_id,
+                    run_id,
+                )
+                .await?;
+            let source = scheduler
+                .receipt_source(&batch_id)?
+                .unwrap_or_else(|| "unknown".into());
+            println!(
+                "recovered run {} (status {}); receipt source: {}",
+                snapshot.run.id, snapshot.run.status, source
+            );
+            println!(
+                "run origin is not proven; this is not an attestation and capacity remains reserved"
+            );
+        }
         Command::ObserveDispatch {
             batch_id,
             config,
@@ -699,6 +759,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "run {}: status {}, conclusion {:?}, placement {:?}; {} new completed job measurements",
                 snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement, recorded
             );
+            let source = scheduler
+                .receipt_source(&batch_id)?
+                .unwrap_or_else(|| "unknown".into());
+            println!("receipt source: {source}");
             println!("observation does not authorize landing or release reserved capacity");
         }
         Command::CancelStale {
