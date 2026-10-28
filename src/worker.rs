@@ -8,6 +8,20 @@ use crate::{
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep};
 
+// Startup is not an error while the first provider reconciliation is still
+// binding a fresh database. Other errors and a mismatched binding must continue
+// through the worker's normal fail-closed path.
+async fn awaiting_repository_binding(db: &std::path::Path) -> bool {
+    let db = db.to_owned();
+    matches!(
+        tokio::task::spawn_blocking(
+            move || Store::open(db).and_then(|store| store.repository_scope())
+        )
+        .await,
+        Ok(Err(crate::store::StoreError::Unbound))
+    )
+}
+
 pub async fn supervise(
     app: Arc<App>,
     db: PathBuf,
@@ -292,6 +306,10 @@ pub async fn supervise_stale_check_cancellation(
     let minimum = poll.max(Duration::from_secs(60));
     let mut delay = minimum;
     loop {
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
         match cancel_stale_checks_once(&app, &db, &policy).await {
             Ok(()) => delay = minimum,
             Err(error) => {
@@ -477,6 +495,10 @@ pub async fn supervise_dispatch_observation_with_signals(
     let wake_delay = poll.max(Duration::from_secs(5)).min(minimum);
     let mut delay = minimum;
     loop {
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
         if let Err(error) =
             observe_dispatches_with_completion(&app, &db, &capacity, &policy, complete_ci_only)
                 .await
@@ -529,6 +551,10 @@ pub async fn supervise_planning(
 ) {
     let mut delay = poll;
     loop {
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
         let app = app.clone();
         let db = db.clone();
         let policy = policy.clone();
@@ -701,12 +727,35 @@ pub async fn supervise_dispatch(
     settings: crate::dispatch::Settings,
     poll: Duration,
 ) {
+    supervise_dispatch_with_wakeup(
+        app,
+        db,
+        policy,
+        capacity,
+        settings,
+        poll,
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .await;
+}
+
+/// Notify the local observer only after the dispatch receipt is durably saved.
+pub async fn supervise_dispatch_with_wakeup(
+    app: Arc<App>,
+    db: PathBuf,
+    policy: RepositoryPolicy,
+    capacity: crate::scheduler::Capacity,
+    settings: crate::dispatch::Settings,
+    poll: Duration,
+    ci_wakeup: Arc<tokio::sync::Notify>,
+) {
     let minimum = poll.max(Duration::from_secs(10));
     let mut delay = minimum;
     loop {
         match dispatch_once(&app, &db, &policy, &capacity, &settings).await {
             Ok(Some(crate::dispatch::Outcome::Sent { run, host })) => {
                 eprintln!("dispatched run {run} to reserved host {host}");
+                ci_wakeup.notify_one();
                 delay = minimum;
             }
             Ok(_) => delay = minimum,
@@ -930,6 +979,10 @@ pub async fn supervise_ci_release_with_wakeup(
     let wake_delay = poll.max(Duration::from_secs(5)).min(minimum);
     let mut delay = minimum;
     loop {
+        if awaiting_repository_binding(&db).await {
+            sleep(poll.max(Duration::from_secs(1))).await;
+            continue;
+        }
         match release_ci_only_once(&app, &db, &capacity, &policy).await {
             Ok(count) => {
                 if count > 0 {

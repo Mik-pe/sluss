@@ -291,8 +291,61 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     let config = data.path().join("sluss.toml");
     std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
     let policy = sluss::config::Config::load(&config).unwrap().policy();
-    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let app =
+        Arc::new(App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap());
     let token = app.read_token(42, 7).await.unwrap();
+    let capacity: Capacity = toml::from_str("[pools]\nrust=1\n[hosts.sluss-host-test]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-test.pools]\nrust=1\n").unwrap();
+    let settings = sluss::dispatch::Settings {
+        workflow_id: 17,
+        required_jobs: ["job-1-0".into()].into(),
+        request: sluss::scheduler::Request {
+            pools: [("rust".into(), 1)].into(),
+        },
+        verification_policy: None,
+    };
+    let planning_db = data.path().join("planning.sqlite");
+    let planner = tokio::spawn(sluss::worker::supervise_planning(
+        app.clone(),
+        planning_db.clone(),
+        policy.clone(),
+        sluss::store::PlanningSettings {
+            max_batch_size: 1,
+            adaptive_batching: false,
+            max_active_batches: 1,
+            debounce: std::time::Duration::ZERO,
+            batch_window: std::time::Duration::ZERO,
+        },
+        std::time::Duration::from_secs(1),
+    ));
+    let first_ci_wake = Arc::new(tokio::sync::Notify::new());
+    let first_release_wake = Arc::new(tokio::sync::Notify::new());
+    let initial_observer =
+        tokio::spawn(sluss::worker::supervise_dispatch_observation_with_signals(
+            app.clone(),
+            db.clone(),
+            capacity.clone(),
+            policy.clone(),
+            std::time::Duration::from_millis(10),
+            true,
+            sluss::worker::ObservationWakeups {
+                ci: first_ci_wake.clone(),
+                release: Some(first_release_wake.clone()),
+            },
+        ));
+    let initial_releaser = tokio::spawn(sluss::worker::supervise_ci_release_with_wakeup(
+        app.clone(),
+        db.clone(),
+        capacity.clone(),
+        policy.clone(),
+        std::time::Duration::from_millis(10),
+        first_release_wake,
+    ));
+    // Leave the fresh database unbound long enough for multiple worker polls.
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    assert!(matches!(
+        Store::open(&db).unwrap().repository_scope(),
+        Err(sluss::store::StoreError::Unbound)
+    ));
     let mut inbox = Inbox::open(&db).unwrap();
     inbox
         .record("initial", "pull_request", &[1; 32], 42, 7)
@@ -302,6 +355,26 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     sluss::reconcile::reconcile_once(&app, &token, &mut store, &event, &policy)
         .await
         .unwrap();
+    let mut planning_inbox = Inbox::open(&planning_db).unwrap();
+    planning_inbox
+        .record("initial-plan", "pull_request", &[2; 32], 42, 7)
+        .unwrap();
+    let planning_event = planning_inbox.pending().unwrap().remove(0);
+    let mut planning_store = Store::open(&planning_db).unwrap();
+    sluss::reconcile::reconcile_once(&app, &token, &mut planning_store, &planning_event, &policy)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(2500), async {
+        loop {
+            if planning_store.active_batches().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("a planner started before binding must plan promptly after reconciliation");
+    planner.abort();
     let id = "batch-0123456789abcdef";
     store.plan_batch(id, &base, 1, 1).unwrap().unwrap();
     let prepared = prepare_local_from_remote(
@@ -325,22 +398,37 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
     );
     drop(store);
     drop(inbox);
-    let capacity: Capacity = toml::from_str("[pools]\nrust=1\n[hosts.sluss-host-test]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-test.pools]\nrust=1\n").unwrap();
-    let settings = sluss::dispatch::Settings {
-        workflow_id: 17,
-        required_jobs: ["job-1-0".into()].into(),
-        request: sluss::scheduler::Request {
-            pools: [("rust".into(), 1)].into(),
-        },
-        verification_policy: None,
-    };
     mode.store(31, Ordering::SeqCst); // The provider reports an in-progress run.
-    assert!(matches!(
-        sluss::dispatch::batch(&db, &app, &policy, &capacity, &settings, id)
-            .await
-            .unwrap(),
-        sluss::dispatch::Outcome::Sent { run: 123, .. }
+    let dispatcher = tokio::spawn(sluss::worker::supervise_dispatch_with_wakeup(
+        app.clone(),
+        db.clone(),
+        policy.clone(),
+        capacity.clone(),
+        settings.clone(),
+        std::time::Duration::from_millis(10),
+        first_ci_wake,
     ));
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            let scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+            if scheduler.pending_dispatches().unwrap().iter().any(|entry| {
+                matches!(
+                    entry.state,
+                    sluss::scheduler::DispatchState::Observed { run_id: 123 }
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect(
+        "an observer started before binding must observe an automatic dispatch without a webhook",
+    );
+    dispatcher.abort();
+    initial_observer.abort();
+    initial_releaser.abort();
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     let scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
     let pending = scheduler.pending_dispatches().unwrap();
@@ -488,6 +576,24 @@ async fn real_staging_commit_survives_dispatch_observation_and_restart() {
         .await
         .unwrap();
     assert_eq!(Store::open(&db).unwrap().metrics().unwrap(), metrics);
+    let mut foreign_policy = policy.clone();
+    foreign_policy.repository = 8;
+    assert!(
+        sluss::worker::observe_dispatches_with_completion(
+            &app,
+            &db,
+            &capacity,
+            &foreign_policy,
+            true
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        sluss::worker::release_ci_only_once(&app, &db, &capacity, &foreign_policy)
+            .await
+            .is_err()
+    );
     assert_eq!(git(remote.path(), &["rev-parse", "refs/heads/main"]), base);
     server.abort();
 }

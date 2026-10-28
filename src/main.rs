@@ -1082,13 +1082,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .clone();
                 let settings = dispatch_settings.expect("preflight dispatch settings");
                 eprintln!("automatic dispatch enabled; landing remains disabled");
-                tokio::spawn(sluss::worker::supervise_dispatch(
+                tokio::spawn(sluss::worker::supervise_dispatch_with_wakeup(
                     app.clone(),
                     cli.db.clone(),
                     policy.clone(),
                     capacity,
                     settings,
                     poll,
+                    ci_wakeup.clone(),
                 ));
             }
             if cancel_stale {
