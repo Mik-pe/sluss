@@ -4386,6 +4386,7 @@ fn read_conflict_release(conn: &Connection, id: &str) -> Result<bool, SchedulerE
             |r| r.get(0),
         )?;
         if saved_capacity != topology
+            || frozen.batch.staging_ref != format!("refs/heads/sluss/{}", batch.id)
             || !frozen.validate(&evidence.capacity)
             || frozen
                 .dispatch(name)

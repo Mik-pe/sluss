@@ -4536,6 +4536,219 @@ async fn cli_dispatches_fixture() {
         foreign_journal.get("foreign-land").unwrap().unwrap().1,
         sluss::landing::IntentState::Prepared
     );
+    // A recovered lane can also race with its direct receipt. Its conflict
+    // must remain attached to the parent batch after capacity is recovered.
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let lane_conflict_db = data.path().join("lane-dispatch-conflict.sqlite");
+    let mut lane_inbox = Inbox::open(&lane_conflict_db).unwrap();
+    let mut lane_store = Store::open(&lane_conflict_db).unwrap();
+    lane_inbox
+        .record("lane-conflict", "pull_request", &[98; 32], 42, 7)
+        .unwrap();
+    let lane_event = lane_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut lane_store,
+        &lane_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    lane_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    lane_store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    lane_store.start_integration(id).unwrap();
+    lane_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    let lane_policy = data.path().join("conflict-lanes.toml");
+    std::fs::write(&lane_policy, "version=1\n[lanes.full]\nworkflow_id=17\nsuites=['full']\nrequired_jobs=['job-1-0']\n[lanes.full.request.pools]\nrust=1\n").unwrap();
+    let lane_settings = sluss::dispatch::LaneSettings {
+        policy: lane_policy,
+        verification_policy: None,
+    };
+    let lane_id = format!("{id}:lane:full");
+    let mut lane_scheduler =
+        sluss::scheduler::Scheduler::open(&lane_conflict_db, one_host.clone()).unwrap();
+    mode.store(123, Ordering::SeqCst);
+    posts.store(0, Ordering::SeqCst);
+    let (lane_send, lane_recovered) = tokio::join!(
+        sluss::dispatch::batch_lanes(
+            &lane_conflict_db,
+            &fixture_app,
+            &fixture_policy,
+            &one_host,
+            &lane_settings,
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while posts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = fixture_app
+                .recover_uncertain_dispatch(
+                    &mut lane_scheduler,
+                    &fixture_token,
+                    "owner",
+                    "repo",
+                    &lane_id,
+                    123,
+                )
+                .await;
+            mode.store(0, Ordering::SeqCst);
+            result
+        }
+    );
+    assert!(lane_recovered.is_ok());
+    assert!(matches!(
+        lane_send,
+        Err(sluss::dispatch::Error::Dispatch(
+            sluss::github::DispatchError::Scheduler(
+                sluss::scheduler::SchedulerError::DispatchReceiptConflict
+            )
+        ))
+    ));
+    assert!(matches!(
+        lane_store.batch(id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    let lane_inventory = fixture_app.runner_inventory_token(42, 7).await.unwrap();
+    assert_eq!(
+        fixture_app
+            .resolve_dispatch_conflict(
+                &mut lane_scheduler,
+                &fixture_token,
+                &lane_inventory,
+                ("owner", "repo"),
+                &lane_id,
+                &one_host
+            )
+            .await
+            .unwrap(),
+        sluss::github::ConflictResolution::Resolved
+    );
+    assert!(lane_scheduler.conflict_release_recorded(&lane_id).unwrap());
+    assert!(lane_scheduler.pending_dispatches().unwrap().is_empty());
+    drop(lane_scheduler);
+    let restarted_lane =
+        sluss::scheduler::Scheduler::open(&lane_conflict_db, one_host.clone()).unwrap();
+    assert!(restarted_lane.conflict_release_recorded(&lane_id).unwrap());
+    assert!(
+        sluss::scheduler::Scheduler::dispatch_overview(&lane_conflict_db)
+            .unwrap()
+            .is_empty()
+    );
+    let conn = rusqlite::Connection::open(&lane_conflict_db).unwrap();
+    let saved: String = conn
+        .query_row(
+            "SELECT body FROM lane_batch_plans WHERE batch_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut changed: Value = serde_json::from_str(&saved).unwrap();
+    changed["batch"]["staging_ref"] = json!("refs/heads/sluss/batch-0000000000000000");
+    conn.execute(
+        "UPDATE lane_batch_plans SET body=?1 WHERE batch_id=?2",
+        rusqlite::params![serde_json::to_string(&changed).unwrap(), id],
+    )
+    .unwrap();
+    assert!(restarted_lane.conflict_release_recorded(&lane_id).is_err());
+    conn.execute(
+        "UPDATE lane_batch_plans SET body=?1 WHERE batch_id=?2",
+        rusqlite::params![saved, id],
+    )
+    .unwrap();
+
+    // A directly acknowledged stale lane is cancelled once and keeps its
+    // physical reservation until GitHub reports a terminal run.
+    mode.store(0, Ordering::SeqCst);
+    let lane_stale_db = data.path().join("lane-stale-cancel.sqlite");
+    let mut lane_stale_inbox = Inbox::open(&lane_stale_db).unwrap();
+    let mut lane_stale_store = Store::open(&lane_stale_db).unwrap();
+    lane_stale_inbox
+        .record("lane-stale", "pull_request", &[97; 32], 42, 7)
+        .unwrap();
+    let lane_stale_event = lane_stale_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut lane_stale_store,
+        &lane_stale_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    lane_stale_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    lane_stale_store
+        .bind_policy_paths(id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    lane_stale_store.start_integration(id).unwrap();
+    lane_stale_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    mode.store(31, Ordering::SeqCst);
+    assert!(matches!(
+        sluss::dispatch::batch_lanes(
+            &lane_stale_db,
+            &fixture_app,
+            &fixture_policy,
+            &one_host,
+            &lane_settings,
+            id
+        )
+        .await
+        .unwrap(),
+        sluss::dispatch::Outcome::Sent { run: 123, .. }
+    ));
+    let (mut stale_batch, version) = lane_stale_store.batch(id).unwrap().unwrap();
+    stale_batch.invalidate("new PR head".into()).unwrap();
+    lane_stale_store
+        .update_batch(&stale_batch, version)
+        .unwrap();
+    posts.store(0, Ordering::SeqCst);
+    sluss::worker::cancel_stale_once(&fixture_app, &lane_stale_db, &one_host, &fixture_policy)
+        .await
+        .unwrap();
+    sluss::worker::cancel_stale_once(&fixture_app, &lane_stale_db, &one_host, &fixture_policy)
+        .await
+        .unwrap();
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let lane_stale_scheduler =
+        sluss::scheduler::Scheduler::open(&lane_stale_db, one_host.clone()).unwrap();
+    assert_eq!(lane_stale_scheduler.pending_dispatches().unwrap().len(), 1);
+    mode.store(43, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::release_ci_only_once(
+            &fixture_app,
+            &lane_stale_db,
+            &one_host,
+            &fixture_policy
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(
+        lane_stale_scheduler
+            .pending_dispatches()
+            .unwrap()
+            .is_empty()
+    );
+
     // A recovered candidate can race with a later direct receipt. Preserve
     // both identities, cancel each at most once, and keep the reservation.
     mode.store(0, Ordering::SeqCst);
