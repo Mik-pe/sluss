@@ -1,5 +1,6 @@
-# Example only. Install on the default branch, protect it and its dependencies,
-# and use isolated runners with unique labels for each physical host.
+# Example only: adapt these package names to your workspace and policy.
+# Install on the default branch, protect it and its dependencies, and use
+# isolated runners with unique labels for each physical host.
 name: Sluss CI example
 on:
   workflow_dispatch:
@@ -22,10 +23,33 @@ jobs:
         with:
           persist-credentials: false
       - name: Run configured suites
+        shell: bash
         env:
           SLUSS_SUITES: ${{ inputs.sluss_suites }}
         run: |
           case "$SLUSS_SUITES" in
-            full) cargo test --workspace --locked ;;
-            *) echo "Unsupported suite selection" >&2; exit 1 ;;
+            full)
+              cargo test --workspace --locked
+              ;;
+            *)
+              # Validate the entire list before running any suite. Never eval
+              # workflow inputs or interpolate them into a shell command.
+              case "$SLUSS_SUITES" in
+                ''|,*|*,|*,,*) echo "Invalid suite list" >&2; exit 1 ;;
+              esac
+              core=0; api=0; ui=0
+              IFS=',' read -r -a suites <<< "$SLUSS_SUITES"
+              for suite in "${suites[@]}"; do
+                case "$suite" in
+                  core-tests) [ "$core" -eq 0 ] || exit 1; core=1 ;;
+                  api-tests) [ "$api" -eq 0 ] || exit 1; api=1 ;;
+                  ui-tests) [ "$ui" -eq 0 ] || exit 1; ui=1 ;;
+                  *) echo "Unsupported suite selection" >&2; exit 1 ;;
+                esac
+              done
+              # Replace these names with actual workspace package names.
+              if [ "$core" -eq 1 ]; then cargo test --locked -p example-core; fi
+              if [ "$api" -eq 1 ]; then cargo test --locked -p example-api; fi
+              if [ "$ui" -eq 1 ]; then cargo test --locked -p example-ui; fi
+              ;;
           esac
