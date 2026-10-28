@@ -218,4 +218,20 @@ fn storage_rejects_mutated_inputs_and_skipped_or_forged_transitions() {
         store.update_batch(&b, 2),
         Err(StoreError::InvalidBatch)
     ));
+    b.state = State::CiCompleteLanes {
+        integration_sha: "tested".into(),
+        lanes: [(
+            "fake".into(),
+            sluss::batch::LaneResult {
+                run_id: 1,
+                conclusion: "success".into(),
+            },
+        )]
+        .into(),
+        conclusion: "success".into(),
+    };
+    assert!(matches!(
+        store.update_batch(&b, 2),
+        Err(StoreError::InvalidBatch)
+    ));
 }

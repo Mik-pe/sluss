@@ -1,6 +1,6 @@
 # Architecture
 
-Sluss is planned as one Rust application with durable local state. SQLite WAL is the initial storage choice; Git commands in isolated workspaces can provide integration semantics without a custom merge engine. The current implementation is an early core, not an operational service.
+Sluss is one Rust application with durable local state. It uses SQLite WAL and Git commands in isolated workspaces. The development preview includes opt-in workers for reconciliation, planning, staging and CI-only dispatch; those workers have only local simulated-provider coverage and are not production-ready.
 
 The intended components are GitHub App ingress and reconciliation, admission and queue management, frozen batch plans, integration building, capacity-aware CI scheduling, evidence verification, and strict landing. A service restart must reconcile external actions and identifiers rather than blindly repeat them.
 
@@ -9,6 +9,8 @@ The intended components are GitHub App ingress and reconciliation, admission and
 Webhook events are hints, not authoritative admission records. Reconcile current heads, reviews, labels, base, and relevant policy with GitHub; deduplicate deliveries durably and handle out-of-order delivery. Debounce PR updates without losing the latest state. Queue snapshots do not imply approval.
 
 Resource scheduling needs explicit budgets for both logical pools and shared physical hosts; multiple labels on the same machine cannot be treated as independent machines. Batch sizes should be measurable and configurable. Bisection rebuilds and retests each sub-batch; a successful sub-batch never inherits another batch's evidence.
+
+An optional lane plan partitions a frozen suite selection into separate workflows and physical-host reservations. Each lane has a durable dispatch identity, its own provider run, and a one-shot send. A CI-only batch completes after all lanes have direct terminal observations and their reservations are safely released. A full frozen lane policy and comparable workflow observations are required for cross-batch bisection; missing timings or investigation costs keep adaptive cost comparisons unresolved. These scheduling records do not constitute trusted attestation.
 
 Two operation modes have distinct contracts: CI-only does not publish merge authorization from a batch; strict merge is opt-in and has no squash fallback. Strict landing requires a tested provider-specific compare-and-update mechanism and compatible branch rules. A `doctor` check cannot replace a runtime recheck.
 
