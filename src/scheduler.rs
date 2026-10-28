@@ -735,7 +735,7 @@ impl Scheduler {
             .capacity
             .hosts
             .iter()
-            .find(|(name, host)| {
+            .filter(|(name, host)| {
                 eligible_hosts.is_none_or(|hosts| hosts.contains(*name))
                     && slots.get(*name).copied().unwrap_or(0) < u64::from(host.slots)
                     && request.pools.iter().all(|(pool, amount)| {
@@ -749,6 +749,31 @@ impl Scheduler {
                                 <= u64::from(*limit)
                         })
                     })
+            })
+            // Keep hosts with additional pool capabilities available for
+            // requests that cannot run on a less flexible machine. Pack
+            // equally capable hosts by remaining requested capacity/slots.
+            .min_by_key(|(name, host)| {
+                let extra_pools = host
+                    .pools
+                    .keys()
+                    .filter(|pool| !request.pools.contains_key(*pool))
+                    .count();
+                let remaining_units: u64 = request
+                    .pools
+                    .iter()
+                    .map(|(pool, amount)| {
+                        let used = per_host
+                            .get(*name)
+                            .and_then(|held| held.get(pool))
+                            .copied()
+                            .unwrap_or(0);
+                        u64::from(host.pools[pool]) - used - u64::from(*amount)
+                    })
+                    .sum();
+                let remaining_slots =
+                    u64::from(host.slots) - slots.get(*name).copied().unwrap_or(0) - 1;
+                (extra_pools, remaining_units, remaining_slots)
             })
             .map(|(name, _)| name.clone());
         let Some(host) = selected else {

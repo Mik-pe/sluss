@@ -76,6 +76,109 @@ fn overlapping_pools_respect_physical_machine_and_global_budgets() {
 }
 
 #[test]
+fn flexible_work_preserves_hosts_needed_by_specialized_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scheduler.sqlite");
+    let configured = Capacity {
+        pools: pools(&[("rust", 2), ("android", 1)]),
+        hosts: BTreeMap::from([
+            (
+                "a-shared".into(),
+                Host {
+                    runner_ids: Default::default(),
+                    slots: 1,
+                    pools: pools(&[("rust", 1), ("android", 1)]),
+                },
+            ),
+            (
+                "z-rust".into(),
+                Host {
+                    runner_ids: Default::default(),
+                    slots: 1,
+                    pools: pools(&[("rust", 1)]),
+                },
+            ),
+        ]),
+    };
+    let mut scheduler = Scheduler::open(&db, configured.clone()).unwrap();
+    assert_eq!(
+        scheduler
+            .reserve("rust", &request(&[("rust", 1)]))
+            .unwrap()
+            .unwrap()
+            .host,
+        "z-rust"
+    );
+    assert_eq!(
+        scheduler
+            .reserve("android", &request(&[("android", 1)]))
+            .unwrap()
+            .unwrap()
+            .host,
+        "a-shared"
+    );
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, configured).unwrap();
+    assert_eq!(
+        scheduler
+            .reserve("rust", &request(&[("rust", 1)]))
+            .unwrap()
+            .unwrap()
+            .host,
+        "z-rust"
+    );
+    assert!(
+        scheduler
+            .reserve("third", &request(&[("rust", 1)]))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn equally_capable_hosts_pack_smaller_remaining_capacity_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let configured = Capacity {
+        pools: pools(&[("rust", 5)]),
+        hosts: BTreeMap::from([
+            (
+                "a-large".into(),
+                Host {
+                    runner_ids: Default::default(),
+                    slots: 2,
+                    pools: pools(&[("rust", 4)]),
+                },
+            ),
+            (
+                "z-small".into(),
+                Host {
+                    runner_ids: Default::default(),
+                    slots: 1,
+                    pools: pools(&[("rust", 1)]),
+                },
+            ),
+        ]),
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("scheduler.sqlite"), configured).unwrap();
+    assert_eq!(
+        scheduler
+            .reserve("small", &request(&[("rust", 1)]))
+            .unwrap()
+            .unwrap()
+            .host,
+        "z-small"
+    );
+    assert_eq!(
+        scheduler
+            .reserve("large", &request(&[("rust", 4)]))
+            .unwrap()
+            .unwrap()
+            .host,
+        "a-large"
+    );
+}
+
+#[test]
 fn different_workers_cannot_oversubscribe_the_same_host() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("scheduler.sqlite");
