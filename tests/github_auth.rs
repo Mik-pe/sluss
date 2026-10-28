@@ -254,7 +254,11 @@ async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> 
     };
     Json(json!({"id": 7, "node_id": node, "default_branch":default}))
 }
-async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+async fn dispatch_ref(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     let mode = state.mode.load(Ordering::SeqCst);
     let sha = if mode == 16 || (mode == 228 && STAGE_REF_READS.fetch_add(1, Ordering::SeqCst) > 0) {
@@ -262,9 +266,21 @@ async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> J
     } else {
         "a"
     };
-    Json(
+    let body = Json(
         json!({"ref":"refs/heads/sluss/batch-0123456789abcdef","object":{"sha":sha.repeat(40),"type":"commit"}}),
-    )
+    );
+    if mode == 223 && STAGE_REF_READS.fetch_add(1, Ordering::SeqCst) > 0 {
+        let reset = (time::OffsetDateTime::now_utc().unix_timestamp() + 60).to_string();
+        return (
+            [
+                ("x-ratelimit-remaining", "0".to_string()),
+                ("x-ratelimit-reset", reset),
+            ],
+            body,
+        )
+            .into_response();
+    }
+    body.into_response()
 }
 async fn dispatched_run(
     State(state): State<ServerState>,
@@ -945,6 +961,58 @@ async fn token(
         ),
     )
 }
+
+async fn rate_limited_token(
+    State(state): State<ServerState>,
+    path: Path<u64>,
+    headers: HeaderMap,
+    body: Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.mode.load(Ordering::SeqCst) {
+        220 => {
+            state.token_calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "1")],
+                Json(json!({"message":"rate limit"})),
+            )
+                .into_response()
+        }
+        221 => {
+            state.token_calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"message":"You have exceeded a secondary rate limit"})),
+            )
+                .into_response()
+        }
+        222 => {
+            state.token_calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"message":"Resource not accessible by integration"})),
+            )
+                .into_response()
+        }
+        223 => {
+            let mut response = token(State(state), path, headers, body)
+                .await
+                .into_response();
+            let reset = (time::OffsetDateTime::now_utc().unix_timestamp() + 10).to_string();
+            response
+                .headers_mut()
+                .insert("x-ratelimit-remaining", "0".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("x-ratelimit-reset", reset.parse().unwrap());
+            response
+        }
+        _ => token(State(state), path, headers, body)
+            .await
+            .into_response(),
+    }
+}
 fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     let dir = tempfile::tempdir().unwrap();
     let private = dir.path().join("test-key.pem");
@@ -973,6 +1041,100 @@ fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     let a = std::fs::read(private).unwrap();
     let b = std::fs::read(public).unwrap();
     (dir, a, b)
+}
+
+#[tokio::test]
+async fn rate_limits_defer_all_workers_and_preserve_normal_forbidden_errors() {
+    let (_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/app/installations/{id}/access_tokens",
+            post(rate_limited_token),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let origin = format!("http://{addr}/");
+    let client = Arc::new(App::new("app-client-id".into(), &private, &origin).unwrap());
+    let read_token = client.read_token(42, 7).await.unwrap();
+    mode.store(220, Ordering::SeqCst);
+    assert!(matches!(
+        client.read_token(42, 7).await,
+        Err(GitHubError::Status(429))
+    ));
+    mode.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        client.observe_pull(&read_token, "owner", "repo", 19).await,
+        Err(GitHubError::RateLimited)
+    ));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            matches!(
+                client.read_token(42, 7).await,
+                Err(GitHubError::RateLimited)
+            )
+        }));
+    }
+    for task in tasks {
+        assert!(task.await.unwrap());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "deferred workers must not call GitHub"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(client.read_token(42, 7).await.is_ok());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let ordinary = App::new("app-client-id".into(), &private, &origin).unwrap();
+    mode.store(222, Ordering::SeqCst);
+    assert!(matches!(
+        ordinary.read_token(42, 7).await,
+        Err(GitHubError::Status(403))
+    ));
+    assert!(matches!(
+        ordinary.read_token(42, 7).await,
+        Err(GitHubError::Status(403))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "ordinary permission errors do not suspend the app"
+    );
+
+    let secondary = App::new("app-client-id".into(), &private, &origin).unwrap();
+    mode.store(221, Ordering::SeqCst);
+    assert!(matches!(
+        secondary.read_token(42, 7).await,
+        Err(GitHubError::Status(403))
+    ));
+    assert!(matches!(
+        secondary.read_token(42, 7).await,
+        Err(GitHubError::RateLimited)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+
+    let primary = App::new("app-client-id".into(), &private, &origin).unwrap();
+    mode.store(223, Ordering::SeqCst);
+    assert!(primary.read_token(42, 7).await.is_ok());
+    assert!(matches!(
+        primary.read_token(42, 7).await,
+        Err(GitHubError::RateLimited)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
+    server.abort();
 }
 
 #[tokio::test]
@@ -2410,6 +2572,20 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         ));
         assert_eq!(posts.load(Ordering::SeqCst), 0);
     }
+    let limited = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    STAGE_REF_READS.store(0, Ordering::SeqCst);
+    mode.store(223, Ordering::SeqCst);
+    assert!(matches!(
+        limited
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
+            .await,
+        Err(DispatchError::GitHub(GitHubError::RateLimited))
+    ));
+    assert!(matches!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Prepared
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
     mode.store(247, Ordering::SeqCst);
     let registered = client
         .observe_registered_workflow(&read_token, "owner", "repo", 17)

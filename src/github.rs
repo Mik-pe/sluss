@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
@@ -20,6 +21,8 @@ pub enum GitHubError {
     Request,
     #[error("GitHub authentication returned HTTP {0}")]
     Status(u16),
+    #[error("GitHub rate limit is active; request deferred")]
+    RateLimited,
     #[error("GitHub returned an invalid or unexpectedly scoped installation token")]
     InvalidResponse,
     #[error("GitHub data is invalid, incomplete, or changed during observation")]
@@ -37,6 +40,65 @@ pub struct App {
     key: EncodingKey,
     client: reqwest::Client,
     api: reqwest::Url,
+    rate_limit: Mutex<RateLimitGate>,
+}
+
+#[derive(Default)]
+enum RateLimitGate {
+    #[default]
+    Open,
+    Until(Instant),
+    Indefinite,
+}
+
+fn rate_limit_delay(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    message_rate_limited: bool,
+    now: u64,
+) -> Option<Duration> {
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        == Some("0");
+    let retry = headers.get(reqwest::header::RETRY_AFTER);
+    let limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || exhausted
+        || (status == reqwest::StatusCode::FORBIDDEN && (retry.is_some() || message_rate_limited));
+    if !limited {
+        return None;
+    }
+    let mut seconds = 0u64;
+    if let Some(value) = retry {
+        let parsed = value.to_str().ok().and_then(|value| {
+            if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(value.parse::<u64>().unwrap_or(u64::MAX));
+            }
+            value.parse::<u64>().ok().or_else(|| {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822)
+                    .ok()
+                    .and_then(|date| u64::try_from(date.unix_timestamp()).ok())
+                    .map(|timestamp| timestamp.saturating_sub(now))
+            })
+        });
+        seconds = seconds.max(parsed.unwrap_or(60).max(1));
+    }
+    if exhausted {
+        let reset = headers
+            .get("x-ratelimit-reset")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        seconds = seconds.max(
+            reset
+                .filter(|value| *value > now)
+                .map(|value| value - now)
+                .unwrap_or(60),
+        );
+    }
+    if seconds == 0 {
+        seconds = 60;
+    }
+    Some(Duration::from_secs(seconds))
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AppIdentity {
@@ -119,14 +181,14 @@ impl App {
                 .join("app")
                 .map_err(|_| GitHubError::InvalidConfiguration)?;
             let mut response = app
-                .client
-                .get(url)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .bearer_auth(jwt)
-                .send()
-                .await
-                .map_err(|_| GitHubError::Request)?;
+                .send(
+                    app.client
+                        .get(url)
+                        .header("Accept", "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", "2022-11-28")
+                        .bearer_auth(jwt),
+                )
+                .await?;
             if !response.status().is_success() {
                 return Err(GitHubError::Status(response.status().as_u16()));
             }
@@ -175,15 +237,15 @@ impl App {
             .join("graphql")
             .map_err(|_| GitHubError::InvalidConfiguration)?;
         let mut response = self
-            .client
-            .post(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(token.secret())
-            .json(&serde_json::json!({"query": QUERY}))
-            .send()
-            .await
-            .map_err(|_| GitHubError::Request)?;
+            .send(
+                self.client
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(token.secret())
+                    .json(&serde_json::json!({"query": QUERY})),
+            )
+            .await?;
         if !response.status().is_success() {
             return Err(GitHubError::Status(response.status().as_u16()));
         }
@@ -269,7 +331,84 @@ impl App {
             key,
             client,
             api,
+            rate_limit: Mutex::new(RateLimitGate::Open),
         })
+    }
+
+    /// Defer new API requests across workers after an observed rate limit.
+    /// In-flight requests and independent processes are not covered.
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, GitHubError> {
+        self.check_rate_limit()?;
+        let mut response = request.send().await.map_err(|_| GitHubError::Request)?;
+        let status = response.status();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        let mut delay = rate_limit_delay(status, response.headers(), false, now);
+        if status == reqwest::StatusCode::FORBIDDEN && delay.is_none() {
+            let mut bytes = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if bytes.len().saturating_add(chunk.len()) > 65536 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let limited = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|body| {
+                    body.get("message")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_ascii_lowercase)
+                })
+                .is_some_and(|message| message.contains("rate limit"));
+            if limited {
+                delay = rate_limit_delay(status, response.headers(), true, now);
+            }
+            if let Some(delay) = delay {
+                self.defer_requests(delay)?;
+            }
+            return Err(GitHubError::Status(status.as_u16()));
+        }
+        if let Some(delay) = delay {
+            self.defer_requests(delay)?;
+        }
+        Ok(response)
+    }
+
+    fn check_rate_limit(&self) -> Result<(), GitHubError> {
+        let mut gate = self
+            .rate_limit
+            .lock()
+            .map_err(|_| GitHubError::RateLimited)?;
+        match &*gate {
+            RateLimitGate::Until(deadline) if Instant::now() >= *deadline => {
+                *gate = RateLimitGate::Open
+            }
+            RateLimitGate::Open => {}
+            _ => return Err(GitHubError::RateLimited),
+        }
+        Ok(())
+    }
+
+    fn defer_requests(&self, delay: Duration) -> Result<(), GitHubError> {
+        let mut gate = self
+            .rate_limit
+            .lock()
+            .map_err(|_| GitHubError::RateLimited)?;
+        let Some(deadline) = Instant::now().checked_add(delay) else {
+            *gate = RateLimitGate::Indefinite;
+            return Ok(());
+        };
+        match &*gate {
+            RateLimitGate::Indefinite => {}
+            RateLimitGate::Until(old) if *old >= deadline => {}
+            _ => *gate = RateLimitGate::Until(deadline),
+        }
+        Ok(())
     }
     fn jwt(&self, now: u64) -> Result<String, GitHubError> {
         let claims = Claims {
@@ -377,15 +516,15 @@ impl App {
             ))
             .map_err(|_| GitHubError::InvalidConfiguration)?;
         let mut response = self
-            .client
-            .post(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(jwt)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| GitHubError::Request)?;
+            .send(
+                self.client
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(jwt)
+                    .json(&body),
+            )
+            .await?;
         if !response.status().is_success() {
             return Err(GitHubError::Status(response.status().as_u16()));
         }
@@ -656,7 +795,7 @@ impl App {
         if let Some(etag) = &cached_etag {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag.clone());
         }
-        let mut response = request.send().await.map_err(|_| GitHubError::Request)?;
+        let mut response = self.send(request).await?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             if cached_etag.is_none() {
                 return Err(GitHubError::UnstableObservation);
@@ -1738,6 +1877,7 @@ impl App {
             {
                 return Err(DispatchError::StaleRef);
             }
+            self.check_rate_limit()?;
             if let Some(security) = security {
                 scheduler.claim_batch_dispatch_with_security(id, &workflow.path, &security)?
             } else if let Some(rules) = rules {
@@ -1755,6 +1895,7 @@ impl App {
             {
                 return Err(DispatchError::StaleRef);
             }
+            self.check_rate_limit()?;
             scheduler.claim_dispatch(id)?
         };
         if !claimed {
@@ -1765,14 +1906,11 @@ impl App {
             pending.plan.workflow_id
         );
         let url = self.api.join(&path).map_err(|_| DispatchError::Uncertain)?;
-        let mut response = self
-            .client
-            .post(url)
+        let mut response = self.send(self.client.post(url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2026-03-10")
             .bearer_auth(token.secret())
-            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "return_run_details": true, "inputs": {"sluss_host": host_label, "sluss_suites": pending.plan.suites.iter().cloned().collect::<Vec<_>>().join(",")}}))
-            .send()
+            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "return_run_details": true, "inputs": {"sluss_host": host_label, "sluss_suites": pending.plan.suites.iter().cloned().collect::<Vec<_>>().join(",")}})))
             .await
             .map_err(|_| DispatchError::Uncertain)?;
         if response.status() != reqwest::StatusCode::OK {
@@ -2343,6 +2481,7 @@ impl App {
         {
             return Err(MarkerCreationError::Scope);
         }
+        self.check_rate_limit()?;
         match journal.claim_marker_creation(&target, trusted)? {
             crate::landing::MarkerCreationState::Creating => {
                 return Err(MarkerCreationError::Uncertain);
@@ -2358,13 +2497,14 @@ impl App {
             .map_err(|_| MarkerCreationError::Scope)?;
         let body = serde_json::json!({"ref":plan.marker_ref,"sha":plan.base_sha});
         let mut response = self
-            .client
-            .post(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(write.secret())
-            .json(&body)
-            .send()
+            .send(
+                self.client
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(write.secret())
+                    .json(&body),
+            )
             .await
             .map_err(|_| MarkerCreationError::Uncertain)?;
         if response.status() != reqwest::StatusCode::CREATED {
@@ -2459,10 +2599,10 @@ impl App {
                 .api
                 .join("graphql")
                 .map_err(|_| GitHubError::InvalidConfiguration)?;
-            let mut response = app.client.post(url).header("Accept", "application/vnd.github+json")
+            let mut response = app.send(app.client.post(url).header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28").bearer_auth(token.secret())
-                .json(&serde_json::json!({"query":QUERY,"variables":{"owner":owner,"name":repository,"number":number}}))
-                .send().await.map_err(|_| GitHubError::Request)?;
+                .json(&serde_json::json!({"query":QUERY,"variables":{"owner":owner,"name":repository,"number":number}})))
+                .await?;
             if !response.status().is_success() {
                 return Err(GitHubError::Status(response.status().as_u16()));
             }
@@ -3081,6 +3221,7 @@ impl App {
         let (record, revision) = self
             .verify_staged_ci_inner(journal, (read, security), policy, trusted_ci, batch_id)
             .await?;
+        self.check_rate_limit()?;
         let intent = match journal.claim_pending_ci_check(&record, revision)? {
             PendingCiCheckClaim::Send(intent) => intent,
             PendingCiCheckClaim::Existing(
@@ -3121,13 +3262,14 @@ impl App {
             .map_err(|_| PendingCheckError::Scope)?;
         let body = serde_json::json!({"name":"sluss/verified","head_sha":intent.candidate.plan.staged_sha,"external_id":batch_id,"status":"in_progress","output":{"title":PENDING_CHECK_TITLE,"summary":pending_check_summary(&intent)}});
         let mut response = self
-            .client
-            .post(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(write.secret())
-            .json(&body)
-            .send()
+            .send(
+                self.client
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(write.secret())
+                    .json(&body),
+            )
             .await
             .map_err(|_| PendingCheckError::Uncertain)?;
         if response.status() != reqwest::StatusCode::CREATED {
@@ -3255,6 +3397,7 @@ impl App {
         if before.check_suite.id != target.suite_id {
             return Err(PendingCheckError::CandidateMismatch);
         }
+        self.check_rate_limit()?;
         if !journal.claim_pending_ci_cancellation(&target)? {
             return Err(PendingCheckError::Uncertain);
         }
@@ -3268,13 +3411,14 @@ impl App {
             .map_err(|_| PendingCheckError::Scope)?;
         let body = serde_json::json!({"status":"completed","conclusion":"cancelled","output":{"title":CANCELLED_CHECK_TITLE,"summary":cancelled_check_summary(&target.intent)}});
         let mut response = self
-            .client
-            .patch(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(write.secret())
-            .json(&body)
-            .send()
+            .send(
+                self.client
+                    .patch(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(write.secret())
+                    .json(&body),
+            )
             .await
             .map_err(|_| PendingCheckError::Uncertain)?;
         if response.status() != reqwest::StatusCode::OK {
@@ -3472,6 +3616,7 @@ impl App {
         if snapshot.run.id != intent.run_id || snapshot.run.head_sha != intent.integration_sha {
             return Err(FailureCheckError::Scope);
         }
+        self.check_rate_limit()?;
         if !scheduler.claim_failure_check(batch_id, app.id, &snapshot)? {
             return Err(FailureCheckError::Uncertain);
         }
@@ -3482,13 +3627,14 @@ impl App {
         let body = serde_json::json!({"name":"sluss/verified","head_sha":intent.integration_sha,"external_id":batch_id,
             "status":"completed","conclusion":"failure","output":{"title":"Staging CI failed","summary":format!("Recorded CI run {} failed. This check is not an attestation and does not authorize a merge.",intent.run_id)}});
         let mut response = self
-            .client
-            .post(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(write.secret())
-            .json(&body)
-            .send()
+            .send(
+                self.client
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(write.secret())
+                    .json(&body),
+            )
             .await
             .map_err(|_| FailureCheckError::Uncertain)?;
         if response.status() != reqwest::StatusCode::CREATED {
@@ -4749,6 +4895,7 @@ impl App {
         ) {
             return Ok(StaleCancellation::Uncertain);
         }
+        self.check_rate_limit()?;
         let claim = if let Some(run_id) = conflicting_run {
             scheduler.claim_conflict_cancellation(id, run_id)?
         } else {
@@ -4765,12 +4912,13 @@ impl App {
             .join(&format!("{path}/cancel"))
             .map_err(|_| DispatchError::Uncertain)?;
         let response = self
-            .client
-            .post(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(token.secret())
-            .send()
+            .send(
+                self.client
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(token.secret()),
+            )
             .await;
         match response {
             Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
@@ -4783,6 +4931,52 @@ impl App {
             }
             _ => Ok(StaleCancellation::Uncertain),
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::rate_limit_delay;
+    use reqwest::{
+        StatusCode,
+        header::{HeaderMap, HeaderValue, RETRY_AFTER},
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn honors_retry_and_primary_reset_without_treating_ordinary_forbidden_as_rate_limited() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            rate_limit_delay(StatusCode::FORBIDDEN, &headers, false, 1_000),
+            None
+        );
+        assert_eq!(
+            rate_limit_delay(StatusCode::FORBIDDEN, &headers, true, 1_000),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, &headers, false, 1_000),
+            Some(Duration::from_secs(60))
+        );
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("10"));
+        assert_eq!(
+            rate_limit_delay(StatusCode::FORBIDDEN, &headers, false, 1_000),
+            Some(Duration::from_secs(10))
+        );
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        headers.insert("x-ratelimit-reset", HeaderValue::from_static("1040"));
+        assert_eq!(
+            rate_limit_delay(StatusCode::FORBIDDEN, &headers, false, 1_000),
+            Some(Duration::from_secs(40))
+        );
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("999999999999999999999999999"),
+        );
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, &headers, false, 1_000),
+            Some(Duration::from_secs(u64::MAX))
+        );
     }
 }
 
