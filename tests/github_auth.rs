@@ -175,7 +175,8 @@ async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> 
 }
 async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
-    let sha = if state.mode.load(Ordering::SeqCst) == 16 {
+    let mode = state.mode.load(Ordering::SeqCst);
+    let sha = if mode == 16 || (mode == 228 && STAGE_REF_READS.fetch_add(1, Ordering::SeqCst) > 0) {
         "b"
     } else {
         "a"
@@ -1793,6 +1794,10 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
             get(default_workflow_tree),
         )
         .route(
+            "/repos/owner/repo/git/blobs/{blob_id}",
+            get(default_workflow_blob),
+        )
+        .route(
             "/repos/owner/repo/actions/workflows/17",
             get(doctor_workflow),
         )
@@ -1882,9 +1887,13 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
             .await,
         Err(DispatchError::GitHub(GitHubError::InvalidConfiguration))
     ));
-    for invalid in [240, 241, 242, 243, 244, 245, 246, 248, 249] {
+    for invalid in [
+        226, 227, 228, 229, 240, 241, 242, 243, 244, 245, 246, 248, 249, 250, 251, 252, 253, 254,
+        255,
+    ] {
         DEFAULT_REPO_READS.store(0, Ordering::SeqCst);
         DEFAULT_BRANCH_READS.store(0, Ordering::SeqCst);
+        STAGE_REF_READS.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
         assert!(
             client
@@ -2271,6 +2280,10 @@ async fn cli_dispatches_fixture() {
         .route(
             "/repos/owner/repo/git/trees/{tree_id}",
             get(default_workflow_tree),
+        )
+        .route(
+            "/repos/owner/repo/git/blobs/{blob_id}",
+            get(default_workflow_blob),
         )
         .route("/repos/owner/repo/pulls", get(open_pulls))
         .route("/repos/owner/repo/pulls/19", get(pull))
@@ -6236,8 +6249,8 @@ async fn cli_dispatches_fixture() {
     assert!(!doctor.status.success());
     let info = String::from_utf8_lossy(&doctor.stdout);
     assert!(info.contains("target: main"));
-    assert!(info.contains("workflow file exists on default branch main"));
-    assert!(info.contains("dispatch trigger and workflow trust are not verified"));
+    assert!(info.contains("workflow_dispatch declared on default branch main"));
+    assert!(info.contains("workflow trust is not verified"));
     assert!(info.contains("active branch rules returned: 2"));
     assert!(info.contains("authenticated GitHub App: sluss-test (ID 17)"));
     assert!(info.contains("active rulesets inspected: 1; bypass lists unavailable: 0"));
@@ -8014,6 +8027,19 @@ async fn default_branch_info(
     )
 }
 
+const WORKFLOW_GOOD: &str = "name: Test\non:\n  workflow_dispatch:\n";
+const WORKFLOW_NO_DISPATCH: &str = "on: push\n";
+const WORKFLOW_INVALID: &str = "on: [workflow_dispatch\n";
+static STAGE_REF_READS: AtomicUsize = AtomicUsize::new(0);
+
+fn test_blob_sha(contents: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hash = Sha1::new();
+    hash.update(format!("blob {}\0", contents.len()).as_bytes());
+    hash.update(contents.as_bytes());
+    hex::encode(hash.finalize())
+}
+
 async fn default_workflow_tree(
     State(state): State<ServerState>,
     Path(tree_id): Path<String>,
@@ -8027,14 +8053,26 @@ async fn default_workflow_tree(
         } else {
             vec![json!({"path":".github","mode":"040000","type":"tree","sha":"d".repeat(40)})]
         }
+    } else if tree_id == "a".repeat(40) {
+        vec![json!({"path":".github","mode":"040000","type":"tree","sha":"1".repeat(40)})]
     } else if tree_id == "d".repeat(40) {
         vec![json!({"path":"workflows","mode":"040000","type":"tree","sha":"e".repeat(40)})]
-    } else if tree_id == "e".repeat(40) {
-        if mode == 241 {
+    } else if tree_id == "1".repeat(40) {
+        vec![json!({"path":"workflows","mode":"040000","type":"tree","sha":"2".repeat(40)})]
+    } else if tree_id == "e".repeat(40) || tree_id == "2".repeat(40) {
+        let default = tree_id == "e".repeat(40);
+        let contents = if mode == 255 && default {
+            WORKFLOW_INVALID
+        } else if (mode == 250 && default) || (mode == 251 && !default) {
+            WORKFLOW_NO_DISPATCH
+        } else {
+            WORKFLOW_GOOD
+        };
+        if mode == 241 || (mode == 226 && !default) {
             vec![]
         } else {
             vec![
-                json!({"path":"ci.yml","mode":if mode==244 {"120000"} else {"100644"},"type":"blob","sha":"f".repeat(40)}),
+                json!({"path":"ci.yml","mode":if mode==244 {"120000"} else {"100644"},"type":"blob","sha":test_blob_sha(contents)}),
             ]
         }
     } else {
@@ -8046,4 +8084,32 @@ async fn default_workflow_tree(
     Json(
         json!({"sha":if mode==243 {"a".repeat(40)} else {tree_id},"truncated":mode==242,"tree":entries}),
     )
+}
+
+async fn default_workflow_blob(
+    State(state): State<ServerState>,
+    Path(blob_id): Path<String>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    use base64::Engine;
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let contents = [WORKFLOW_GOOD, WORKFLOW_NO_DISPATCH, WORKFLOW_INVALID]
+        .into_iter()
+        .find(|text| test_blob_sha(text) == blob_id)
+        .unwrap();
+    let changed = contents.replace("Test", "Nest");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(if mode == 229 {
+        changed.as_str()
+    } else {
+        contents
+    });
+    let size = if mode == 227 {
+        256 * 1024 + 1
+    } else {
+        contents.len() + usize::from(mode == 254)
+    };
+    Json(json!({"sha":if mode==253 {"f".repeat(40)} else {blob_id},
+        "size":size, "encoding":"base64",
+        "content":if mode==252 {"invalid?"} else {encoded.as_str()}}))
 }

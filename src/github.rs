@@ -24,8 +24,10 @@ pub enum GitHubError {
     InvalidResponse,
     #[error("GitHub data is invalid, incomplete, or changed during observation")]
     UnstableObservation,
-    #[error("the registered workflow file is absent or not a regular file on the default branch")]
+    #[error("the workflow file is absent or not a regular file in the inspected commit")]
     MissingDefaultWorkflow,
+    #[error("the workflow file is invalid, unsupported or does not declare workflow_dispatch")]
+    MissingWorkflowDispatch,
 }
 
 pub struct App {
@@ -1446,6 +1448,17 @@ impl App {
         let default_workflow = self
             .observe_default_workflow(token, owner, repository, &workflow)
             .await?;
+        let staged_blob = self
+            .workflow_blob_at_commit(
+                token,
+                owner,
+                repository,
+                &pending.plan.integration_sha,
+                &workflow.path,
+            )
+            .await?;
+        self.verify_dispatch_trigger(token, owner, repository, &staged_blob)
+            .await?;
         let claimed = if let Some((target, base)) = target_base {
             let rules = match self
                 .observe_branch_rules(token, owner, repository, target)
@@ -1500,6 +1513,13 @@ impl App {
             }
             self.recheck_default_workflow(token, owner, repository, &workflow, &default_workflow)
                 .await?;
+            let last_ref: DispatchRef = self.get_json(token, &ref_path, None).await?;
+            if last_ref.reference != pending.plan.staging_ref
+                || last_ref.object.kind != "commit"
+                || last_ref.object.sha != pending.plan.integration_sha
+            {
+                return Err(DispatchError::StaleRef);
+            }
             if let Some(security) = security {
                 scheduler.claim_batch_dispatch_with_security(id, &workflow.path, &security)?
             } else if let Some(rules) = rules {
@@ -1510,6 +1530,13 @@ impl App {
         } else {
             self.recheck_default_workflow(token, owner, repository, &workflow, &default_workflow)
                 .await?;
+            let last_ref: DispatchRef = self.get_json(token, &ref_path, None).await?;
+            if last_ref.reference != pending.plan.staging_ref
+                || last_ref.object.kind != "commit"
+                || last_ref.object.sha != pending.plan.integration_sha
+            {
+                return Err(DispatchError::StaleRef);
+            }
             scheduler.claim_dispatch(id)?
         };
         if !claimed {
@@ -4100,7 +4127,7 @@ impl App {
     }
 
     /// Verify the active workflow's file is a regular blob at a stable default
-    /// branch commit. This does not parse workflow_dispatch or prove trust.
+    /// branch commit and declares workflow_dispatch. This does not prove trust.
     pub async fn observe_default_workflow(
         &self,
         token: &InstallationToken,
@@ -4108,20 +4135,6 @@ impl App {
         repository: &str,
         workflow: &WorkflowInfo,
     ) -> Result<DefaultWorkflowPresence, GitHubError> {
-        #[derive(Deserialize)]
-        struct Tree {
-            sha: String,
-            truncated: bool,
-            tree: Vec<Entry>,
-        }
-        #[derive(Deserialize)]
-        struct Entry {
-            path: String,
-            mode: String,
-            #[serde(rename = "type")]
-            kind: String,
-            sha: String,
-        }
         if !valid_name(owner)
             || !valid_name(repository)
             || workflow.state != "active"
@@ -4139,11 +4152,65 @@ impl App {
         let branch1 = self
             .observe_target_branch(token, owner, repository, &repo1.default_branch)
             .await?;
-        let mut tree_sha = branch1.commit.sha.clone();
-        let filename = workflow
-            .path
+        let tree_sha = self
+            .workflow_blob_at_commit(
+                token,
+                owner,
+                repository,
+                &branch1.commit.sha,
+                &workflow.path,
+            )
+            .await?;
+        self.verify_dispatch_trigger(token, owner, repository, &tree_sha)
+            .await?;
+        let branch2 = self
+            .observe_target_branch(token, owner, repository, &repo1.default_branch)
+            .await?;
+        let repo2: DefaultRepository = self.get_json(token, &root, None).await?;
+        if repo1 != repo2 || branch1 != branch2 {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(DefaultWorkflowPresence {
+            branch: repo1.default_branch,
+            commit_sha: branch1.commit.sha,
+            blob_sha: tree_sha,
+        })
+    }
+
+    async fn workflow_blob_at_commit(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<String, GitHubError> {
+        #[derive(Deserialize)]
+        struct Tree {
+            sha: String,
+            truncated: bool,
+            tree: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            path: String,
+            mode: String,
+            #[serde(rename = "type")]
+            kind: String,
+            sha: String,
+        }
+        if !valid_name(owner)
+            || !valid_name(repository)
+            || !commit_sha(commit)
+            || !valid_workflow_path(path)
+        {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let root = format!("repos/{owner}/{repository}");
+        let filename = path
             .strip_prefix(".github/workflows/")
             .ok_or(GitHubError::InvalidConfiguration)?;
+        let mut tree_sha = commit.to_owned();
         for (component, kind, modes) in [
             (".github", "tree", &["040000"][..]),
             ("workflows", "tree", &["040000"][..]),
@@ -4166,18 +4233,63 @@ impl App {
             }
             tree_sha = entry.sha.clone();
         }
-        let branch2 = self
-            .observe_target_branch(token, owner, repository, &repo1.default_branch)
-            .await?;
-        let repo2: DefaultRepository = self.get_json(token, &root, None).await?;
-        if repo1 != repo2 || branch1 != branch2 {
-            return Err(GitHubError::UnstableObservation);
+        Ok(tree_sha)
+    }
+
+    async fn verify_dispatch_trigger(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        expected_sha: &str,
+    ) -> Result<(), GitHubError> {
+        use base64::Engine;
+        use sha1::{Digest, Sha1};
+        #[derive(Deserialize)]
+        struct Blob {
+            sha: String,
+            size: usize,
+            encoding: String,
+            content: String,
         }
-        Ok(DefaultWorkflowPresence {
-            branch: repo1.default_branch,
-            commit_sha: branch1.commit.sha,
-            blob_sha: tree_sha,
-        })
+        if !commit_sha(expected_sha) {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let blob: Blob = self
+            .get_json(
+                token,
+                &format!("repos/{owner}/{repository}/git/blobs/{expected_sha}"),
+                None,
+            )
+            .await?;
+        if blob.sha != expected_sha
+            || blob.encoding != "base64"
+            || blob.size == 0
+            || blob.size > 256 * 1024
+        {
+            return Err(GitHubError::MissingWorkflowDispatch);
+        }
+        let encoded: String = blob
+            .content
+            .chars()
+            .filter(|character| *character != '\n' && *character != '\r')
+            .collect();
+        let contents = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| GitHubError::MissingWorkflowDispatch)?;
+        if contents.len() != blob.size {
+            return Err(GitHubError::MissingWorkflowDispatch);
+        }
+        let mut hash = Sha1::new();
+        hash.update(format!("blob {}\0", contents.len()).as_bytes());
+        hash.update(&contents);
+        if hex::encode(hash.finalize()) != expected_sha
+            || !crate::workflow::has_dispatch(&contents)
+                .map_err(|_| GitHubError::MissingWorkflowDispatch)?
+        {
+            return Err(GitHubError::MissingWorkflowDispatch);
+        }
+        Ok(())
     }
 
     async fn recheck_default_workflow(
@@ -4252,6 +4364,17 @@ impl App {
         }
         let default_workflow = self
             .observe_default_workflow(token, owner, repository, &workflow2)
+            .await?;
+        let target_blob = self
+            .workflow_blob_at_commit(
+                token,
+                owner,
+                repository,
+                &branch2.commit.sha,
+                &workflow2.path,
+            )
+            .await?;
+        self.verify_dispatch_trigger(token, owner, repository, &target_blob)
             .await?;
         self.recheck_default_workflow(token, owner, repository, &workflow2, &default_workflow)
             .await?;

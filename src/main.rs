@@ -1221,7 +1221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 preflight.workflow.id, preflight.workflow.path, preflight.workflow.state
             );
             println!(
-                "workflow file exists on default branch {} at {}; dispatch trigger and workflow trust are not verified",
+                "workflow_dispatch declared on default branch {} at {} and on the selected target; workflow trust is not verified",
                 preflight.default_workflow.branch, preflight.default_workflow.commit_sha
             );
             let runners = app
