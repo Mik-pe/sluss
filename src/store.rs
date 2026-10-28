@@ -70,6 +70,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS candidate_stability (number INTEGER PRIMARY KEY, changed_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS batch_selection (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -710,6 +711,79 @@ impl Store {
             .optional()?;
         row.map(|(body, version)| Ok((serde_json::from_str(&body)?, version)))
             .transpose()
+    }
+
+    /// Return a previously frozen selective plan, if any.
+    pub fn batch_selection(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::selective::FrozenSelection>, StoreError> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM batch_selection WHERE batch_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        body.map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
+    }
+    /// Freeze a selection only while its batch and admission evidence are current.
+    pub fn record_selection(
+        &mut self,
+        id: &str,
+        selection: &crate::selective::FrozenSelection,
+    ) -> Result<(), StoreError> {
+        let digest = &selection.policy_digest;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || selection.selection.suites().is_empty()
+            || selection.selection.suites().len() > 100
+            || selection.selection.suites().iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 100
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            })
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (batch, _) = checked_batch(&tx, id)?;
+        if batch.base_sha != selection.base_sha
+            || batch.state
+                != (State::Testing {
+                    integration_sha: selection.integration_sha.clone(),
+                })
+        {
+            return Err(StoreError::StaleBatch);
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT body FROM batch_selection WHERE batch_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(body) = existing {
+            let old: crate::selective::FrozenSelection = serde_json::from_str(&body)?;
+            if old != *selection {
+                return Err(StoreError::Conflict);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO batch_selection(batch_id,body) VALUES(?1,?2)",
+                params![id, serde_json::to_string(selection)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Return the declared-file policy digest for a prepared batch.

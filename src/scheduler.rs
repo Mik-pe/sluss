@@ -383,6 +383,11 @@ pub struct DispatchPlan {
     /// Exact required GitHub job names, frozen before dispatch.
     #[serde(default)]
     pub required_jobs: std::collections::BTreeSet<String>,
+    /// Explicit workflow suites and optional operator-owned selection policy.
+    #[serde(default)]
+    pub suites: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub selection_policy_digest: Option<String>,
 }
 impl DispatchPlan {
     fn valid(&self) -> bool {
@@ -398,6 +403,19 @@ impl DispatchPlan {
             && self.workflow_id != 0
             && hex(&self.integration_sha, 40)
             && hex(&self.policy_digest, 64)
+            && !self.suites.is_empty()
+            && self.suites.len() <= 100
+            && self.suites.iter().all(|name| {
+                !name.is_empty()
+                    && name.len() <= 100
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            })
+            && match &self.selection_policy_digest {
+                Some(digest) => hex(digest, 64),
+                None => self.suites.len() == 1 && self.suites.contains("full"),
+            }
             && !self.required_jobs.is_empty()
             && self.required_jobs.len() <= 100
             && self.required_jobs.iter().all(|name| {
@@ -692,6 +710,24 @@ fn validate_batch_dispatch(
         .optional()?;
     if policy.as_deref() != Some(&plan.policy_digest) {
         return Err(SchedulerError::StaleBatch);
+    }
+    if let Some(digest) = &plan.selection_policy_digest {
+        let body: Option<String> = tx
+            .query_row(
+                "SELECT body FROM batch_selection WHERE batch_id=?1",
+                [batch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let selection: crate::selective::FrozenSelection =
+            serde_json::from_str(&body.ok_or(SchedulerError::StaleBatch)?)?;
+        if &selection.policy_digest != digest
+            || selection.base_sha != batch.base_sha
+            || selection.integration_sha != plan.integration_sha
+            || selection.selection.suites() != &plan.suites
+        {
+            return Err(SchedulerError::StaleBatch);
+        }
     }
     for candidate in batch.candidates {
         let number = i64::try_from(candidate.number).map_err(|_| SchedulerError::StaleBatch)?;

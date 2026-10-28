@@ -221,9 +221,14 @@ async fn dispatch_post(
 ) -> (StatusCode, Json<Value>) {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     assert_eq!(headers["x-github-api-version"], "2026-03-10");
+    let suites = if state.mode.load(Ordering::SeqCst) == 33 {
+        "api-tests,ui-tests"
+    } else {
+        "full"
+    };
     assert_eq!(
         body,
-        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "inputs":{"sluss_host":"sluss-host-test"}})
+        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "inputs":{"sluss_host":"sluss-host-test","sluss_suites":suites}})
     );
     state.permissions.fetch_add(1, Ordering::SeqCst);
     if state.mode.load(Ordering::SeqCst) == 17 {
@@ -867,6 +872,8 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
         policy_digest: "b".repeat(64),
         required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
+        suites: std::collections::BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
     };
     let req = Request {
         pools: BTreeMap::from([("rust".into(), 1)]),
@@ -1107,6 +1114,7 @@ async fn staging_tokens_are_scoped_and_never_sent_from_a_non_github_origin() {
 async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     use sluss::{
         batch::Candidate,
+        selective::{FrozenSelection, Policy, Selection},
         store::{AdmissionCandidate, Store},
         webhook::Inbox,
     };
@@ -1189,6 +1197,23 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     store
         .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
         .unwrap();
+    let policy = data.path().join("verification.toml");
+    let policy_text = include_str!("../examples/verification.toml");
+    std::fs::write(&policy, policy_text).unwrap();
+    store
+        .record_selection(
+            id,
+            &FrozenSelection {
+                base_sha: "b".repeat(40),
+                integration_sha: "a".repeat(40),
+                policy_digest: Policy::load(&policy).unwrap().digest().unwrap(),
+                selection: Selection::Selected {
+                    suites: ["api-tests".into(), "ui-tests".into()].into(),
+                    components: ["api".into(), "ui".into()].into(),
+                },
+            },
+        )
+        .unwrap();
     drop(store);
     let launch = |args: Vec<String>| {
         let db = db.clone();
@@ -1203,6 +1228,43 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
                 .unwrap()
         })
     };
+    let dispatch_args = || {
+        vec![
+            "dispatch-github".into(),
+            "--batch-id".into(),
+            id.into(),
+            "--config".into(),
+            config.to_str().unwrap().into(),
+            "--capacity".into(),
+            capacity.to_str().unwrap().into(),
+            "--pool".into(),
+            "rust=1".into(),
+            "--workflow-id".into(),
+            "17".into(),
+            "--required-job".into(),
+            "job-1-0".into(),
+        ]
+    };
+    let missing = launch(dispatch_args()).await.unwrap();
+    assert!(!missing.status.success());
+    let mut changed_args = dispatch_args();
+    changed_args.extend([
+        "--verification-policy".into(),
+        policy.to_str().unwrap().into(),
+    ]);
+    std::fs::write(
+        &policy,
+        policy_text.replace(
+            "always_full = [\"ci/\"]",
+            "always_full = [\"ci/\", \"scripts/\"]",
+        ),
+    )
+    .unwrap();
+    let changed = launch(changed_args).await.unwrap();
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("verification policy changed"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    std::fs::write(&policy, policy_text).unwrap();
     mode.store(29, Ordering::SeqCst);
     let unstable = launch(vec![
         "dispatch-github".into(),
@@ -1218,6 +1280,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         "17".into(),
         "--required-job".into(),
         "job-1-0".into(),
+        "--verification-policy".into(),
+        policy.to_str().unwrap().into(),
     ])
     .await
     .unwrap();
@@ -1240,13 +1304,15 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         "17".into(),
         "--required-job".into(),
         "job-1-0".into(),
+        "--verification-policy".into(),
+        policy.to_str().unwrap().into(),
     ])
     .await
     .unwrap();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("RunnerMismatch"));
     assert_eq!(posts.load(Ordering::SeqCst), 0);
-    mode.store(0, Ordering::SeqCst);
+    mode.store(33, Ordering::SeqCst);
     let output = launch(vec![
         "dispatch-github".into(),
         "--batch-id".into(),
@@ -1261,6 +1327,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         "17".into(),
         "--required-job".into(),
         "job-1-0".into(),
+        "--verification-policy".into(),
+        policy.to_str().unwrap().into(),
     ])
     .await
     .unwrap();
@@ -1273,6 +1341,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         String::from_utf8_lossy(&output.stdout)
             .contains("dispatched run 123 to reserved host sluss-host-test")
     );
+    mode.store(0, Ordering::SeqCst);
     let output = launch(vec![
         "observe-dispatch".into(),
         "--batch-id".into(),

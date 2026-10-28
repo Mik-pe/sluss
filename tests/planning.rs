@@ -207,6 +207,8 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
         staging_ref: format!("refs/heads/sluss/{id}"),
         policy_digest: "c".repeat(64),
         required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
+        suites: std::collections::BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
     };
     assert!(
         scheduler
@@ -550,6 +552,8 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
         staging_ref: format!("refs/heads/sluss/{id}"),
         policy_digest: "c".repeat(64),
         required_jobs: BTreeSet::from(["test".into()]),
+        suites: std::collections::BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
     };
     scheduler
         .reserve_batch_dispatch(id, &Request { pools }, &plan)

@@ -46,6 +46,16 @@ enum Command {
         #[arg(long)]
         head_sha: String,
     },
+    /// Freeze a selective plan for an already prepared batch.
+    SelectBatch {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        policy: PathBuf,
+        /// Local repository containing both frozen commits.
+        #[arg(long)]
+        source: PathBuf,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -108,6 +118,9 @@ enum Command {
         /// Exact GitHub job name required for this run; repeat if needed.
         #[arg(long, required = true)]
         required_job: Vec<String>,
+        /// Operator-controlled selective policy used by `select-batch`, if any.
+        #[arg(long)]
+        verification_policy: Option<PathBuf>,
     },
     /// Observe a dispatched run and check the reserved host's runner IDs.
     ObserveDispatch {
@@ -370,6 +383,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("selection is not CI evidence or merge authorization");
         }
+        Command::SelectBatch {
+            batch_id,
+            policy,
+            source,
+        } => {
+            let mut store = store;
+            let batch = store.batch(&batch_id)?.ok_or("unknown batch")?.0;
+            let sha = match batch.state {
+                sluss::batch::State::Testing { integration_sha } => integration_sha,
+                _ => return Err("batch has not been staged for testing".into()),
+            };
+            let policy = sluss::selective::Policy::load(&policy)?;
+            let selection = policy.select_git(&source, &batch.base_sha, &sha)?;
+            let frozen = sluss::selective::FrozenSelection {
+                base_sha: batch.base_sha,
+                integration_sha: sha,
+                policy_digest: policy.digest()?,
+                selection,
+            };
+            store.record_selection(&batch_id, &frozen)?;
+            println!(
+                "frozen verification selection for {} (policy {})",
+                batch_id, frozen.policy_digest
+            );
+            for suite in frozen.selection.suites() {
+                println!("{suite}");
+            }
+            println!("selection is not CI evidence or merge authorization");
+        }
         Command::Plan {
             id,
             base_sha,
@@ -461,6 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool,
             workflow_id,
             required_job,
+            verification_policy,
         } => {
             let config = sluss::config::Config::load(&config)?;
             if store.repository_scope()?
@@ -479,6 +522,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let policy_digest = store
                 .batch_policy_digest(&batch_id)?
                 .ok_or("batch has no policy snapshot")?;
+            let (suites, selection_policy_digest) =
+                match (store.batch_selection(&batch_id)?, verification_policy) {
+                    (Some(frozen), Some(path)) => {
+                        let policy = sluss::selective::Policy::load(&path)?;
+                        if policy.digest()? != frozen.policy_digest {
+                            return Err("verification policy changed after selection".into());
+                        }
+                        (
+                            frozen.selection.suites().clone(),
+                            Some(frozen.policy_digest),
+                        )
+                    }
+                    (Some(_), None) => {
+                        return Err("the frozen selection requires --verification-policy".into());
+                    }
+                    (None, Some(_)) => {
+                        return Err(
+                            "run select-batch before supplying a verification policy".into()
+                        );
+                    }
+                    (None, None) => (std::collections::BTreeSet::from(["full".into()]), None),
+                };
             let plan = sluss::scheduler::DispatchPlan {
                 installation_id: config.github.installation_id as u64,
                 repository_id: config.github.repository_id as u64,
@@ -487,6 +552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 staging_ref: format!("refs/heads/sluss/{batch_id}"),
                 policy_digest,
                 required_jobs: required_job.into_iter().collect(),
+                suites,
+                selection_policy_digest,
             };
             let request = sluss::scheduler::Request {
                 pools: parse_pools(&pool)?,

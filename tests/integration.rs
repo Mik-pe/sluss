@@ -457,6 +457,37 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
         git(remote.path(), &["rev-parse", &prepared.reference]),
         prepared.sha
     );
+    let policy = data.path().join("verification.toml");
+    std::fs::write(
+        &policy,
+        "version = 1\nfull_suites = ['fast', 'all']\n[[components]]\nname = 'feature'\npaths = ['feature']\nsuites = ['fast']\n",
+    )
+    .unwrap();
+    let select = || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db)
+            .args(["select-batch", "--batch-id", id, "--policy"])
+            .arg(&policy)
+            .arg("--source")
+            .arg(remote.path())
+            .output()
+            .unwrap()
+    };
+    let selected = select();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert!(String::from_utf8_lossy(&selected.stdout).contains("fast"));
+    let frozen = store.batch_selection(id).unwrap().unwrap();
+    assert_eq!(frozen.base_sha, base);
+    assert_eq!(frozen.integration_sha, prepared.sha);
+    assert!(select().status.success());
+    std::fs::write(&policy, "version = 1\nfull_suites = ['different']\n").unwrap();
+    assert!(!select().status.success());
+    assert_eq!(store.batch_selection(id).unwrap().unwrap(), frozen);
     let pools = BTreeMap::from([("rust".into(), 1)]);
     let mut scheduler = Scheduler::open(
         &db,
@@ -482,12 +513,21 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
         staging_ref: prepared.reference,
         policy_digest: "c".repeat(64),
         required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
+        suites: std::collections::BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
     };
     assert!(matches!(
         scheduler.reserve_batch_dispatch(id, &request, &plan),
         Err(SchedulerError::StaleBatch)
     ));
     plan.policy_digest = prepared.policy_digest;
+    plan.suites = std::collections::BTreeSet::from(["fast".into()]);
+    plan.selection_policy_digest = Some("d".repeat(64));
+    assert!(matches!(
+        scheduler.reserve_batch_dispatch(id, &request, &plan),
+        Err(SchedulerError::StaleBatch)
+    ));
+    plan.selection_policy_digest = Some(frozen.policy_digest);
     assert!(
         scheduler
             .reserve_batch_dispatch(id, &request, &plan)

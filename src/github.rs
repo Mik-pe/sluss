@@ -828,7 +828,7 @@ impl App {
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2026-03-10")
             .bearer_auth(token.secret())
-            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "inputs": {"sluss_host": host_label}}))
+            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "inputs": {"sluss_host": host_label, "sluss_suites": pending.plan.suites.iter().cloned().collect::<Vec<_>>().join(",")}}))
             .send()
             .await
             .map_err(|_| DispatchError::Uncertain)?;

@@ -1,6 +1,6 @@
 //! Conservative selection from an operator-owned verification policy.
 //! Selection is not CI evidence and does not authorize landing.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     io::Read,
@@ -9,7 +9,7 @@ use std::{
 };
 use thiserror::Error;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub version: u32,
@@ -18,7 +18,7 @@ pub struct Policy {
     pub always_full: Vec<String>,
     pub components: Vec<Component>,
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Component {
     pub name: String,
@@ -28,7 +28,7 @@ pub struct Component {
     #[serde(default)]
     pub suites: Vec<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Selection {
     Full {
         suites: BTreeSet<String>,
@@ -52,7 +52,31 @@ pub enum SelectionError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSelection {
+    pub base_sha: String,
+    pub integration_sha: String,
+    pub policy_digest: String,
+    pub selection: Selection,
+}
+impl Selection {
+    pub fn suites(&self) -> &BTreeSet<String> {
+        match self {
+            Self::Full { suites, .. } | Self::Selected { suites, .. } => suites,
+        }
+    }
+}
 impl Policy {
+    /// Hash the parsed operator policy, independent of TOML formatting.
+    pub fn digest(&self) -> Result<String, SelectionError> {
+        use sha2::Digest;
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| SelectionError::InvalidPolicy)?;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"sluss-selective-policy-v1\0");
+        hash.update(bytes);
+        Ok(hex::encode(hash.finalize()))
+    }
     pub fn load(path: &Path) -> Result<Self, SelectionError> {
         let bytes = std::fs::read(path)?;
         if bytes.len() > 65536 {

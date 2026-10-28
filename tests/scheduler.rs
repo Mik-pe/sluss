@@ -144,6 +144,8 @@ fn dispatch_plan() -> sluss::scheduler::DispatchPlan {
         staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
         policy_digest: "b".repeat(64),
         required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
+        suites: std::collections::BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
     }
 }
 
