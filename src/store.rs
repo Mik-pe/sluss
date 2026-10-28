@@ -28,6 +28,11 @@ pub enum StoreError {
     Unbound,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionCandidate {
+    pub candidate: Candidate,
+    pub evidence_digest: String,
+}
 pub struct Store {
     conn: Connection,
 }
@@ -49,6 +54,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS candidate_evidence (number INTEGER PRIMARY KEY, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS repository_binding (
                 id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
             );",
@@ -92,7 +99,19 @@ impl Store {
             WHERE candidates.head_sha != excluded.head_sha",
             params![candidate.number as i64, candidate.head_sha],
         )?;
-        invalidate_batches(&tx, candidate.number, Some(&candidate.head_sha))?;
+        let removed_evidence = tx.execute(
+            "DELETE FROM candidate_evidence WHERE number=?1",
+            [candidate.number as i64],
+        )?;
+        invalidate_batches(
+            &tx,
+            candidate.number,
+            if removed_evidence > 0 {
+                None
+            } else {
+                Some(&candidate.head_sha)
+            },
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -103,6 +122,10 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let removed = tx.execute("DELETE FROM candidates WHERE number=?1", [sql_number])? != 0;
+        tx.execute(
+            "DELETE FROM candidate_evidence WHERE number=?1",
+            [sql_number],
+        )?;
         invalidate_batches(&tx, number, None)?;
         tx.commit()?;
         Ok(removed)
@@ -116,6 +139,34 @@ impl Store {
         job: &crate::webhook::Reconciliation,
         policy_digest: &str,
         candidates: &[Candidate],
+    ) -> Result<(), StoreError> {
+        self.apply_reconciliation_inner(job, policy_digest, candidates, None)
+    }
+    /// Apply observed review and authorization evidence with the queue update.
+    pub fn apply_admission_reconciliation(
+        &mut self,
+        job: &crate::webhook::Reconciliation,
+        policy_digest: &str,
+        admitted: &[AdmissionCandidate],
+    ) -> Result<(), StoreError> {
+        let candidates: Vec<Candidate> = admitted.iter().map(|v| v.candidate.clone()).collect();
+        let digests: Vec<String> = admitted.iter().map(|v| v.evidence_digest.clone()).collect();
+        if digests.iter().any(|d| {
+            d.len() != 64
+                || !d
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(StoreError::InvalidCandidate);
+        }
+        self.apply_reconciliation_inner(job, policy_digest, &candidates, Some(&digests))
+    }
+    fn apply_reconciliation_inner(
+        &mut self,
+        job: &crate::webhook::Reconciliation,
+        policy_digest: &str,
+        candidates: &[Candidate],
+        digests: Option<&[String]>,
     ) -> Result<(), StoreError> {
         if job.installation <= 0
             || job.repository <= 0
@@ -185,10 +236,35 @@ impl Store {
         for number in old {
             if !numbers.contains(&number) {
                 tx.execute("DELETE FROM candidates WHERE number=?1", [number as i64])?;
+                tx.execute(
+                    "DELETE FROM candidate_evidence WHERE number=?1",
+                    [number as i64],
+                )?;
                 invalidate_batches(&tx, number, None)?;
             }
         }
-        for candidate in candidates {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let existing_evidence: Option<String> = tx
+                .query_row(
+                    "SELECT digest FROM candidate_evidence WHERE number=?1",
+                    [candidate.number as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let new_evidence = digests.map(|values| values[index].as_str());
+            if existing_evidence.as_deref() != new_evidence {
+                invalidate_batches(&tx, candidate.number, None)?;
+            }
+            if let Some(digest) = new_evidence {
+                tx.execute("INSERT INTO candidate_evidence(number,digest) VALUES(?1,?2) ON CONFLICT(number) DO UPDATE SET digest=excluded.digest", params![candidate.number as i64, digest])?;
+            } else {
+                tx.execute(
+                    "DELETE FROM candidate_evidence WHERE number=?1",
+                    [candidate.number as i64],
+                )?;
+                // Without admission evidence no existing batch may remain usable.
+                invalidate_batches(&tx, candidate.number, None)?;
+            }
             tx.execute("INSERT INTO candidates(number,head_sha,sequence) VALUES(?1,?2,(SELECT COALESCE(MAX(sequence),0)+1 FROM candidates)) ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,sequence=excluded.sequence WHERE candidates.head_sha!=excluded.head_sha",params![candidate.number as i64,candidate.head_sha])?;
             invalidate_batches(&tx, candidate.number, Some(&candidate.head_sha))?;
         }
@@ -307,6 +383,16 @@ impl Store {
                     return Err(StoreError::InvalidCandidate);
                 }
                 if !occupied.contains(&number) {
+                    let evidence: Option<String> = tx
+                        .query_row(
+                            "SELECT digest FROM candidate_evidence WHERE number=?1",
+                            [number as i64],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if evidence.is_none() {
+                        return Err(StoreError::InvalidCandidate);
+                    }
                     selected.push(Candidate {
                         number,
                         head_sha: sha,
@@ -326,6 +412,17 @@ impl Store {
             "INSERT INTO batches(id,version,body) VALUES(?1,0,?2)",
             params![id, serde_json::to_string(&batch)?],
         )?;
+        for candidate in &batch.candidates {
+            let digest: String = tx.query_row(
+                "SELECT digest FROM candidate_evidence WHERE number=?1",
+                [candidate.number as i64],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO batch_evidence(batch_id,number,digest) VALUES(?1,?2,?3)",
+                params![id, candidate.number as i64, digest],
+            )?;
+        }
         tx.commit()?;
         Ok(Some(batch))
     }

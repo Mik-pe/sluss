@@ -37,6 +37,8 @@ async fn permission(State(state): State<ServerState>, headers: HeaderMap) -> Jso
     let count = state.permissions.fetch_add(1, Ordering::SeqCst);
     let access = if mode == 7 || (mode == 9 && count > 0) {
         "read"
+    } else if mode == 25 || mode == 26 {
+        "admin"
     } else {
         "write"
     };
@@ -73,7 +75,10 @@ async fn reviews(
     } else {
         1
     };
-    let items: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"user":{"id":9,"login":"reviewer","type":"User"},"state":"APPROVED","commit_id":"a".repeat(40),"submitted_at":"2026-01-01T00:00:00Z"})).collect();
+    let mut items: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"user":{"id":9,"login":"reviewer","type":"User"},"state":"APPROVED","commit_id":"a".repeat(40),"submitted_at":"2026-01-01T00:00:00Z"})).collect();
+    if matches!(state.mode.load(Ordering::SeqCst), 24 | 26) {
+        items.push(json!({"id":2,"user":{"id":9,"login":"reviewer","type":"User"},"state":"COMMENTED","commit_id":"a".repeat(40),"submitted_at":"2026-01-02T00:00:00Z"}));
+    }
     Json(json!(items))
 }
 async fn open_pulls(
@@ -410,6 +415,10 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .unwrap();
     assert_eq!(store.candidates().unwrap()[0].head_sha, "a".repeat(40));
     assert!(inbox.pending().unwrap().is_empty());
+    let frozen = store
+        .plan_batch("batch-0123456789abcdef", &"b".repeat(40), 4, 1)
+        .unwrap()
+        .unwrap();
     inbox
         .record("reconcile-other", "pull_request", &[3; 32], 42, 7)
         .unwrap();
@@ -426,6 +435,41 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     sluss::reconcile::reconcile_once(&client, &token, &mut store, &other_job, &config)
         .await
         .unwrap();
+    assert_eq!(
+        store.batch(&frozen.id).unwrap().unwrap().0.state,
+        sluss::batch::State::Planned
+    );
+    inbox
+        .record("permission-changed", "repository", &[6; 32], 42, 7)
+        .unwrap();
+    let permission_job = inbox.pending().unwrap().remove(0);
+    mode.store(25, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &permission_job, &config)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.batch(&frozen.id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    let frozen = store
+        .plan_batch("batch-1123456789abcdef", &"b".repeat(40), 4, 1)
+        .unwrap()
+        .unwrap();
+    mode.store(0, Ordering::SeqCst);
+    inbox
+        .record("review-comment", "pull_request_review", &[7; 32], 42, 7)
+        .unwrap();
+    let review_job = inbox.pending().unwrap().remove(0);
+    mode.store(26, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &review_job, &config)
+        .await
+        .unwrap();
+    assert_eq!(store.candidates().unwrap()[0].head_sha, "a".repeat(40));
+    assert!(matches!(
+        store.batch(&frozen.id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    mode.store(0, Ordering::SeqCst);
     inbox
         .record("reconcile-2", "pull_request", &[2; 32], 42, 7)
         .unwrap();

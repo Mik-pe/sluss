@@ -235,7 +235,7 @@ impl App {
 
 /// An observation is not an admission decision: reviewer permissions, branch
 /// protection and concurrent provider changes must still be validated.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullObservation {
     pub number: u64,
     pub state: String,
@@ -245,33 +245,33 @@ pub struct PullObservation {
     pub base: PullBase,
     pub labels: Vec<PullLabel>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullUser {
     pub id: u64,
     pub login: String,
     #[serde(rename = "type")]
     pub kind: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullHead {
     pub sha: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullBase {
     pub sha: String,
     #[serde(rename = "ref")]
     pub branch: String,
     pub repo: PullRepository,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullRepository {
     pub id: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullLabel {
     pub name: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReviewObservation {
     pub id: u64,
     pub user: Option<PullUser>,
@@ -279,7 +279,7 @@ pub struct ReviewObservation {
     pub commit_id: Option<String>,
     pub submitted_at: Option<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PullSnapshot {
     pub pull: PullObservation,
     pub reviews: Vec<ReviewObservation>,
@@ -412,6 +412,8 @@ pub struct AuthorizedPullObservation {
     pub snapshot: PullSnapshot,
     /// IDs with verified write or admin base permission at observation time.
     pub authorized_reviewers: std::collections::BTreeSet<u64>,
+    /// Stable per-reviewer permission values observed during this scan.
+    pub reviewer_permissions: BTreeMap<u64, String>,
 }
 #[derive(Deserialize, PartialEq, Eq)]
 struct PermissionObservation {
@@ -460,6 +462,7 @@ impl App {
             );
         }
         let mut authorized = std::collections::BTreeSet::new();
+        let mut reviewer_permissions = BTreeMap::new();
         for (id, login) in &reviewers {
             let current = self
                 .permission(token, owner, repository, *id, login)
@@ -467,6 +470,7 @@ impl App {
             if first_permissions.get(id) != Some(&current) {
                 return Err(GitHubError::UnstableObservation);
             }
+            reviewer_permissions.insert(*id, current.permission.clone());
             match current.permission.as_str() {
                 "admin" | "write" => {
                     authorized.insert(*id);
@@ -482,6 +486,7 @@ impl App {
         Ok(AuthorizedPullObservation {
             snapshot: last,
             authorized_reviewers: authorized,
+            reviewer_permissions,
         })
     }
     async fn permission(

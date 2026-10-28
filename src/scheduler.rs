@@ -663,6 +663,23 @@ fn validate_batch_dispatch(
         if head.as_deref() != Some(&candidate.head_sha) {
             return Err(SchedulerError::StaleBatch);
         }
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT digest FROM candidate_evidence WHERE number=?1",
+                [number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let frozen: Option<String> = tx
+            .query_row(
+                "SELECT digest FROM batch_evidence WHERE batch_id=?1 AND number=?2",
+                params![batch_id, number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current.is_none() || current != frozen {
+            return Err(SchedulerError::StaleBatch);
+        }
     }
     Ok(())
 }

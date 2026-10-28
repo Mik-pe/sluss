@@ -1,10 +1,19 @@
 use sluss::{
     batch::{Candidate, State},
-    store::{Store, StoreError},
+    store::{AdmissionCandidate, Store, StoreError},
     webhook::Inbox,
 };
 use std::sync::{Arc, Barrier};
 
+fn with_evidence(candidates: &[Candidate]) -> Vec<AdmissionCandidate> {
+    candidates
+        .iter()
+        .map(|c| AdmissionCandidate {
+            candidate: c.clone(),
+            evidence_digest: format!("{:064x}", c.number),
+        })
+        .collect()
+}
 fn ready_queue(path: &std::path::Path) {
     let mut inbox = Inbox::open(path).unwrap();
     let mut store = Store::open(path).unwrap();
@@ -19,7 +28,7 @@ fn ready_queue(path: &std::path::Path) {
         })
         .collect();
     store
-        .apply_reconciliation(&event, &"f".repeat(64), &candidates)
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
         .unwrap();
 }
 #[test]
@@ -55,7 +64,7 @@ fn batch_planning_respects_pause_pending_events_capacity_and_order() {
     let event = inbox.pending().unwrap().remove(0);
     let candidates = store.candidates().unwrap();
     store
-        .apply_reconciliation(&event, &"f".repeat(64), &candidates)
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
         .unwrap();
     let batch = store
         .plan_batch("batch-0123456789abcdef", &"a".repeat(40), 2, 1)
@@ -221,7 +230,7 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
     let mut candidates = store.candidates().unwrap();
     candidates[0].head_sha = "f".repeat(40);
     store
-        .apply_reconciliation(&event, &"f".repeat(64), &candidates)
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &with_evidence(&candidates))
         .unwrap();
     assert!(matches!(
         scheduler.claim_dispatch(id),
@@ -232,4 +241,38 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
     assert!(!scheduler.cancel_prepared(id).unwrap());
     assert!(scheduler.pending_dispatches().unwrap().is_empty());
     assert!(scheduler.reserve("next", &req).unwrap().is_some());
+}
+
+#[test]
+fn changed_review_evidence_invalidates_batch_without_changing_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let batch = store
+        .plan_batch("batch-0123456789abcdef", &"a".repeat(40), 2, 1)
+        .unwrap()
+        .unwrap();
+    let (mut stale, version) = store.batch(&batch.id).unwrap().unwrap();
+    inbox
+        .record("changed-review", "pull_request_review", &[5; 32], 1, 2)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let candidates = store.candidates().unwrap();
+    let mut updated = with_evidence(&candidates);
+    updated[0].evidence_digest = "e".repeat(64);
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &updated)
+        .unwrap();
+    assert_eq!(store.candidates().unwrap(), candidates);
+    assert!(matches!(
+        store.batch(&batch.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    stale.begin_build().unwrap();
+    assert!(matches!(
+        store.update_batch(&stale, version),
+        Err(StoreError::Conflict)
+    ));
 }

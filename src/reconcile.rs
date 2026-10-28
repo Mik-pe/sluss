@@ -4,7 +4,7 @@ use crate::{
     admission::{self, AdmissionError, Policy},
     batch::Candidate,
     github::{App, GitHubError, InstallationToken},
-    store::{Store, StoreError},
+    store::{AdmissionCandidate, Store, StoreError},
     webhook::Reconciliation,
 };
 use std::collections::BTreeSet;
@@ -65,13 +65,26 @@ pub async fn reconcile_once(
             target_branch: config.target_branch.clone(),
             required_reviews: config.required_reviews,
             block_labels: config.block_labels.clone(),
-            authorized_reviewers: observed.authorized_reviewers,
+            authorized_reviewers: observed.authorized_reviewers.clone(),
         };
         match admission::evaluate(&observed.snapshot, &policy) {
-            Ok(eligible) => candidates.push(Candidate {
-                number: eligible.pull_number,
-                head_sha: eligible.head_sha,
-            }),
+            Ok(eligible) => {
+                use sha2::Digest;
+                let input = serde_json::to_vec(&(
+                    "sluss-admission-v1",
+                    &observed.snapshot,
+                    &observed.authorized_reviewers,
+                    &observed.reviewer_permissions,
+                ))
+                .map_err(|_| ReconcileError::Scope)?;
+                candidates.push(AdmissionCandidate {
+                    candidate: Candidate {
+                        number: eligible.pull_number,
+                        head_sha: eligible.head_sha,
+                    },
+                    evidence_digest: hex::encode(sha2::Sha256::digest(input)),
+                });
+            }
             Err(
                 AdmissionError::NotReady
                 | AdmissionError::BlockedLabel
@@ -91,6 +104,6 @@ pub async fn reconcile_once(
     use sha2::Digest;
     let encoded = serde_json::to_vec(&(app.scope(), config)).map_err(|_| ReconcileError::Scope)?;
     let policy_digest = hex::encode(sha2::Sha256::digest(encoded));
-    store.apply_reconciliation(job, &policy_digest, &candidates)?;
+    store.apply_admission_reconciliation(job, &policy_digest, &candidates)?;
     Ok(())
 }
