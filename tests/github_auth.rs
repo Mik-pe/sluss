@@ -839,6 +839,12 @@ async fn token(
     if mode == 27 {
         permissions.insert("actions", "write");
     }
+    if mode == 226 {
+        permissions.insert("issues", "read");
+    }
+    if mode == 227 {
+        permissions.insert("metadata", "write");
+    }
     let repo = if mode == 4 { 8 } else { 7 };
     (
         StatusCode::CREATED,
@@ -1160,13 +1166,30 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         client.read_token(42, 7).await,
         Err(GitHubError::Status(307))
     ));
-    for value in [2, 3, 4] {
+    for value in [2, 3, 4, 226, 227] {
         mode.store(value, Ordering::SeqCst);
         assert!(matches!(
             client.read_token(42, 7).await,
             Err(GitHubError::InvalidResponse)
         ));
     }
+    mode.store(226, Ordering::SeqCst);
+    assert!(matches!(
+        client.dispatch_token(42, 7).await,
+        Err(GitHubError::InvalidResponse)
+    ));
+    assert!(matches!(
+        client.staging_token(42, 7).await,
+        Err(GitHubError::InvalidResponse)
+    ));
+    assert!(matches!(
+        client.runner_inventory_token(42, 7).await,
+        Err(GitHubError::InvalidResponse)
+    ));
+    assert!(matches!(
+        client.checks_write_token(42, 7).await,
+        Err(GitHubError::InvalidResponse)
+    ));
     assert!(matches!(
         client.read_token(0, 7).await,
         Err(GitHubError::InvalidConfiguration)

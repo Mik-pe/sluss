@@ -405,9 +405,15 @@ impl App {
             || response.expires_at.is_empty()
             || response.repositories.len() != 1
             || response.repositories[0].id != repository_id
-            || response.permissions.iter().any(|(k, v)| {
-                v != "read" && body.permissions.get(k.as_str()).copied() != Some(v.as_str())
-            })
+            || response
+                .permissions
+                .iter()
+                .any(|(k, v)| match body.permissions.get(k.as_str()) {
+                    Some(expected) => *expected != v,
+                    // GitHub grants metadata read implicitly. Any other extra
+                    // permission, including read access, exceeds this token's scope.
+                    None => k != "metadata" || v != "read",
+                })
             || body.permissions.iter().any(|(k, expected)| {
                 response.permissions.get(*k).map(String::as_str) != Some(*expected)
             })
