@@ -35,7 +35,7 @@ jobs:
               # Validate the entire list before running any suite. Never eval
               # workflow inputs or interpolate them into a shell command.
               case "$SLUSS_SUITES" in
-                ''|,*|*,|*,,*) echo "Invalid suite list" >&2; exit 1 ;;
+                ''|,*|*,|*,,*|*[!a-z0-9,_-]*) echo "Invalid suite list" >&2; exit 1 ;;
               esac
               core=0; api=0; ui=0
               IFS=',' read -r -a suites <<< "$SLUSS_SUITES"

@@ -119,6 +119,18 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Change the admission policy after stopping workers and draining work.
+    MigrateAdmission {
+        /// Current admission digest from `sluss status`.
+        #[arg(long)]
+        expected_digest: String,
+        /// Current admission policy revision from `sluss status`.
+        #[arg(long)]
+        expected_revision: i64,
+        /// Operator-owned configuration containing the new policy.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Change CI bisection after stopping workers and draining investigations.
     MigrateCiBisection {
         /// Current CI bisection revision from `sluss status`.
@@ -684,6 +696,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         if let Some(path) = admission_db {
             let binding = Store::admission_history_binding(path)?;
+            let epoch = Store::admission_history_policy_epoch(path)?;
             let expected = sluss::reconcile::policy_digest(&app, &config.policy())?;
             if binding
                 != (
@@ -708,6 +721,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(observed) = observations.iter().find(|o| {
                     o.head_sha == *head
                         && !o.clock_uncertain
+                        && o.first_revision >= epoch.1
                         && o.first_observed_ms < merged_ms
                         && o.last_observed_ms < merged_ms
                         && o.ended_ms.is_none_or(|end| end > merged_ms)
@@ -715,6 +729,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     delivery.observed_ready_at = Some(format_unix_ms(observed.first_observed_ms)?);
                     matched += 1;
                 }
+            }
+            if Store::admission_history_binding(path)? != binding
+                || Store::admission_history_policy_epoch(path)? != epoch
+            {
+                return Err("admission database policy changed during collection".into());
             }
             eprintln!(
                 "Matched {matched}/{} Sluss deliveries to local admission observations; these are not exact ready times or proof of continuous eligibility.",
@@ -1824,6 +1843,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("planning settings already match; Sluss remains paused");
             }
         }
+        Command::MigrateAdmission {
+            expected_digest,
+            expected_revision,
+            config,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let next = sluss::reconcile::policy_digest(&app, &config.policy())?;
+            let mut store = store;
+            if store.migrate_admission_policy(
+                &expected_digest,
+                expected_revision,
+                &next,
+                config.github.installation_id,
+                config.github.repository_id,
+                &config.queue.target,
+            )? {
+                println!(
+                    "admission policy migrated; old queue cleared and a new reconciliation scheduled; Sluss remains paused"
+                );
+            } else {
+                println!("admission policy already matches; Sluss remains paused");
+            }
+        }
         Command::MigrateCiBisection {
             expected_revision,
             config,
@@ -2121,6 +2170,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store.paused()?,
                 store.candidates()?.len()
             );
+            if let Some(digest) = store.repository_policy_digest()? {
+                println!(
+                    "admission policy digest: {digest}; revision: {}",
+                    store.admission_policy_revision()?
+                );
+            } else {
+                println!("admission policy: unbound");
+            }
             println!(
                 "selection mode: {}",
                 store

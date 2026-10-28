@@ -51,6 +51,12 @@ pub enum StoreError {
         "CI bisection migration requires no active batches, reservations, unresolved dispatches or unfinished investigations"
     )]
     BisectionMigrationBusy,
+    #[error("pause Sluss before migrating admission policy")]
+    AdmissionMigrationNeedsPause,
+    #[error(
+        "admission migration requires no active batches, reservations or unresolved dispatches"
+    )]
+    AdmissionMigrationBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -177,7 +183,10 @@ impl Store {
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
                 id INTEGER PRIMARY KEY CHECK(id = 1), installation INTEGER NOT NULL, repository INTEGER NOT NULL, policy_digest TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS admission_policy_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision >= 0));
+            CREATE TABLE IF NOT EXISTS admission_policy_migrations (revision INTEGER PRIMARY KEY, previous_digest TEXT NOT NULL, next_digest TEXT NOT NULL, migrated_ms INTEGER NOT NULL, scan_revision INTEGER NOT NULL CHECK(scan_revision > 0));
+            INSERT OR IGNORE INTO admission_policy_revision(id,revision) SELECT 1,0 WHERE NOT EXISTS(SELECT 1 FROM admission_policy_migrations);",
         )?;
         crate::metrics::ensure_schema(&conn)?;
         Ok(Self { conn })
@@ -251,6 +260,39 @@ impl Store {
         .ok_or(StoreError::Unbound)
     }
 
+    /// Read the latest policy epoch and its first possible scan revision.
+    /// Older databases without the migration tables belong to epoch zero.
+    pub fn admission_history_policy_epoch(
+        path: impl AsRef<Path>,
+    ) -> Result<(i64, i64), StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('admission_policy_revision','admission_policy_migrations')", [], |r| r.get(0))?;
+        if tables == 0 {
+            return Ok((0, 0));
+        }
+        if tables != 2 {
+            return Err(StoreError::PolicyMismatch);
+        }
+        let revision: Option<i64> = conn
+            .query_row(
+                "SELECT revision FROM admission_policy_revision WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let last: Option<(i64,i64)> = conn.query_row("SELECT revision,scan_revision FROM admission_policy_migrations ORDER BY revision DESC LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        match (revision, last) {
+            (Some(0), None) => Ok((0, 0)),
+            (Some(revision), Some((last, scan)))
+                if revision > 0 && revision == last && scan > 0 =>
+            {
+                Ok((revision, scan))
+            }
+            _ => Err(StoreError::PolicyMismatch),
+        }
+    }
+
     /// Read a completed CI observation without constructing a scheduler.
     pub fn ci_evidence(&self, id: &str) -> Result<Option<CiEvidence>, StoreError> {
         let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')", [], |r| r.get(0))?;
@@ -293,6 +335,143 @@ impl Store {
             )
             .optional()?)
     }
+    /// Admission policy revision is distinct from webhook delivery revisions.
+    pub fn admission_policy_revision(&self) -> Result<i64, StoreError> {
+        let state: Option<(i64, i64)> = self.conn.query_row(
+            "SELECT revision,(SELECT COALESCE(MAX(revision),0) FROM admission_policy_migrations) FROM admission_policy_revision WHERE id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        match state {
+            Some((revision, last)) if revision >= 0 && revision == last => Ok(revision),
+            _ => Err(StoreError::PolicyMismatch),
+        }
+    }
+
+    /// Invalidate admission observations and queue a fresh scan atomically.
+    /// Operators must stop external workers before the migration.
+    pub fn migrate_admission_policy(
+        &mut self,
+        expected_digest: &str,
+        expected_revision: i64,
+        next_digest: &str,
+        installation: i64,
+        repository: i64,
+        target: &str,
+    ) -> Result<bool, StoreError> {
+        if !valid_hex(expected_digest, 64) || !valid_hex(next_digest, 64) || expected_revision < 0 {
+            return Err(StoreError::InvalidBatch);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !tx.query_row(
+            "SELECT value != 0 FROM settings WHERE key='paused'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Err(StoreError::AdmissionMigrationNeedsPause);
+        }
+        let binding: Option<(i64,i64,String,String)> = tx.query_row(
+            "SELECT r.installation,r.repository,r.policy_digest,t.branch FROM repository_binding r JOIN observed_target t ON r.id=t.id WHERE r.id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        let (known_installation, known_repository, old_digest, known_target) =
+            binding.ok_or(StoreError::Unbound)?;
+        if (known_installation, known_repository) != (installation, repository) {
+            return Err(StoreError::RepositoryMismatch);
+        }
+        if known_target != target || old_digest != expected_digest {
+            return Err(StoreError::PolicyMismatch);
+        }
+        let revision: Option<(i64,i64)> = tx.query_row(
+            "SELECT revision,(SELECT COALESCE(MAX(revision),0) FROM admission_policy_migrations) FROM admission_policy_revision WHERE id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        if revision != Some((expected_revision, expected_revision)) {
+            return Err(StoreError::PolicyMismatch);
+        }
+        {
+            let mut stmt = tx.prepare("SELECT body FROM batches")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let batch: Batch = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                if matches!(
+                    batch.state,
+                    State::Planned
+                        | State::Building
+                        | State::Testing { .. }
+                        | State::Verified { .. }
+                ) {
+                    return Err(StoreError::AdmissionMigrationBusy);
+                }
+            }
+        }
+        for (table, predicate) in [
+            ("capacity_reservations", "1"),
+            ("dispatch_intents", "state NOT IN ('finished','cancelled')"),
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if exists
+                && tx.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"),
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                return Err(StoreError::AdmissionMigrationBusy);
+            }
+        }
+        if old_digest == next_digest {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let now = now_ms()?;
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidBatch)?;
+        clear_ci_candidate_heads(&tx)?;
+        tx.execute("UPDATE admission_observations_v1 SET clock_uncertain=CASE WHEN ?1<last_observed_ms THEN 1 ELSE clock_uncertain END, ended_ms=MAX(last_observed_ms,?1) WHERE ended_ms IS NULL", [now])?;
+        tx.execute("DELETE FROM candidates", [])?;
+        tx.execute("DELETE FROM candidate_evidence", [])?;
+        tx.execute("DELETE FROM candidate_stability", [])?;
+        tx.execute("DELETE FROM observed_base", [])?;
+        tx.execute("DELETE FROM ci_candidate_completions", [])?;
+        tx.execute("DELETE FROM failed_singletons", [])?;
+        tx.execute(
+            "UPDATE split_tasks SET state='stale' WHERE state='pending'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE ci_investigations SET state='stale' WHERE state!='stale'",
+            [],
+        )?;
+        tx.execute("DELETE FROM adaptive_batch_state_v1 WHERE id=1", [])?;
+        tx.execute("DELETE FROM ci_capacity_waits WHERE ended_ms IS NULL", [])?;
+        tx.execute(
+            "UPDATE repository_binding SET policy_digest=?1 WHERE id=1",
+            [next_digest],
+        )?;
+        tx.execute(
+            "UPDATE admission_policy_revision SET revision=?1 WHERE id=1",
+            [next_revision],
+        )?;
+        // Advance the shared delivery clock even if a scan is in flight.
+        tx.execute("INSERT INTO webhook_deliveries(delivery_id,event,digest) VALUES('admission-migration-' || lower(hex(randomblob(16))), '__scan__', zeroblob(32))", [])?;
+        let scan_revision = tx.last_insert_rowid();
+        tx.execute("INSERT INTO reconciliations(installation,repository,revision) VALUES(?1,?2,?3) ON CONFLICT(installation,repository) DO UPDATE SET revision=excluded.revision", params![installation,repository,scan_revision])?;
+        tx.execute(
+            "DELETE FROM webhook_deliveries WHERE sequence=?1",
+            [scan_revision],
+        )?;
+        tx.execute("INSERT INTO admission_policy_migrations(revision,previous_digest,next_digest,migrated_ms,scan_revision) VALUES(?1,?2,?3,?4,?5)", params![next_revision,old_digest,next_digest,now,scan_revision])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Scope fixed by successful repository reconciliation.
     pub fn repository_scope(&self) -> Result<(u64, u64), StoreError> {
         let binding: Option<(i64, i64)> = self

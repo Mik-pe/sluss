@@ -64,7 +64,7 @@ class ExampleWorkflowTests(unittest.TestCase):
         self.assertEqual(calls, ["test --locked -p example-core", "test --locked -p example-api", "test --locked -p example-ui"])
 
     def test_invalid_inputs_do_not_run_any_suite_or_shell_code(self):
-        for value in ["", ",api-tests", "api-tests,", "api-tests,,ui-tests", "api-tests,api-tests", "full,ui-tests", "api-tests,unknown", "$(touch injected)"]:
+        for value in ["", ",api-tests", "api-tests,", "api-tests,,ui-tests", "api-tests,api-tests", "full,ui-tests", "api-tests,unknown", "api-tests\nunknown", "api-tests\n", "$(touch injected)"]:
             with self.subTest(value=value):
                 result, calls, injected = self.run_selection(value)
                 self.assertNotEqual(result.returncode, 0)

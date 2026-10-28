@@ -146,6 +146,267 @@ fn stale_reconciliation_never_records_admission_and_manual_changes_close_it() {
 }
 
 #[test]
+fn admission_migration_invalidates_queue_and_inflight_scans_until_reconciled() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    let original = candidate('b', 'c');
+    let job = event(&mut inbox, "first", 30);
+    apply(&mut store, &job, std::slice::from_ref(&original));
+    let stale = event(&mut inbox, "in-flight", 31);
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::AdmissionMigrationNeedsPause)
+    ));
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 8, "main"),
+        Err(StoreError::RepositoryMismatch)
+    ));
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "other"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(
+        store
+            .migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main")
+            .unwrap()
+    );
+    assert_eq!(store.admission_policy_revision().unwrap(), 1);
+    assert!(store.candidates().unwrap().is_empty());
+    assert!(
+        Store::admission_history(&path, 19).unwrap()[0]
+            .ended_ms
+            .is_some()
+    );
+    let fresh = inbox.pending().unwrap().remove(0);
+    assert!(fresh.revision > stale.revision);
+    assert_eq!(
+        Store::admission_history_policy_epoch(&path).unwrap(),
+        (1, fresh.revision)
+    );
+    assert!(matches!(
+        store.apply_admission_reconciliation_with_base(
+            &stale,
+            &"f".repeat(64),
+            std::slice::from_ref(&original),
+            &"a".repeat(40),
+            "main"
+        ),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        store.apply_admission_reconciliation_with_base(
+            &stale,
+            &"e".repeat(64),
+            std::slice::from_ref(&original),
+            &"a".repeat(40),
+            "main"
+        ),
+        Err(StoreError::Conflict)
+    ));
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.repository_policy_digest().unwrap(),
+        Some("e".repeat(64))
+    );
+    assert!(store.paused().unwrap());
+    store
+        .apply_admission_reconciliation_with_base(
+            &fresh,
+            &"e".repeat(64),
+            std::slice::from_ref(&original),
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert_eq!(store.candidates().unwrap(), vec![original.candidate]);
+    let history = Store::admission_history(&path, 19).unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history[0].ended_ms.is_none() && history[1].ended_ms.is_some());
+    assert!(history[0].first_revision >= fresh.revision);
+    assert!(history[1].first_revision < fresh.revision);
+    assert!(
+        store
+            .migrate_admission_policy(&"e".repeat(64), 1, &"f".repeat(64), 42, 7, "main")
+            .unwrap()
+    );
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM admission_policy_revision", [])
+        .unwrap();
+    drop(conn);
+    drop(store);
+    let mut reopened = Store::open(&path).unwrap();
+    assert!(matches!(
+        reopened.admission_policy_revision(),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        Store::admission_history_policy_epoch(&path),
+        Err(StoreError::PolicyMismatch)
+    ));
+    assert!(matches!(
+        reopened.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::PolicyMismatch)
+    ));
+}
+
+#[test]
+fn admission_migration_requires_drained_batches_and_dispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    let job = event(&mut inbox, "first", 40);
+    apply(&mut store, &job, &[candidate('b', 'c')]);
+    let batch = store
+        .plan_batch("batch-0123456789abcdef", &"a".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    store.set_paused(true).unwrap();
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::AdmissionMigrationBusy)
+    ));
+    assert_eq!(store.candidates().unwrap().len(), 1);
+    store.set_paused(false).unwrap();
+    store.start_integration(&batch.id).unwrap();
+    store.fail_integration(&batch.id, "conflict").unwrap();
+    store.set_paused(true).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("CREATE TABLE capacity_reservations(id TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO capacity_reservations VALUES('busy')", [])
+        .unwrap();
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::AdmissionMigrationBusy)
+    ));
+    conn.execute("DELETE FROM capacity_reservations", [])
+        .unwrap();
+    conn.execute("CREATE TABLE dispatch_intents(state TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO dispatch_intents VALUES('sending')", [])
+        .unwrap();
+    assert!(matches!(
+        store.migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main"),
+        Err(StoreError::AdmissionMigrationBusy)
+    ));
+    conn.execute("UPDATE dispatch_intents SET state='finished'", [])
+        .unwrap();
+    assert!(
+        store
+            .migrate_admission_policy(&"f".repeat(64), 0, &"e".repeat(64), 42, 7, "main")
+            .unwrap()
+    );
+}
+
+#[test]
+fn concurrent_admission_migrations_cannot_both_change_the_same_revision() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let mut inbox = Inbox::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    let job = event(&mut inbox, "first", 50);
+    apply(&mut store, &job, &[candidate('b', 'c')]);
+    store.set_paused(true).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for next in ['d', 'e'] {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut store = Store::open(path).unwrap();
+            barrier.wait();
+            store.migrate_admission_policy(
+                &"f".repeat(64),
+                0,
+                &next.to_string().repeat(64),
+                42,
+                7,
+                "main",
+            )
+        }));
+    }
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(StoreError::PolicyMismatch)))
+            .count(),
+        1
+    );
+    assert_eq!(store.admission_policy_revision().unwrap(), 1);
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+}
+
+#[test]
+fn admission_migration_cli_computes_the_policy_and_schedules_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let config = dir.path().join("sluss.toml");
+    let key = dir.path().join("app.pem");
+    let generated = Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+        ])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    std::fs::write(&config, "version=1\n[github]\napp_client_id='test'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\n[queue]\ntarget='main'\nmax_batch_size=2\nmax_active_batches=1\ndebounce_seconds=0\nbatch_window_seconds=0\n[checks]\nrequired_reviews=2\n").unwrap();
+    let mut inbox = Inbox::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    let job = event(&mut inbox, "first", 60);
+    apply(&mut store, &job, &[candidate('b', 'c')]);
+    store.set_paused(true).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&path)
+        .args([
+            "migrate-admission",
+            "--expected-digest",
+            &"f".repeat(64),
+            "--expected-revision",
+            "0",
+            "--config",
+        ])
+        .arg(&config)
+        .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", &key)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(store.paused().unwrap());
+    assert!(store.candidates().unwrap().is_empty());
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+    let status = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&path)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("revision: 1"));
+}
+
+#[test]
 fn backwards_clock_marks_observations_uncertain() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");

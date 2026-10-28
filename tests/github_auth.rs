@@ -6600,6 +6600,33 @@ async fn benchmark_collection_fetches_attempts_and_merges_without_claiming_compl
         annotated.report().unwrap().sluss.observed_median_latency_ms,
         Some(140 * 60_000)
     );
+    // Even when the policy is changed back to its old digest, an observation
+    // from the earlier epoch must not become a new-policy latency sample.
+    let digest = sluss::reconcile::policy_digest(&app, &policy).unwrap();
+    admission_store.set_paused(true).unwrap();
+    admission_store
+        .migrate_admission_policy(&digest, 0, &"e".repeat(64), 42, 7, "main")
+        .unwrap();
+    admission_store
+        .migrate_admission_policy(&"e".repeat(64), 1, &digest, 42, 7, "main")
+        .unwrap();
+    let output = tokio::task::spawn_blocking({
+        let request_path = request_path.clone();
+        let config = config.clone();
+        let key_path = key_path.clone();
+        let admission_db = admission_db.clone();
+        let db_path = db_path.clone();
+        move || run_collection(request_path, config, key_path, admission_db, db_path)
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let annotated: sluss::benchmark::Input = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(annotated.sluss.deliveries[0].observed_ready_at, None);
     // An observation known to have ended before the merge cannot be matched.
     conn.execute(
         "UPDATE admission_observations_v1 SET ended_ms=1767322800000",
