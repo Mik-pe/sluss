@@ -15,14 +15,15 @@ Operators experimenting with a recorded successful batch and a separately review
 ```sh
 sluss --db sluss.sqlite prepare-landing-marker --batch-id <batch-id> --policy /path/to/trusted-ci-policy.toml
 sluss --db sluss.sqlite landing-intents
+sluss --db sluss.sqlite freeze-landing-heads --operation-id <id> --config /path/to/sluss.toml --policy /path/to/trusted-ci-policy.toml
 sluss --db sluss.sqlite create-landing-marker --operation-id <id> --config /path/to/sluss.toml --policy /path/to/trusted-ci-policy.toml
 sluss --db sluss.sqlite observe-marker-creation --operation-id <id> --config /path/to/sluss.toml
 sluss --db sluss.sqlite landing-recovery --operation-id <id>
 ```
 
-Preparation generates and prints a random ID; `landing-intents` recovers it if output is lost. Creation makes a GitHub branch and may trigger workflows. Configure `SLUSS_GITHUB_PRIVATE_KEY_PATH` and protect the reserved marker namespace from other writers. If creation remains uncertain, the attempt will not be resent or automatically resolved. The observation command reads twice and records a historical snapshot; a matching SHA does not prove who created the ref, and a 404 means only that the ref is not visible to the token. `cancel-landing --operation-id <id>` releases only an unclaimed landing intent; a marker creation may still have succeeded and requires inspection or cleanup. These commands do not enable automatic landing.
+Preparation generates and prints a random ID; `landing-intents` recovers it if output is lost. Freeze each PR's same-repository head branch before creating the marker; forks are rejected. An older marked intent whose marker was already created without head guards must be cancelled and prepared again. Creation makes a GitHub branch and may trigger workflows. Configure `SLUSS_GITHUB_PRIVATE_KEY_PATH` and protect the reserved marker namespace from other writers. If creation remains uncertain, the attempt will not be resent or automatically resolved. The observation command reads twice and records a historical snapshot; a matching SHA does not prove who created the ref, and a 404 means only that the ref is not visible to the token. `cancel-landing --operation-id <id>` releases only an unclaimed landing intent; a marker creation may still have succeeded and requires inspection or cleanup. These commands do not enable automatic landing.
 
-Strict landing is not enabled: the current ref-update request cannot atomically guard PR heads, reviews or branch policy. A provider probe also found that GitHub rejected a PR's synthetic `refs/pull/.../head` as a GraphQL ref-update input. See the [protocol](docs/protocol.md) for the evidence and its limits.
+Strict landing is not enabled: experimental no-op guards cover only frozen source branches in the same repository, and cannot atomically guard PR metadata, reviews or branch policy. A provider probe found that GitHub rejected a PR's synthetic `refs/pull/.../head` as a GraphQL ref-update input. See the [protocol](docs/protocol.md) for the evidence and its limits.
 
 For an experimental installation, `sluss app-registration-url --name "My Sluss Preview"` creates a GitHub registration link with read-only permissions and webhooks disabled. It does not create an App. See [GitHub App setup](docs/github-app-setup.md) for the separately opted-in CI permissions, webhook setup and key isolation.
 

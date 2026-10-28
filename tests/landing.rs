@@ -11,6 +11,7 @@ fn plan(id: &str) -> LandingPlan {
         target_ref: "refs/heads/main".into(),
         staging_ref: "refs/heads/sluss/batch-123".into(),
         marker_ref: None,
+        guarded_heads: None,
         base_sha: "a".repeat(40),
         staged_sha: "b".repeat(40),
         policy_digest: "c".repeat(64),
@@ -94,6 +95,57 @@ fn marked_plan_freezes_atomic_marker_and_survives_restart() {
         invalid.graphql_request(),
         Err(LandingError::Invalid)
     ));
+}
+
+#[test]
+fn guarded_source_branches_are_atomic_no_ops_and_cannot_overlap() {
+    use sluss::landing::GuardedHead;
+    let mut p = plan("123456789abcdef0123456789abcdef0");
+    p.marker_ref = Some(format!("refs/heads/sluss/receipts/{}", p.operation_id));
+    let head = GuardedHead {
+        number: 7,
+        reference: "refs/heads/feature/a".into(),
+        sha: "f".repeat(40),
+    };
+    p.guarded_heads = Some(vec![head.clone()]);
+    let request = p.graphql_request().unwrap();
+    let refs = request["variables"]["input"]["refUpdates"]
+        .as_array()
+        .unwrap();
+    assert_eq!(refs.len(), 4);
+    assert_eq!(refs[3]["name"], head.reference);
+    assert_eq!(refs[3]["beforeOid"], head.sha);
+    assert_eq!(refs[3]["afterOid"], head.sha);
+    assert_eq!(refs[3]["force"], false);
+    for bad in [
+        "refs/pull/7/head",
+        "refs/heads/main",
+        "refs/heads/sluss/other",
+        "refs/heads/a/../b",
+    ] {
+        let mut invalid = p.clone();
+        invalid.guarded_heads.as_mut().unwrap()[0].reference = bad.into();
+        assert!(invalid.graphql_request().is_err(), "{bad}");
+    }
+    for duplicate in [
+        GuardedHead {
+            number: 7,
+            reference: "refs/heads/other".into(),
+            sha: "f".repeat(40),
+        },
+        GuardedHead {
+            number: 8,
+            reference: head.reference.clone(),
+            sha: "f".repeat(40),
+        },
+    ] {
+        let mut invalid = p.clone();
+        invalid.guarded_heads.as_mut().unwrap().push(duplicate);
+        assert!(invalid.graphql_request().is_err());
+    }
+    let mut invalid = p.clone();
+    invalid.guarded_heads = Some(vec![]);
+    assert!(invalid.graphql_request().is_err());
 }
 
 #[test]

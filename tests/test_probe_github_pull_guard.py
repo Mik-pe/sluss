@@ -15,8 +15,9 @@ BASE, CANDIDATE, HEAD, FOREIGN = (letter * 40 for letter in "abcd")
 
 
 class FakeGitHub:
-    def __init__(self, *, reject_matching=False, wrong_ancestry=False, change_before_cleanup=False, stale_after_delete=False, fail_control=False):
-        self.refs = {"pull/12/head": HEAD}
+    def __init__(self, *, reject_matching=False, wrong_ancestry=False, change_before_cleanup=False, stale_after_delete=False, fail_control=False, fork=False):
+        self.refs = {"pull/12/head": HEAD, "heads/feature": HEAD}
+        self.fork = fork
         self.reject_matching = reject_matching
         self.wrong_ancestry = wrong_ancestry
         self.fail_control = fail_control
@@ -33,7 +34,9 @@ class FakeGitHub:
     def __call__(self, args, body=None):
         endpoint = next((a for a in args if a.startswith("repos/") or a == "graphql"), "")
         if endpoint == "repos/owner/repo":
-            return self.result({"full_name": "owner/repo", "node_id": "R_repo"})
+            return self.result({"full_name": "owner/repo", "node_id": "R_repo", "id": 1})
+        if endpoint == "repos/owner/repo/pulls/12":
+            return self.result({"number": 12, "state": "open", "head": {"sha": HEAD, "ref": "feature", "repo": {"id": 2 if self.fork else 1}}, "base": {"repo": {"id": 1}}})
         if "/compare/" in endpoint:
             return self.result({"status": "diverged" if self.wrong_ancestry else "ahead", "ahead_by": 1,
                                 "base_commit": {"sha": BASE}, "merge_base_commit": {"sha": BASE}})
@@ -53,7 +56,7 @@ class FakeGitHub:
             updates = item["refUpdates"]
             for change in updates:
                 key = change["name"].removeprefix("refs/")
-                if key.startswith("pull/"):
+                if key.startswith("pull/") or key == "heads/feature":
                     self.guard_updates.append(change.copy())
                     assert change["beforeOid"] == change["afterOid"], "a PR guard must never change the PR ref"
             if self.change_before_cleanup and len(updates) == 1 and updates[0]["afterOid"] == probe.ZERO:
@@ -76,21 +79,35 @@ class FakeGitHub:
 
 
 class ProbeTests(unittest.TestCase):
-    def execute(self, fake):
+    def execute(self, fake, guard="pull"):
         with patch.object(probe, "api", fake), patch.object(probe.time, "sleep"), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return probe.run("owner/repo", 12, BASE, CANDIDATE)
+            return probe.run("owner/repo", 12, BASE, CANDIDATE, guard)
 
     def test_matching_guard_and_cleanup(self):
         fake = FakeGitHub()
         self.assertTrue(self.execute(fake))
-        self.assertEqual(fake.refs, {"pull/12/head": HEAD})
-        self.assertEqual(len(fake.guard_updates), 2)
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
+        self.assertEqual(len(fake.guard_updates), 3)
         self.assertTrue(all(item["beforeOid"] == item["afterOid"] for item in fake.guard_updates))
+
+    def test_same_repository_branch_can_be_guarded_without_mutating_it(self):
+        fake = FakeGitHub()
+        self.assertTrue(self.execute(fake, "branch"))
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
+        self.assertEqual(len(fake.guard_updates), 3)
+        self.assertTrue(all(item["name"] == "refs/heads/feature" for item in fake.guard_updates))
+
+    def test_fork_is_rejected_before_creating_temporary_refs(self):
+        fake = FakeGitHub(fork=True)
+        with self.assertRaisesRegex(RuntimeError, "same-repository"):
+            self.execute(fake, "branch")
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
+        self.assertEqual(fake.guard_updates, [])
 
     def test_delayed_deletion_readback_does_not_resend_the_delete(self):
         fake = FakeGitHub(stale_after_delete=True)
         self.assertTrue(self.execute(fake))
-        self.assertEqual(fake.refs, {"pull/12/head": HEAD})
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
         self.assertEqual(fake.stale, {})
         self.assertEqual(len(fake.deletions), 2)
         self.assertEqual(len(set(fake.deletions)), 2)
@@ -98,20 +115,20 @@ class ProbeTests(unittest.TestCase):
     def test_rejected_matching_guard_is_inconclusive_and_cleans_up(self):
         fake = FakeGitHub(reject_matching=True)
         self.assertFalse(self.execute(fake))
-        self.assertEqual(fake.refs, {"pull/12/head": HEAD})
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
 
     def test_failed_control_stops_before_any_pull_ref_mutation(self):
         fake = FakeGitHub(fail_control=True)
         with self.assertRaisesRegex(RuntimeError, "control was not confirmed"):
             self.execute(fake)
-        self.assertEqual(fake.refs, {"pull/12/head": HEAD})
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
         self.assertEqual(fake.guard_updates, [])
 
     def test_unsafe_candidate_never_creates_a_branch(self):
         fake = FakeGitHub(wrong_ancestry=True)
         with self.assertRaisesRegex(RuntimeError, "descendant"):
             self.execute(fake)
-        self.assertEqual(fake.refs, {"pull/12/head": HEAD})
+        self.assertEqual(fake.refs, {"pull/12/head": HEAD, "heads/feature": HEAD})
 
     def test_cleanup_refuses_racing_change(self):
         fake = FakeGitHub(change_before_cleanup=True)

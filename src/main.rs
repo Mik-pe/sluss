@@ -175,6 +175,15 @@ enum Command {
         #[arg(long)]
         policy: PathBuf,
     },
+    /// Freeze currently observed same-repository PR source branches.
+    FreezeLandingHeads {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
     /// Create the frozen marker once with the GitHub App; no landing is sent.
     CreateLandingMarker {
         #[arg(long)]
@@ -1233,7 +1242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("To inspect GitHub, supply --config, --capacity and --workflow-id.");
         }
         eprintln!(
-            "PR heads, reviews and branch policy are not atomically guarded by the landing request."
+            "Only frozen same-repository PR head branches can be guarded; reviews, PR metadata and branch policy are not atomically guarded."
         );
         eprintln!(
             "NOT READY: workflow trust, full runner scope, bypass policy, attestation and strict landing are not verified."
@@ -1302,6 +1311,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("marker missing from plan")?
         );
         println!("Local intent only; no GitHub ref, CI attestation or merge was created.");
+        return Ok(());
+    }
+    if let Command::FreezeLandingHeads {
+        operation_id,
+        config,
+        policy,
+    } = &cli.command
+    {
+        let config = sluss::config::Config::load(config)?;
+        let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
+        let inspect = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        let (plan, _) = inspect.get(operation_id)?.ok_or("unknown landing intent")?;
+        if (plan.installation_id, plan.repository_id)
+            != (config.github.installation_id, config.github.repository_id)
+            || plan.target_ref != format!("refs/heads/{}", config.queue.target)
+            || plan.marker_ref.is_none()
+        {
+            return Err("repository, target or marker does not match the landing intent".into());
+        }
+        let key = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+        let app = sluss::github::App::new(
+            config.github.app_client_id.clone(),
+            &std::fs::read(key)?,
+            &config.github.api,
+        )?;
+        let token = app
+            .read_token(
+                config.github.installation_id as u64,
+                config.github.repository_id as u64,
+            )
+            .await?;
+        let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+        let bound = app
+            .freeze_landing_heads(&mut journal, &token, &config.policy(), &trust, operation_id)
+            .await?;
+        for head in bound.guarded_heads.as_deref().unwrap_or_default() {
+            println!("PR {}: {} at {}", head.number, head.reference, head.sha);
+        }
+        println!(
+            "Head refs frozen; reviews, PR metadata and branch policy are not atomically guarded. No landing was sent."
+        );
         return Ok(());
     }
     if let Command::CreateLandingMarker {
@@ -1541,6 +1592,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::FindDispatchRuns { .. } => unreachable!(),
         Command::PrepareLandingMarker { .. } => unreachable!(),
         Command::CreateLandingMarker { .. } => unreachable!(),
+        Command::FreezeLandingHeads { .. } => unreachable!(),
         Command::LandingIntents => unreachable!(),
         Command::CancelLanding { .. } => unreachable!(),
         Command::ObserveMarkerCreation { .. } => unreachable!(),

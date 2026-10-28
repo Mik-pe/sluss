@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Probe whether GitHub's atomic ref mutation can guard a PR's synthetic head.
+"""Probe atomic guards using a PR's synthetic ref or same-repo head branch.
 
 Creates and conditionally deletes two temporary branches in the selected repo.
 The PR ref is included only as a no-op (beforeOid equals afterOid). GitHub may
@@ -68,7 +68,7 @@ def mutate(repo_id, updates, label):
     return {"acknowledged": ack, "graphql_error": bool(errors), "messages": messages}
 
 
-def run(repo, pull, base, candidate):
+def run(repo, pull, base, candidate, guard="pull"):
     response = api([f"repos/{repo}"])
     if response.returncode:
         raise RuntimeError("Repository identity unavailable")
@@ -88,6 +88,27 @@ def run(repo, pull, base, candidate):
     head = read(repo, pull_path)
     if head is None:
         raise RuntimeError("Pull-request head is not visible")
+    guard_path = pull_path
+    if guard == "branch":
+        response = api([f"repos/{repo}/pulls/{pull}"])
+        if response.returncode:
+            raise RuntimeError("Could not inspect the pull request")
+        details = json.loads(response.stdout)
+        source = details.get("head") or {}
+        source_repo = source.get("repo") or {}
+        target_repo = (details.get("base") or {}).get("repo") or {}
+        branch = source.get("ref")
+        if (details.get("number") != pull or details.get("state") != "open" or
+                not isinstance(repository.get("id"), int) or source_repo.get("id") != repository["id"] or
+                target_repo.get("id") != repository["id"] or source.get("sha") != head or
+                not isinstance(branch, str) or len(branch) > 200 or
+                not re.fullmatch(r"[A-Za-z0-9_./-]+", branch) or ".." in branch or "//" in branch or
+                any(not part or part.startswith(".") or part.endswith(".lock") for part in branch.split("/")) or
+                branch.endswith(".")):
+            raise RuntimeError("PR head is not a stable same-repository branch")
+        guard_path = f"heads/{branch}"
+        if read(repo, guard_path) != head:
+            raise RuntimeError("PR head and source branch do not agree")
     name = "sluss-pull-guard-probe-" + uuid.uuid4().hex
     path = f"heads/{name}"
     control = f"heads/{name}-control"
@@ -100,21 +121,30 @@ def run(repo, pull, base, candidate):
         check = {"name": f"refs/{control}", "beforeOid": base, "afterOid": candidate, "force": False}
         control_result = mutate(repo_id, [check], f"{name}-control")
         if (not control_result["acknowledged"] or read(repo, control) != candidate or
-                read(repo, path) != base or read(repo, pull_path) != head):
+                read(repo, path) != base or read(repo, pull_path) != head or read(repo, guard_path) != head):
             raise RuntimeError(f"Ordinary-ref control was not confirmed: {control_result}")
         print("PASS: ordinary branch compare-and-update worked with the same commits")
         target_update = {"name": f"refs/{path}", "beforeOid": base, "afterOid": candidate, "force": False}
         # ZERO-to-ZERO is a no-op even if the PR ref disappears concurrently.
-        mismatch = {"name": f"refs/{pull_path}", "beforeOid": ZERO, "afterOid": ZERO, "force": False}
+        mismatch = {"name": f"refs/{guard_path}", "beforeOid": ZERO, "afterOid": ZERO, "force": False}
         wrong = mutate(repo_id, [target_update, mismatch], f"{name}-wrong")
-        after_wrong = (read(repo, path), read(repo, pull_path))
-        if wrong["acknowledged"] or not wrong["graphql_error"] or after_wrong != (base, head):
+        after_wrong = (read(repo, path), read(repo, pull_path), read(repo, guard_path))
+        if wrong["acknowledged"] or not wrong["graphql_error"] or after_wrong != (base, head, head):
             raise RuntimeError(f"Wrong-head test was inconclusive: {wrong}, refs={after_wrong}")
-        print("PASS: incorrect pull-ref precondition left target and pull head unchanged")
-        matching = {"name": f"refs/{pull_path}", "beforeOid": head, "afterOid": head, "force": False}
+        print("PASS: missing-ref precondition left target and PR head unchanged")
+        # Both values are identical, so even a concurrently changed branch
+        # could not be modified by this probe. The target is disposable.
+        stale = base if head != base else candidate
+        stale_guard = {"name": f"refs/{guard_path}", "beforeOid": stale, "afterOid": stale, "force": False}
+        stale_result = mutate(repo_id, [target_update, stale_guard], f"{name}-stale")
+        after_stale = (read(repo, path), read(repo, pull_path), read(repo, guard_path))
+        if stale_result["acknowledged"] or not stale_result["graphql_error"] or after_stale != (base, head, head):
+            raise RuntimeError(f"Stale-head test was inconclusive: {stale_result}, refs={after_stale}")
+        print("PASS: stale head SHA left target and PR head unchanged")
+        matching = {"name": f"refs/{guard_path}", "beforeOid": head, "afterOid": head, "force": False}
         result = mutate(repo_id, [target_update, matching], f"{name}-matching")
-        final = (read(repo, path), read(repo, pull_path))
-        if result["acknowledged"] and final == (candidate, head):
+        final = (read(repo, path), read(repo, pull_path), read(repo, guard_path))
+        if result["acknowledged"] and final == (candidate, head, head):
             print("PASS: target advanced with the expected PR head included as a no-op")
             return True
         print("INCONCLUSIVE: matching PR-ref guard did not produce a confirmed atomic update:",
@@ -144,6 +174,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--pull", required=True, type=int)
+    parser.add_argument("--guard", choices=("pull", "branch"), default="pull",
+                        help="branch is limited to PRs whose source is in the target repository")
     parser.add_argument("--base", required=True)
     parser.add_argument("--candidate", required=True)
     args = parser.parse_args()
@@ -155,7 +187,7 @@ def main():
         parser.error("invalid pull request number")
     if any(not re.fullmatch(r"[0-9a-f]{40}", sha) or sha == ZERO for sha in (args.base, args.candidate)) or args.base == args.candidate:
         parser.error("commits must be distinct full lowercase SHA-1 IDs")
-    if not run(args.repo, args.pull, args.base, args.candidate):
+    if not run(args.repo, args.pull, args.base, args.candidate, args.guard):
         sys.exit(1)
 
 

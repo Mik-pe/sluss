@@ -2054,6 +2054,9 @@ impl App {
         {
             return Err(MarkerCreationError::Scope);
         }
+        if plan.guarded_heads.is_none() {
+            return Err(crate::landing::LandingError::UnprotectedHeads.into());
+        }
         let root = format!("repos/{}/{}", repository.owner, repository.name);
         let first: Identity = self.get_json(read, &root, None).await?;
         let last: Identity = self.get_json(read, &root, None).await?;
@@ -2223,6 +2226,141 @@ impl App {
         }
         Ok(last)
     }
+    /// Freeze same-repository head branches observed twice around each PR ref.
+    /// Forks are rejected; review/policy races remain unsolved.
+    pub async fn freeze_landing_heads(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        trusted: &crate::landing::TrustedCiPolicy,
+        operation_id: &str,
+    ) -> Result<crate::landing::LandingPlan, LandingRefreshError> {
+        let target = journal.refresh_target(operation_id, trusted)?;
+        let plan = &target.plan;
+        if !token.checks_read
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+            || i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
+            || i64::try_from(token.installation_id).ok() != Some(plan.installation_id)
+            || policy.repository != plan.repository_id
+            || policy.installation != plan.installation_id
+            || plan.target_ref != format!("refs/heads/{}", policy.target_branch)
+            || crate::reconcile::policy_digest(self, policy)
+                .ok()
+                .as_deref()
+                != Some(target.repository_policy_digest.as_str())
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let heads = Box::pin(self.observe_same_repo_heads(token, policy, &target)).await?;
+        journal
+            .bind_guarded_heads(&target, trusted, heads)
+            .map_err(Into::into)
+    }
+
+    async fn observe_same_repo_heads(
+        &self,
+        token: &InstallationToken,
+        policy: &crate::reconcile::RepositoryPolicy,
+        target: &crate::landing::RefreshTarget,
+    ) -> Result<Vec<crate::landing::GuardedHead>, LandingRefreshError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Repo {
+            id: u64,
+        }
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Head {
+            sha: String,
+            #[serde(rename = "ref")]
+            branch: String,
+            repo: Option<Repo>,
+        }
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Base {
+            #[serde(rename = "ref")]
+            branch: String,
+            repo: Repo,
+        }
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Pull {
+            number: u64,
+            state: String,
+            head: Head,
+            base: Base,
+        }
+        if !valid_name(&policy.owner)
+            || !valid_name(&policy.name)
+            || !token.checks_read
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let root = format!("repos/{}/{}", policy.owner, policy.name);
+        let repo: Identity = self.get_json(token, &root, None).await?;
+        if repo.id != token.repository_id || repo.node_id != target.plan.repository_node_id {
+            return Err(LandingRefreshError::Scope);
+        }
+        let mut heads = Vec::with_capacity(target.members.len());
+        for member in &target.members {
+            let pull_path = format!("{root}/pulls/{}", member.candidate.number);
+            let first: Pull = self.get_json(token, &pull_path, None).await?;
+            let full_ref = format!("refs/heads/{}", first.head.branch);
+            if first.number != member.candidate.number
+                || first.state != "open"
+                || first.head.sha != member.candidate.head_sha
+                || first.head.repo.as_ref().map(|r| r.id) != Some(token.repository_id)
+                || first.base.repo.id != token.repository_id
+                || first.base.branch != policy.target_branch
+                || !crate::landing::valid_guarded_head_ref(&full_ref)
+                || full_ref == target.plan.target_ref
+            {
+                return Err(LandingRefreshError::Changed);
+            }
+            let branch_path = format!(
+                "{root}/git/ref/{}",
+                full_ref
+                    .strip_prefix("refs/")
+                    .ok_or(LandingRefreshError::Scope)?
+            );
+            let pull_ref_name = format!("refs/pull/{}/head", member.candidate.number);
+            let pull_ref_path = format!("{root}/git/ref/pull/{}/head", member.candidate.number);
+            let branch: DispatchRef = self.get_json(token, &branch_path, None).await?;
+            let synthetic: DispatchRef = self.get_json(token, &pull_ref_path, None).await?;
+            let last: Pull = self.get_json(token, &pull_path, None).await?;
+            let final_branch: DispatchRef = self.get_json(token, &branch_path, None).await?;
+            let final_synthetic: DispatchRef = self.get_json(token, &pull_ref_path, None).await?;
+            if first != last
+                || branch != final_branch
+                || synthetic != final_synthetic
+                || branch.reference != full_ref
+                || synthetic.reference != pull_ref_name
+                || branch.object.kind != "commit"
+                || synthetic.object.kind != "commit"
+                || branch.object.sha != first.head.sha
+                || synthetic.object.sha != first.head.sha
+            {
+                return Err(LandingRefreshError::Changed);
+            }
+            heads.push(crate::landing::GuardedHead {
+                number: first.number,
+                reference: full_ref,
+                sha: first.head.sha,
+            });
+        }
+        let last_repo: Identity = self.get_json(token, &root, None).await?;
+        if repo != last_repo {
+            return Err(LandingRefreshError::Changed);
+        }
+        Ok(heads)
+    }
+
     /// Refresh the PRs, reviews, refs and recorded Actions run immediately
     /// before claiming an experimental batch-bound intent. This is not authorization:
     /// approvals, trusted policy and provider state can still change later.
@@ -2411,6 +2549,11 @@ impl App {
                 return Err(LandingRefreshError::Changed);
             }
         }
+        if let Some(expected) = &plan.guarded_heads
+            && &Box::pin(self.observe_same_repo_heads(token, policy, target)).await? != expected
+        {
+            return Err(LandingRefreshError::Changed);
+        }
         let mut provider_reviews = Vec::with_capacity(target.members.len());
         for member in &target.members {
             let review = self
@@ -2476,6 +2619,11 @@ impl App {
             {
                 return Err(LandingRefreshError::Changed);
             }
+        }
+        if let Some(expected) = &plan.guarded_heads
+            && &Box::pin(self.observe_same_repo_heads(token, policy, target)).await? != expected
+        {
+            return Err(LandingRefreshError::Changed);
         }
         let last_stage: DispatchRef = self.get_json(token, &ref_path, None).await?;
         if let Some(path) = &marker_path {

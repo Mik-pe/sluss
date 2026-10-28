@@ -78,7 +78,7 @@ async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Valu
         "b"
     };
     Json(
-        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha},"base":{"sha":base.repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":label}]}),
+        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha,"ref":if state.mode.load(Ordering::SeqCst)==232 {"main"} else {"feature/19"},"repo":if state.mode.load(Ordering::SeqCst)==231 {Value::Null} else {json!({"id":if state.mode.load(Ordering::SeqCst)==230 {8} else {7}})}},"base":{"sha":base.repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":label}]}),
     )
 }
 async fn reviews(
@@ -2174,8 +2174,25 @@ async fn staging_tokens_are_scoped_and_never_sent_from_a_non_github_origin() {
     server.abort();
 }
 
-#[tokio::test]
-async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
+#[test]
+fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
+    // This end-to-end fixture holds many independent async flows and exceeds
+    // the default test-thread stack; keep the real workflow on a bounded stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(Box::pin(cli_dispatches_fixture()));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn cli_dispatches_fixture() {
     use sluss::{
         selective::{FrozenSelection, Policy, Selection},
         store::Store,
@@ -2218,6 +2235,14 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             get(doctor_protection),
         )
         .route("/repos/owner/repo/rulesets/10", get(doctor_ruleset))
+        .route(
+            "/repos/owner/repo/git/ref/heads/feature/19",
+            get(guarded_head_ref),
+        )
+        .route(
+            "/repos/owner/repo/git/ref/pull/19/head",
+            get(guarded_head_ref),
+        )
         .route(
             "/repos/owner/repo/git/refs",
             post(create_landing_marker_stub),
@@ -5745,10 +5770,90 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         &mode,
     ))
     .await;
-    let frozen_landing = landing
+    let unguarded = landing
         .prepare_trusted_batch_with_marker("123456789abcdef0123456789abcdef0", id, &selected_trust)
         .unwrap();
     let marker_token = observer_app.staging_token(42, 7).await.unwrap();
+    let posts_before = MARKER_POSTS.load(Ordering::SeqCst);
+    assert!(
+        observer_app
+            .create_landing_marker(
+                &mut landing,
+                &fixture_token,
+                &marker_token,
+                &observer_policy,
+                &selected_trust,
+                "123456789abcdef0123456789abcdef0"
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(MARKER_POSTS.load(Ordering::SeqCst), posts_before);
+    for invalid in [230, 231, 232, 233, 234, 235, 236, 237] {
+        GUARDED_HEAD_READS.store(0, Ordering::SeqCst);
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(
+            Box::pin(observer_app.freeze_landing_heads(
+                &mut landing,
+                &fixture_token,
+                &observer_policy,
+                &selected_trust,
+                "123456789abcdef0123456789abcdef0"
+            ))
+            .await
+            .is_err(),
+            "mode {invalid}"
+        );
+        assert_eq!(
+            landing
+                .get("123456789abcdef0123456789abcdef0")
+                .unwrap()
+                .unwrap()
+                .0,
+            unguarded
+        );
+    }
+    Box::pin(exercise_head_freeze_race(
+        &observer_app,
+        &fixture_token,
+        &observer_policy,
+        &selected_trust,
+        &db,
+        &data,
+        &mode,
+    ))
+    .await;
+    mode.store(0, Ordering::SeqCst);
+    let frozen_landing = Box::pin(observer_app.freeze_landing_heads(
+        &mut landing,
+        &fixture_token,
+        &observer_policy,
+        &selected_trust,
+        "123456789abcdef0123456789abcdef0",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        frozen_landing.guarded_heads.as_ref().unwrap()[0].reference,
+        "refs/heads/feature/19"
+    );
+    assert_eq!(
+        Box::pin(observer_app.freeze_landing_heads(
+            &mut landing,
+            &fixture_token,
+            &observer_policy,
+            &selected_trust,
+            "123456789abcdef0123456789abcdef0"
+        ))
+        .await
+        .unwrap(),
+        frozen_landing
+    );
+    let request = frozen_landing.graphql_request().unwrap();
+    let guard = &request["variables"]["input"]["refUpdates"][3];
+    assert_eq!(guard["name"], "refs/heads/feature/19");
+    assert_eq!(guard["beforeOid"], "a".repeat(40));
+    assert_eq!(guard["afterOid"], "a".repeat(40));
     Box::pin(exercise_marker_creation(
         &observer_app,
         &mut landing,
@@ -5788,8 +5893,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     );
     for invalid in [
         5, 10, 13, 16, 21, 22, 30, 38, 40, 51, 63, 64, 65, 67, 69, 72, 74, 76, 77, 80, 81, 82, 104,
-        105, 106, 108, 109, 110, 111, 112, 113, 114, 115, 117, 119, 120,
+        105, 106, 108, 109, 110, 111, 112, 113, 114, 115, 117, 119, 120, 230, 231, 232, 233, 234,
+        235, 236, 237,
     ] {
+        GUARDED_HEAD_READS.store(0, Ordering::SeqCst);
         reads.store(0, Ordering::SeqCst);
         graphql_counts.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
@@ -6065,7 +6172,7 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     assert!(String::from_utf8_lossy(&doctor.stderr).contains("NOT READY"));
     assert!(
         String::from_utf8_lossy(&doctor.stderr)
-            .contains("PR heads, reviews and branch policy are not atomically guarded")
+            .contains("reviews, PR metadata and branch policy are not atomically guarded")
     );
     assert!(!info.contains("fake-installation-token"));
     reads.store(0, Ordering::SeqCst);
@@ -6614,6 +6721,7 @@ async fn uncertain_landing_records_stable_github_refs_without_claiming_success()
         target_ref: "refs/heads/main".into(),
         staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
         marker_ref: None,
+        guarded_heads: None,
         base_sha: "b".repeat(40),
         staged_sha: "a".repeat(40),
         policy_digest: "c".repeat(64),
@@ -7249,6 +7357,7 @@ async fn uncertain_landing_observes_marker_without_resolving_or_unlocking() {
         target_ref: "refs/heads/main".into(),
         staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
         marker_ref: Some(format!("refs/heads/sluss/receipts/{id}")),
+        guarded_heads: None,
         base_sha: "b".repeat(40),
         staged_sha: "a".repeat(40),
         policy_digest: "c".repeat(64),
@@ -7563,6 +7672,24 @@ async fn exercise_marker_cli(
         previous_id = id.clone();
         let listed = launch(vec!["landing-intents".into()]).await.unwrap();
         assert!(listed.status.success() && String::from_utf8_lossy(&listed.stdout).contains(&id));
+        mode.store(0, Ordering::SeqCst);
+        let frozen = launch(vec![
+            "freeze-landing-heads".into(),
+            "--operation-id".into(),
+            id.clone(),
+            "--config".into(),
+            config.to_str().unwrap().into(),
+            "--policy".into(),
+            policy.to_str().unwrap().into(),
+        ])
+        .await
+        .unwrap();
+        assert!(
+            frozen.status.success(),
+            "{}",
+            String::from_utf8_lossy(&frozen.stderr)
+        );
+        assert!(String::from_utf8_lossy(&frozen.stdout).contains("refs/heads/feature/19"));
         let create = || {
             vec![
                 "create-landing-marker".into(),
@@ -7706,4 +7833,86 @@ async fn exercise_marker_cli(
             );
         }
     }
+}
+
+static GUARDED_HEAD_READS: AtomicUsize = AtomicUsize::new(0);
+
+async fn guarded_head_ref(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
+) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let synthetic = uri.0.path().contains("/pull/");
+    let count = if !synthetic {
+        GUARDED_HEAD_READS.fetch_add(1, Ordering::SeqCst)
+    } else {
+        0
+    };
+    if mode == 238 && !synthetic {
+        while state.mode.load(Ordering::SeqCst) == 238 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    let sha =
+        if mode == 233 || (mode == 234 && synthetic) || (mode == 235 && !synthetic && count > 0) {
+            "b"
+        } else {
+            "a"
+        };
+    let name = if mode == 237 {
+        "refs/heads/other"
+    } else if synthetic {
+        "refs/pull/19/head"
+    } else {
+        "refs/heads/feature/19"
+    };
+    Json(
+        json!({"ref":name,"object":{"sha":sha.repeat(40),"type":if mode == 236 {"tree"} else {"commit"}}}),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exercise_head_freeze_race(
+    app: &App,
+    read: &sluss::github::InstallationToken,
+    policy: &sluss::reconcile::RepositoryPolicy,
+    trust: &sluss::landing::TrustedCiPolicy,
+    db: &std::path::Path,
+    data: &tempfile::TempDir,
+    mode: &AtomicU8,
+) {
+    let copy = data.path().join("guard-race.sqlite");
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+        .unwrap();
+    let mut journal = sluss::landing::LandingJournal::open(&copy).unwrap();
+    let mut inbox = sluss::webhook::Inbox::open(&copy).unwrap();
+    let id = "123456789abcdef0123456789abcdef0";
+    GUARDED_HEAD_READS.store(0, Ordering::SeqCst);
+    mode.store(238, Ordering::SeqCst);
+    let (result, _) = tokio::join!(
+        app.freeze_landing_heads(&mut journal, read, policy, trust, id),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while GUARDED_HEAD_READS.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            inbox
+                .record("guard-freeze-race", "pull_request_review", &[87; 32], 42, 7)
+                .unwrap();
+            mode.store(0, Ordering::SeqCst);
+        }
+    );
+    assert!(result.is_err());
+    assert!(journal.get(id).unwrap().unwrap().0.guarded_heads.is_none());
+    assert_eq!(
+        journal.marker_creation_state(id).unwrap(),
+        sluss::landing::MarkerCreationState::Prepared
+    );
 }

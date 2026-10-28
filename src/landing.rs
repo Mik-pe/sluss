@@ -15,6 +15,15 @@ use thiserror::Error;
 const QUERY: &str =
     "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }";
 
+/// One PR head branch in the target repository, frozen for compare-and-update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedHead {
+    pub number: u64,
+    pub reference: String,
+    pub sha: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LandingPlan {
@@ -28,6 +37,9 @@ pub struct LandingPlan {
     /// A per-operation reference reserved for the experimental atomic receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker_ref: Option<String>,
+    /// Absent in older plans; not proof that reviews or rules are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarded_heads: Option<Vec<GuardedHead>>,
     pub base_sha: String,
     pub staged_sha: String,
     pub policy_digest: String,
@@ -77,6 +89,8 @@ pub enum LandingError {
     Transition,
     #[error("marker creation is not directly confirmed or its journal is inconsistent")]
     MarkerUnconfirmed,
+    #[error("PR head branch guards are missing, changed or invalid")]
+    UnprotectedHeads,
     #[error("provider response is ambiguous; keep the intent unresolved")]
     Uncertain,
     #[error("stored landing intent is corrupt")]
@@ -205,6 +219,9 @@ fn reference(value: &str) -> bool {
             .split('/')
             .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
 }
+pub(crate) fn valid_guarded_head_ref(value: &str) -> bool {
+    reference(value) && !value.starts_with("refs/heads/sluss/")
+}
 impl LandingPlan {
     pub fn validate(&self) -> Result<(), LandingError> {
         if !identifier(&self.operation_id)
@@ -244,12 +261,34 @@ impl LandingPlan {
         {
             return Err(LandingError::Invalid);
         }
+        if let Some(heads) = &self.guarded_heads {
+            let mut numbers = BTreeSet::new();
+            let mut references = BTreeSet::new();
+            if heads.is_empty()
+                || heads.len() > 100
+                || heads.iter().any(|head| {
+                    head.number == 0
+                        || head.number > i32::MAX as u64
+                        || !numbers.insert(head.number)
+                        || !valid_guarded_head_ref(&head.reference)
+                        || !references.insert(&head.reference)
+                        || head.reference.starts_with("refs/heads/sluss/")
+                        || head.reference == self.target_ref
+                        || head.reference == self.staging_ref
+                        || self.marker_ref.as_ref() == Some(&head.reference)
+                        || !hex(&head.sha, 40)
+                })
+            {
+                return Err(LandingError::Invalid);
+            }
+        }
         Ok(())
     }
 
     /// Build the documented atomic compare-and-update operation. This does
     /// not send it or attest that its inputs are authorized or current. It
-    /// does not atomically guard PR heads, reviews, labels or branch policy.
+    /// can guard explicitly frozen same-repository head refs, but does not
+    /// atomically guard reviews, labels, branch policy or PR metadata.
     pub fn graphql_request(&self) -> Result<serde_json::Value, LandingError> {
         self.validate()?;
         let mut refs = vec![
@@ -258,6 +297,11 @@ impl LandingPlan {
         ];
         if let Some(marker) = &self.marker_ref {
             refs.push(serde_json::json!({"name":marker,"beforeOid":self.base_sha,"afterOid":self.staged_sha,"force":false}));
+        }
+        if let Some(heads) = &self.guarded_heads {
+            for head in heads {
+                refs.push(serde_json::json!({"name":head.reference,"beforeOid":head.sha,"afterOid":head.sha,"force":false}));
+            }
         }
         Ok(serde_json::json!({"query":QUERY,"variables":{"input":{
             "repositoryId":self.repository_node_id,"clientMutationId":self.operation_id,
@@ -1242,12 +1286,16 @@ impl LandingJournal {
         let mut now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
         now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
         now.marker_ref = plan.marker_ref.clone();
+        now.guarded_heads = plan.guarded_heads.clone();
         if now != plan {
             return Err(LandingError::StaleBatch);
         }
         verify_trust_binding(&tx, &plan, policy)?;
         if let Some(policy) = policy {
             verify_trusted_policy(&tx, &plan, policy)?;
+        }
+        if plan.marker_ref.is_some() && plan.guarded_heads.is_none() {
+            return Err(LandingError::UnprotectedHeads);
         }
         if plan.marker_ref.is_some()
             && marker_creation_state(&tx, &plan)? != MarkerCreationState::Created
@@ -1281,6 +1329,73 @@ impl LandingJournal {
         }
         tx.commit()?;
         Ok(Some(plan))
+    }
+
+    /// Freeze observed same-repository source branches into both journal rows.
+    /// This binds refs to the exact batch inputs but does not authorize landing.
+    pub(crate) fn bind_guarded_heads(
+        &mut self,
+        target: &RefreshTarget,
+        policy: &TrustedCiPolicy,
+        heads: Vec<GuardedHead>,
+    ) -> Result<LandingPlan, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,i64,String)> = tx.query_row(
+            "SELECT i.plan,i.state,i.repository_id,i.target_ref FROM landing_intents_v1 i JOIN landing_batch_bindings_v1 b ON b.id=i.id WHERE i.id=?1",
+            [&target.plan.operation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        let (plan, state) = decode_row(
+            &target.plan.operation_id,
+            row.ok_or(LandingError::BatchBound)?,
+        )?;
+        if state != IntentState::Prepared || plan != target.plan || plan.marker_ref.is_none() {
+            return Err(LandingError::StaleBatch);
+        }
+        let mut now = observed_plan(
+            &tx,
+            &plan.operation_id,
+            &plan.batch_id,
+            &plan.repository_node_id,
+        )?;
+        now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
+        now.marker_ref = plan.marker_ref.clone();
+        now.guarded_heads = plan.guarded_heads.clone();
+        if now != plan || refresh_target_details(&tx, now)? != *target {
+            return Err(LandingError::StaleBatch);
+        }
+        verify_trust_binding(&tx, &plan, Some(policy))?;
+        verify_trusted_policy(&tx, &plan, policy)?;
+        if heads.len() != target.members.len()
+            || heads.iter().zip(&target.members).any(|(head, member)| {
+                head.number != member.candidate.number || head.sha != member.candidate.head_sha
+            })
+        {
+            return Err(LandingError::UnprotectedHeads);
+        }
+        let mut bound = plan.clone();
+        bound.guarded_heads = Some(heads);
+        bound
+            .validate()
+            .map_err(|_| LandingError::UnprotectedHeads)?;
+        if let Some(previous) = &plan.guarded_heads {
+            if Some(previous) != bound.guarded_heads.as_ref() {
+                return Err(LandingError::UnprotectedHeads);
+            }
+        } else {
+            if marker_creation_state(&tx, &plan)? != MarkerCreationState::Prepared {
+                return Err(LandingError::MarkerUnconfirmed);
+            }
+            let old = serde_json::to_string(&plan)?;
+            let new = serde_json::to_string(&bound)?;
+            if tx.execute("UPDATE landing_intents_v1 SET plan=?2 WHERE id=?1 AND state='prepared' AND plan=?3", params![plan.operation_id,new,old])? != 1
+                || tx.execute("UPDATE landing_marker_creation_v1 SET plan=?2 WHERE id=?1 AND state='prepared' AND plan=?3", params![plan.operation_id,new,old])? != 1 {
+                return Err(LandingError::Transition);
+            }
+        }
+        tx.commit()?;
+        Ok(bound)
     }
 
     /// Inspect a marker send without creating or changing journal state.
@@ -1373,7 +1488,11 @@ impl LandingJournal {
             &target.plan.operation_id,
             row.ok_or(LandingError::BatchBound)?,
         )?;
-        if state != IntentState::Prepared || plan != target.plan || plan.marker_ref.is_none() {
+        if state != IntentState::Prepared
+            || plan != target.plan
+            || plan.marker_ref.is_none()
+            || plan.guarded_heads.is_none()
+        {
             return Err(LandingError::StaleBatch);
         }
         let mut now = observed_plan(
@@ -1384,6 +1503,7 @@ impl LandingJournal {
         )?;
         now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
         now.marker_ref = plan.marker_ref.clone();
+        now.guarded_heads = plan.guarded_heads.clone();
         if now != plan || refresh_target_details(&tx, now)? != *target {
             return Err(LandingError::StaleBatch);
         }
@@ -1442,6 +1562,7 @@ impl LandingJournal {
         let mut now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
         now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
         now.marker_ref = plan.marker_ref.clone();
+        now.guarded_heads = plan.guarded_heads.clone();
         if now != plan {
             return Err(LandingError::StaleBatch);
         }
@@ -2042,6 +2163,7 @@ fn observed_plan(
         target_ref: format!("refs/heads/{target}"),
         staging_ref: dispatch.staging_ref,
         marker_ref: None,
+        guarded_heads: None,
         base_sha: batch.base_sha,
         staged_sha: integration.clone(),
         policy_digest: dispatch.policy_digest,
