@@ -4783,6 +4783,61 @@ async fn cli_dispatches_fixture() {
             .any(|item| item.reservation.id == pinned_id
                 && item.state == sluss::scheduler::DispatchState::Prepared)
     );
+    // An unrelated busy host must not hold the completed host's reservation.
+    // The bounded topology covers both hosts' pool usage, including old reruns.
+    sluss::worker::observe_dispatches_with_completion(
+        &fixture_app,
+        &stale_db,
+        &independent_capacity,
+        &fixture_policy,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        stale_store.batch(id).unwrap().unwrap().0.state,
+        sluss::batch::State::CiComplete { .. }
+    ));
+    mode.store(47, Ordering::SeqCst);
+    assert!(
+        sluss::worker::release_ci_only_once(
+            &fixture_app,
+            &stale_db,
+            &independent_capacity,
+            &fixture_policy
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(stale_scheduler.pending_dispatches().unwrap().len(), 2);
+    // A missing or mismatched unrelated runner still invalidates the inventory.
+    mode.store(28, Ordering::SeqCst);
+    assert!(
+        sluss::worker::release_ci_only_once(
+            &fixture_app,
+            &stale_db,
+            &independent_capacity,
+            &fixture_policy
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(stale_scheduler.pending_dispatches().unwrap().len(), 2);
+    mode.store(46, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::release_ci_only_once(
+            &fixture_app,
+            &stale_db,
+            &independent_capacity,
+            &fixture_policy
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let remaining = stale_scheduler.pending_dispatches().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].reservation.id, pinned_id);
     posts.store(0, Ordering::SeqCst);
     mode.store(0, Ordering::SeqCst);
     reads.store(0, Ordering::SeqCst);

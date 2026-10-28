@@ -180,6 +180,24 @@ pub fn check_repository_runner_inventory(
     Ok(())
 }
 
+/// Validate the whole inventory but require only the named host to be idle.
+/// Used with the bounded release topology, which reserves the worst-case pool
+/// budget for every configured host even if older workflows are rerun.
+pub fn check_repository_host_idle(
+    capacity: &crate::scheduler::Capacity,
+    runners: &[crate::github::RepositoryRunner],
+    host: &str,
+) -> Result<(), InventoryError> {
+    if !capacity.hosts.contains_key(host) {
+        return Err(InventoryError::InvalidConfiguration);
+    }
+    let available = available_repository_hosts(capacity, runners)?;
+    if !available.contains(host) {
+        return Err(InventoryError::InsufficientCapacity);
+    }
+    Ok(())
+}
+
 /// Validate the entire repository inventory and return only hosts whose full
 /// configured slot budget is currently idle. Other busy hosts do not block an
 /// independent reservation. Physical isolation remains an operator obligation.

@@ -790,8 +790,12 @@ pub async fn release_ci_only_once(
             .observe_repository_runners(&inventory_token, &policy.owner, &policy.name)
             .await
             .map_err(|e| e.to_string())?;
-        crate::verification::check_repository_runner_inventory(capacity, &runners)
-            .map_err(|e| e.to_string())?;
+        crate::verification::check_repository_host_idle(
+            capacity,
+            &runners,
+            &pending.reservation.host,
+        )
+        .map_err(|e| e.to_string())?;
         let last = app
             .reconcile_dispatch(
                 &mut scheduler,
