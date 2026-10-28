@@ -947,3 +947,115 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
     );
     assert_eq!(scheduler.pending_dispatches().unwrap().len(), 1);
 }
+
+#[test]
+fn busy_host_does_not_block_an_independent_eligible_host() {
+    use sluss::{
+        github::{RepositoryRunner, RunnerLabel},
+        scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError},
+        verification::{InventoryError, available_repository_hosts},
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let ids = ["batch-0000000000000001", "batch-0000000000000002"];
+    for id in ids {
+        store
+            .plan_batch(id, &"a".repeat(40), 2, 2)
+            .unwrap()
+            .unwrap();
+        store.start_integration(id).unwrap();
+        store
+            .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+            .unwrap();
+    }
+    let pools = BTreeMap::from([("rust".into(), 2)]);
+    let host = |runner_id| Host {
+        slots: 1,
+        runner_ids: BTreeSet::from([runner_id]),
+        pools: BTreeMap::from([("rust".into(), 1)]),
+    };
+    let capacity = Capacity {
+        pools,
+        hosts: BTreeMap::from([
+            ("sluss-host-a".into(), host(1)),
+            ("sluss-host-b".into(), host(2)),
+        ]),
+    };
+    let runner = |id, label: &str, busy| RepositoryRunner {
+        id,
+        name: format!("runner-{id}"),
+        status: "online".into(),
+        busy,
+        labels: vec![
+            RunnerLabel {
+                name: "self-hosted".into(),
+            },
+            RunnerLabel { name: label.into() },
+        ],
+    };
+    let mut inventory = vec![
+        runner(1, "sluss-host-a", true),
+        runner(2, "sluss-host-b", false),
+    ];
+    let eligible = available_repository_hosts(&capacity, &inventory).unwrap();
+    assert_eq!(eligible, BTreeSet::from(["sluss-host-b".into()]));
+    let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+    let request = Request {
+        pools: BTreeMap::from([("rust".into(), 1)]),
+    };
+    let make_plan = |id| DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: BTreeSet::from(["test".into()]),
+        suites: BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
+    };
+    let first = scheduler
+        .reserve_batch_dispatch_on(ids[0], &request, &make_plan(ids[0]), &eligible)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.host, "sluss-host-b");
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(ids[1], &request, &make_plan(ids[1]), &eligible)
+            .unwrap()
+            .is_none()
+    );
+    inventory[1].busy = true;
+    let none = available_repository_hosts(&capacity, &inventory).unwrap();
+    assert!(none.is_empty());
+    assert!(
+        scheduler
+            .reserve_batch_dispatch_on(ids[0], &request, &make_plan(ids[0]), &none)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        scheduler
+            .reserve_batch_dispatch_on(ids[0], &request, &make_plan(ids[0]), &eligible)
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    assert!(matches!(
+        scheduler.reserve_batch_dispatch_on(
+            ids[1],
+            &request,
+            &make_plan(ids[1]),
+            &BTreeSet::from(["unknown".into()])
+        ),
+        Err(SchedulerError::Invalid)
+    ));
+    inventory[0].labels.pop();
+    assert!(matches!(
+        available_repository_hosts(&capacity, &inventory),
+        Err(InventoryError::RunnerMismatch)
+    ));
+}

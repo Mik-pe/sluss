@@ -253,6 +253,12 @@ async fn repository_runners(
     assert_eq!(query["page"], "1");
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
+    if mode == 44 || mode == 45 {
+        return Json(json!({"total_count":2,"runners":[
+            {"id":2,"name":"busy-runner","status":"online","busy":true,"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
+            {"id":1,"name":"runner","status":"online","busy":mode == 45,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}
+        ]}));
+    }
     let id = if mode == 28 || (mode == 29 && count % 2 == 1) {
         2
     } else {
@@ -1437,6 +1443,79 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     .await
     .unwrap();
     let id = "batch-0123456789abcdef";
+    // Exercise the actual dispatch path with two independent hosts: a busy
+    // registered runner must not prevent dispatch to the other idle runner.
+    let independent_db = data.path().join("independent.sqlite");
+    let mut independent_inbox = Inbox::open(&independent_db).unwrap();
+    let mut independent_store = Store::open(&independent_db).unwrap();
+    independent_inbox
+        .record("independent", "pull_request", &[7; 32], 42, 7)
+        .unwrap();
+    let event = independent_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut independent_store,
+        &event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    independent_store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    independent_store.start_integration(id).unwrap();
+    independent_store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    let independent_capacity: sluss::scheduler::Capacity = toml::from_str(
+        "[pools]\nrust=2\n[hosts.sluss-host-busy]\nslots=1\nrunner_ids=[2]\n[hosts.sluss-host-busy.pools]\nrust=1\n[hosts.sluss-host-test]\nslots=1\nrunner_ids=[1]\n[hosts.sluss-host-test.pools]\nrust=1\n"
+    ).unwrap();
+    let settings = sluss::dispatch::Settings {
+        workflow_id: 17,
+        required_jobs: ["job-1-0".into()].into(),
+        request: sluss::scheduler::Request {
+            pools: [("rust".into(), 1)].into(),
+        },
+        verification_policy: None,
+    };
+    mode.store(45, Ordering::SeqCst);
+    assert_eq!(
+        sluss::dispatch::batch(
+            &independent_db,
+            &fixture_app,
+            &fixture_policy,
+            &independent_capacity,
+            &settings,
+            id
+        )
+        .await
+        .unwrap(),
+        sluss::dispatch::Outcome::NoCapacity
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    mode.store(44, Ordering::SeqCst);
+    assert_eq!(
+        sluss::dispatch::batch(
+            &independent_db,
+            &fixture_app,
+            &fixture_policy,
+            &independent_capacity,
+            &settings,
+            id
+        )
+        .await
+        .unwrap(),
+        sluss::dispatch::Outcome::Sent {
+            run: 123,
+            host: "sluss-host-test".into()
+        }
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    posts.store(0, Ordering::SeqCst);
+    mode.store(0, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
     store
         .plan_batch(id, &"b".repeat(40), 1, 1)
         .unwrap()

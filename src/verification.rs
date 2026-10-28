@@ -170,6 +170,20 @@ pub fn check_repository_runner_inventory(
     capacity: &crate::scheduler::Capacity,
     runners: &[crate::github::RepositoryRunner],
 ) -> Result<(), InventoryError> {
+    let available = available_repository_hosts(capacity, runners)?;
+    if available.len() != capacity.hosts.len() {
+        return Err(InventoryError::InsufficientCapacity);
+    }
+    Ok(())
+}
+
+/// Validate the entire repository inventory and return only hosts whose full
+/// configured slot budget is currently idle. Other busy hosts do not block an
+/// independent reservation. Physical isolation remains an operator obligation.
+pub fn available_repository_hosts(
+    capacity: &crate::scheduler::Capacity,
+    runners: &[crate::github::RepositoryRunner],
+) -> Result<BTreeSet<String>, InventoryError> {
     let mut configured = BTreeSet::new();
     for (label, host) in &capacity.hosts {
         if !crate::github::valid_runner_label(label)
@@ -217,6 +231,7 @@ pub fn check_repository_runner_inventory(
             return Err(InventoryError::RunnerMismatch);
         }
     }
+    let mut available_hosts = BTreeSet::new();
     for (label, host) in &capacity.hosts {
         let matches: Vec<_> = runners
             .iter()
@@ -235,11 +250,11 @@ pub fn check_repository_runner_inventory(
             .iter()
             .filter(|runner| runner.status == "online" && !runner.busy)
             .count();
-        if available < host.slots as usize {
-            return Err(InventoryError::InsufficientCapacity);
+        if available >= host.slots as usize {
+            available_hosts.insert(label.clone());
         }
     }
-    Ok(())
+    Ok(available_hosts)
 }
 
 /// A provider result comparison, not proof of trusted workflow policy.

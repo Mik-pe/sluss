@@ -166,11 +166,12 @@ pub async fn batch(
     let runners = app
         .observe_repository_runners(&inventory_token, &policy.owner, &policy.name)
         .await?;
-    verification::check_repository_runner_inventory(capacity, &runners)?;
+    let eligible_hosts = verification::available_repository_hosts(capacity, &runners)?;
     let token = app
         .dispatch_token(plan.installation_id, plan.repository_id)
         .await?;
-    let Some(reservation) = scheduler.reserve_batch_dispatch(batch_id, &settings.request, &plan)?
+    let Some(reservation) =
+        scheduler.reserve_batch_dispatch_on(batch_id, &settings.request, &plan, &eligible_hosts)?
     else {
         return Ok(Outcome::NoCapacity);
     };

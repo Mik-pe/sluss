@@ -139,7 +139,7 @@ impl Scheduler {
         id: &str,
         request: &Request,
     ) -> Result<Option<Reservation>, SchedulerError> {
-        self.reserve_inner(id, request, None, None)
+        self.reserve_inner(id, request, None, None, None)
     }
     /// Atomically record the frozen dispatch intent and reserve capacity.
     /// No provider request is made here.
@@ -152,7 +152,7 @@ impl Scheduler {
         if !plan.valid() {
             return Err(SchedulerError::Invalid);
         }
-        self.reserve_inner(id, request, Some(plan), None)
+        self.reserve_inner(id, request, Some(plan), None, None)
     }
     /// Reserve a dispatch bound to a frozen batch in the same database.
     /// Provider policy, staging-ref protection and runner placement still need
@@ -166,7 +166,32 @@ impl Scheduler {
         if !plan.valid() || plan.staging_ref != format!("refs/heads/sluss/{batch_id}") {
             return Err(SchedulerError::Invalid);
         }
-        self.reserve_inner(batch_id, request, Some(plan), Some(batch_id))
+        self.reserve_inner(batch_id, request, Some(plan), Some(batch_id), None)
+    }
+    /// Reserve only among hosts observed eligible by the caller. The caller
+    /// must revalidate provider inventory; this set is not an enforcement gate.
+    pub fn reserve_batch_dispatch_on(
+        &mut self,
+        batch_id: &str,
+        request: &Request,
+        plan: &DispatchPlan,
+        eligible_hosts: &std::collections::BTreeSet<String>,
+    ) -> Result<Option<Reservation>, SchedulerError> {
+        if !plan.valid()
+            || plan.staging_ref != format!("refs/heads/sluss/{batch_id}")
+            || eligible_hosts
+                .iter()
+                .any(|name| !self.capacity.hosts.contains_key(name))
+        {
+            return Err(SchedulerError::Invalid);
+        }
+        self.reserve_inner(
+            batch_id,
+            request,
+            Some(plan),
+            Some(batch_id),
+            Some(eligible_hosts),
+        )
     }
     fn reserve_inner(
         &mut self,
@@ -174,6 +199,7 @@ impl Scheduler {
         request: &Request,
         plan: Option<&DispatchPlan>,
         batch_id: Option<&str>,
+        eligible_hosts: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Option<Reservation>, SchedulerError> {
         if id.is_empty()
             || request.pools.is_empty()
@@ -251,6 +277,9 @@ impl Scheduler {
             if old != *request {
                 return Err(SchedulerError::IdConflict);
             }
+            if eligible_hosts.is_some_and(|hosts| !hosts.contains(&host)) {
+                return Ok(None);
+            }
             return Ok(Some(Reservation {
                 id: id.into(),
                 host,
@@ -297,7 +326,8 @@ impl Scheduler {
             .hosts
             .iter()
             .find(|(name, host)| {
-                slots.get(*name).copied().unwrap_or(0) < u64::from(host.slots)
+                eligible_hosts.is_none_or(|hosts| hosts.contains(*name))
+                    && slots.get(*name).copied().unwrap_or(0) < u64::from(host.slots)
                     && request.pools.iter().all(|(pool, amount)| {
                         host.pools.get(pool).is_some_and(|limit| {
                             per_host
