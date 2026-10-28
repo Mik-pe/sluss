@@ -904,8 +904,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if verification_policy.is_some() && !auto_stage && !auto_dispatch {
             return Err("--verification-policy requires --auto-stage or --auto-dispatch".into());
         }
+        // Check every static worker setting before creating the inbox, binding
+        // persistent state, listening, or spawning workers that can contact GitHub.
+        if auto_stage {
+            let paths: std::collections::BTreeSet<_> = policy_file.iter().collect();
+            if paths.len() != policy_file.len()
+                || paths.is_empty()
+                || paths.len() > 128
+                || paths
+                    .iter()
+                    .any(|path| !sluss::integration::valid_policy_path(path))
+            {
+                return Err("invalid or duplicate CI policy paths".into());
+            }
+        }
+        if let Some(path) = &verification_policy {
+            sluss::selective::Policy::load(path)?;
+        }
+        let capacity_config =
+            if auto_dispatch || cancel_stale || observe_dispatches || release_ci_only {
+                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                sluss::scheduler::validate_capacity(&capacity)
+                    .map_err(|error| error.to_string())?;
+                if release_ci_only {
+                    sluss::verification::check_release_topology(&capacity)
+                        .map_err(|error| error.to_string())?;
+                }
+                Some(capacity)
+            } else {
+                None
+            };
+        let dispatch_settings = if auto_dispatch {
+            let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
+            let workflow_id = workflow_id.ok_or("workflow ID is required")?;
+            let jobs: std::collections::BTreeSet<_> = required_job.into_iter().collect();
+            let pools = parse_pools(&pool)?;
+            if workflow_id == 0
+                || jobs.is_empty()
+                || jobs.len() > 100
+                || jobs.iter().any(|name: &String| {
+                    name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+                })
+                || capacity
+                    .hosts
+                    .keys()
+                    .any(|name| !sluss::github::valid_runner_label(name))
+                || pools.iter().any(|(name, amount)| {
+                    capacity.pools.get(name).is_none_or(|limit| amount > limit)
+                })
+                || !capacity.hosts.values().any(|host| {
+                    pools.iter().all(|(name, amount)| {
+                        host.pools.get(name).is_some_and(|limit| amount <= limit)
+                    })
+                })
+            {
+                return Err(
+                    "invalid workflow, required jobs or unsatisfiable dispatch capacity".into(),
+                );
+            }
+            Some(sluss::dispatch::Settings {
+                workflow_id,
+                required_jobs: jobs,
+                request: sluss::scheduler::Request { pools },
+                verification_policy: verification_policy.clone(),
+            })
+        } else {
+            None
+        };
         let secret = std::env::var("SLUSS_WEBHOOK_SECRET")?;
-        let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
         let worker = if let Some(path) = config {
             let config = sluss::config::Config::load(&path)?;
             if auto_plan && config.queue.adaptive_batching && !complete_ci_only {
@@ -919,10 +985,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &key,
                 &config.github.api,
             )?);
-            let mut initial_store = Store::open(&cli.db)?;
-            if complete_ci_only {
-                initial_store.bind_ci_bisection(bisect_ci_failures)?;
-            }
             Some((
                 app,
                 config.policy(),
@@ -933,11 +995,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let _inbox = sluss::webhook::Inbox::open(&cli.db)?;
+        if complete_ci_only {
+            Store::open(&cli.db)?.bind_ci_bisection(bisect_ci_failures)?;
+        }
         let scope = worker
             .as_ref()
             .map(|(_, policy, _, _, _)| (policy.installation, policy.repository));
         let app = sluss::webhook::router_with_scope(secret.into_bytes(), cli.db.clone(), scope)?;
-        let listener = tokio::net::TcpListener::bind(listen).await?;
         if let Some((app, policy, planning, poll, rescan)) = worker {
             if auto_plan {
                 eprintln!("automatic batch planning enabled; landing remains disabled");
@@ -961,15 +1027,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             if auto_dispatch {
-                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
-                let settings = sluss::dispatch::Settings {
-                    workflow_id: workflow_id.ok_or("workflow ID is required")?,
-                    required_jobs: required_job.into_iter().collect(),
-                    request: sluss::scheduler::Request {
-                        pools: parse_pools(&pool)?,
-                    },
-                    verification_policy,
-                };
+                let capacity = capacity_config
+                    .as_ref()
+                    .expect("preflight capacity")
+                    .clone();
+                let settings = dispatch_settings.expect("preflight dispatch settings");
                 eprintln!("automatic dispatch enabled; landing remains disabled");
                 tokio::spawn(sluss::worker::supervise_dispatch(
                     app.clone(),
@@ -981,7 +1043,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             if cancel_stale {
-                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                let capacity = capacity_config
+                    .as_ref()
+                    .expect("preflight capacity")
+                    .clone();
                 eprintln!(
                     "automatic stale-run cancellation enabled; capacity is not automatically released"
                 );
@@ -1005,8 +1070,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             if release_ci_only {
-                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
-                sluss::verification::check_release_topology(&capacity)?;
+                let capacity = capacity_config
+                    .as_ref()
+                    .expect("preflight capacity")
+                    .clone();
                 eprintln!(
                     "CI-only capacity release enabled under the single-runner isolation contract"
                 );
@@ -1019,7 +1086,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             if observe_dispatches {
-                let capacity = load_capacity(capacity.as_deref().ok_or("capacity is required")?)?;
+                let capacity = capacity_config
+                    .as_ref()
+                    .expect("preflight capacity")
+                    .clone();
                 eprintln!(
                     "automatic dispatch observation enabled; observations do not authorize landing"
                 );

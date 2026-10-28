@@ -542,7 +542,8 @@ fn policy_snapshot(
         paths,
     })
 }
-pub(crate) fn valid_policy_path(path: &str) -> bool {
+/// Check a repository-relative CI policy path before preparing work.
+pub fn valid_policy_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 512
         && path

@@ -98,3 +98,96 @@ fn adaptive_batching_requires_single_active_batch_and_ci_completion_worker() {
     .unwrap();
     assert!(matches!(Config::load(&config), Err(ConfigError::Invalid)));
 }
+
+#[test]
+fn invalid_worker_configuration_fails_before_creating_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("sluss.toml");
+    let capacity = dir.path().join("capacity.toml");
+    let db = dir.path().join("queue.sqlite");
+    std::fs::write(&config, VALID).unwrap();
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db)
+            .args(["serve", "--config"])
+            .arg(&config)
+            .args(extra)
+            .env("SLUSS_WEBHOOK_SECRET", "test")
+            .env_remove("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+            .output()
+            .unwrap()
+    };
+    let cap = capacity.to_str().unwrap();
+    let flags = [
+        "--auto-plan",
+        "--auto-stage",
+        "--policy-file",
+        ".github/workflows/ci.yml",
+        "--auto-dispatch",
+        "--capacity",
+        cap,
+        "--workflow-id",
+        "17",
+        "--required-job",
+        "test",
+        "--pool",
+        "rust=1",
+    ];
+    std::fs::write(&capacity, "not valid toml").unwrap();
+    let output = run(&flags);
+    assert!(!output.status.success());
+    assert!(
+        !db.exists(),
+        "a worker or inbox touched the database before validation"
+    );
+
+    std::fs::write(
+        &capacity,
+        "[pools]\nrust = 1\n[hosts.sluss-host-one]\nslots = 0\npools = {rust = 1}\n",
+    )
+    .unwrap();
+    let output = run(&flags);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("capacity configuration or request is invalid")
+    );
+    assert!(!db.exists());
+
+    std::fs::write(
+        &capacity,
+        "[pools]\nrust = 1\n[hosts.sluss-host-one]\nslots = 1\npools = {rust = 1}\n",
+    )
+    .unwrap();
+    let output = run(&["--auto-stage", "--policy-file", "../outside"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid or duplicate CI policy paths")
+    );
+    assert!(!db.exists());
+    let output = run(&[
+        "--auto-dispatch",
+        "--capacity",
+        cap,
+        "--workflow-id",
+        "17",
+        "--required-job",
+        "test",
+        "--pool",
+        "rust=2",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsatisfiable dispatch capacity"));
+    assert!(!db.exists());
+    let output = run(&[
+        "--observe-dispatches",
+        "--complete-ci-only",
+        "--release-ci-only",
+        "--capacity",
+        cap,
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one registered runner"));
+    assert!(!db.exists());
+}

@@ -604,7 +604,8 @@ fn capacity_extends_release_envelope(previous: &Capacity, next: &Capacity) -> bo
         })
 }
 
-fn validate_capacity(capacity: &Capacity) -> Result<(), SchedulerError> {
+/// Validate the topology without opening or changing a scheduler database.
+pub fn validate_capacity(capacity: &Capacity) -> Result<(), SchedulerError> {
     if capacity.pools.is_empty()
         || capacity.hosts.is_empty()
         || capacity.pools.iter().any(|(k, v)| k.is_empty() || *v == 0)
