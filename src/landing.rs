@@ -274,6 +274,42 @@ fn recovery_digest(body: &str) -> String {
     hex::encode(hash.finalize())
 }
 
+/// A provider-observed candidate for a future CI attestation. Its stored
+/// digest is an integrity check, not a signature or merge authorization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiEvidenceCandidate {
+    pub plan: LandingPlan,
+    pub policy: TrustedCiPolicy,
+    pub snapshot: crate::github::ActionsSnapshot,
+    pub app_id: u64,
+    pub app_node_id: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiEvidenceRecord {
+    pub candidate: CiEvidenceCandidate,
+    pub digest: String,
+    pub first_observed_ms: u64,
+}
+fn ci_candidate_digest(body: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-ci-evidence-candidate-v1\0");
+    hash.update(body.as_bytes());
+    hex::encode(hash.finalize())
+}
+fn validate_ci_candidate(candidate: &CiEvidenceCandidate) -> Result<(), LandingError> {
+    candidate.plan.validate()?;
+    if candidate.app_id == 0
+        || !node_id(&candidate.app_node_id)
+        || candidate.plan.trusted_ci_policy_digest.as_deref()
+            != Some(candidate.policy.digest()?.as_str())
+        || candidate.snapshot.run.id == 0
+    {
+        return Err(LandingError::Corrupt);
+    }
+    Ok(())
+}
+
 pub struct LandingJournal {
     conn: Connection,
 }
@@ -320,6 +356,111 @@ impl LandingJournal {
         }
         Ok(current.plan)
     }
+    /// Append an independently provider-refreshed candidate only after the
+    /// local batch, policy, admission and recorded run still agree in one
+    /// transaction. No GitHub check or landing intent is created.
+    pub(crate) fn record_ci_candidate(
+        &mut self,
+        expected: &RefreshTarget,
+        policy: &TrustedCiPolicy,
+        snapshot: &crate::github::ActionsSnapshot,
+        app: &crate::github::AppIdentity,
+        observed_ms: u64,
+    ) -> Result<CiEvidenceRecord, LandingError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let plan = observed_plan(
+            &tx,
+            &expected.plan.operation_id,
+            &expected.plan.batch_id,
+            &policy.repository_node_id,
+        )?;
+        verify_trusted_policy(&tx, &plan, policy)?;
+        let current = refresh_target_details(&tx, plan)?;
+        let mut normalized = snapshot.clone();
+        normalized.jobs.sort_by_key(|job| job.id);
+        if current != *expected || current.snapshot != normalized {
+            return Err(LandingError::StaleBatch);
+        }
+        let mut bound_plan = current.plan;
+        let policy_digest = policy.digest()?;
+        bound_plan.trusted_ci_policy_digest = Some(policy_digest.clone());
+        let candidate = CiEvidenceCandidate {
+            plan: bound_plan,
+            policy: policy.clone(),
+            snapshot: normalized,
+            app_id: app.id,
+            app_node_id: app.node_id.clone(),
+        };
+        validate_ci_candidate(&candidate)?;
+        let body = serde_json::to_string(&candidate)?;
+        if body.len() > 8_000_000 || observed_ms == 0 {
+            return Err(LandingError::Corrupt);
+        }
+        let digest = ci_candidate_digest(&body);
+        let observed_ms = i64::try_from(observed_ms).map_err(|_| LandingError::Corrupt)?;
+        tx.execute("INSERT OR IGNORE INTO ci_evidence_candidates_v1(batch_id,policy_digest,body,digest,first_observed_ms) VALUES(?1,?2,?3,?4,?5)", params![candidate.plan.batch_id,policy_digest,body,digest,observed_ms])?;
+        let (saved, saved_policy, first): (String,String,i64) = tx.query_row("SELECT body,policy_digest,first_observed_ms FROM ci_evidence_candidates_v1 WHERE batch_id=?1 AND digest=?2", params![candidate.plan.batch_id,digest], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        if saved != body || saved_policy != policy.digest()? || first <= 0 {
+            return Err(LandingError::Corrupt);
+        }
+        tx.execute("INSERT INTO ci_evidence_candidate_heads_v1(batch_id,policy_digest,digest) VALUES(?1,?2,?3) ON CONFLICT(batch_id,policy_digest) DO UPDATE SET digest=excluded.digest", params![candidate.plan.batch_id,policy_digest,digest])?;
+        tx.commit()?;
+        Ok(CiEvidenceRecord {
+            candidate,
+            digest,
+            first_observed_ms: first as u64,
+        })
+    }
+
+    /// Inspect the saved candidate under the current local queue and policy.
+    /// Provider state may have changed since it was recorded.
+    pub fn inspect_ci_candidate(
+        &mut self,
+        batch_id: &str,
+        policy: &TrustedCiPolicy,
+    ) -> Result<Option<CiEvidenceRecord>, LandingError> {
+        let policy_digest = policy.digest()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_evidence_candidate_heads_v1')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let head: Option<String> = tx.query_row("SELECT digest FROM ci_evidence_candidate_heads_v1 WHERE batch_id=?1 AND policy_digest=?2", params![batch_id,policy_digest], |r| r.get(0)).optional()?;
+        let Some(head) = head else { return Ok(None) };
+        let row: Option<(String,String,i64)> = tx.query_row("SELECT body,digest,first_observed_ms FROM ci_evidence_candidates_v1 WHERE batch_id=?1 AND policy_digest=?2 AND digest=?3", params![batch_id,policy_digest,head], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let (body, digest, first) = row.ok_or(LandingError::Corrupt)?;
+        if body.len() > 8_000_000 || ci_candidate_digest(&body) != digest || first <= 0 {
+            return Err(LandingError::Corrupt);
+        }
+        let candidate: CiEvidenceCandidate = serde_json::from_str(&body)?;
+        validate_ci_candidate(&candidate)?;
+        if candidate.plan.batch_id != batch_id || candidate.policy != *policy {
+            return Err(LandingError::Corrupt);
+        }
+        let mut plan = observed_plan(
+            &tx,
+            &candidate.plan.operation_id,
+            batch_id,
+            &policy.repository_node_id,
+        )?;
+        verify_trusted_policy(&tx, &plan, policy)?;
+        let target = refresh_target_details(&tx, plan.clone())?;
+        plan.trusted_ci_policy_digest = Some(policy_digest);
+        if candidate.plan != plan || candidate.snapshot != target.snapshot {
+            return Err(LandingError::StaleBatch);
+        }
+        tx.commit()?;
+        Ok(Some(CiEvidenceRecord {
+            candidate,
+            digest,
+            first_observed_ms: first as u64,
+        }))
+    }
+
     /// Compare a frozen local batch to an operator policy without creating a
     /// journal intent or querying the provider. The database is opened read-only.
     pub fn inspect_trusted_batch(
@@ -352,6 +493,8 @@ impl LandingJournal {
         ON landing_intents_v1(repository_id,target_ref) WHERE state IN ('prepared','sending');
         CREATE TABLE IF NOT EXISTS landing_recovery_observations_v1 (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS landing_recovery_by_id_v1 ON landing_recovery_observations_v1(id,sequence);
+        CREATE TABLE IF NOT EXISTS ci_evidence_candidates_v1 (batch_id TEXT NOT NULL, policy_digest TEXT NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL, first_observed_ms INTEGER NOT NULL, PRIMARY KEY(batch_id,digest));
+        CREATE TABLE IF NOT EXISTS ci_evidence_candidate_heads_v1 (batch_id TEXT NOT NULL, policy_digest TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id,policy_digest));
         CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
         CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);",
         )?;
@@ -901,8 +1044,13 @@ fn observed_plan(
     use crate::batch::State;
     use crate::verification::CiObservation;
     let (batch, _) = crate::store::checked_batch(tx, batch_id)?;
-    let integration = match &batch.state {
-        State::Testing { integration_sha } => integration_sha,
+    let (integration, completed_run) = match &batch.state {
+        State::Testing { integration_sha } => (integration_sha, None),
+        State::CiComplete {
+            integration_sha,
+            run_id,
+            conclusion,
+        } if conclusion == "success" => (integration_sha, Some(*run_id)),
         _ => return Err(LandingError::StaleBatch),
     };
     let binding: (i64, i64, String) = tx.query_row(
@@ -972,6 +1120,19 @@ fn observed_plan(
     )?;
     let record: crate::scheduler::CiObservationRecord = serde_json::from_str(&ci_body)?;
     let dispatch: crate::scheduler::DispatchPlan = serde_json::from_str(&dispatch_body)?;
+    let receipt_conflict: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+        [batch_id],
+        |r| r.get(0),
+    )?;
+    let (reserved, finished): (bool, bool) = tx.query_row("SELECT EXISTS(SELECT 1 FROM capacity_reservations WHERE id=?1), EXISTS(SELECT 1 FROM capacity_finished WHERE id=?1)", [batch_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    let lifecycle_valid = match (completed_run, state.as_str(), reserved, finished) {
+        (None, "observed", true, false) => true,
+        (Some(run), "observed", true, false) | (Some(run), "finished", false, true) => {
+            run == record.run_id
+        }
+        _ => false,
+    };
     let snapshot = record.snapshot.as_ref().ok_or(LandingError::StaleBatch)?;
     let runner = record.runner_id.ok_or(LandingError::StaleBatch)?;
     let paths: Option<String> = tx
@@ -1004,8 +1165,9 @@ fn observed_plan(
         return Err(LandingError::StaleBatch);
     }
     if conflicted
+        || receipt_conflict
+        || !lifecycle_valid
         || source != "direct"
-        || state != "observed"
         || record.plan != dispatch
         || i64::try_from(dispatch.installation_id).ok() != Some(binding.0)
         || i64::try_from(dispatch.repository_id).ok() != Some(binding.1)

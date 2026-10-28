@@ -697,3 +697,136 @@ fn replacing_policy_and_its_row_digest_cannot_rebind_a_claimed_intent() {
         IntentState::Sending
     );
 }
+
+#[test]
+fn successful_ci_evidence_survives_completion_and_bounded_capacity_release() {
+    let mut f = setup();
+    let trust = trusted_policy();
+    let before = f
+        .journal
+        .prepare_trusted_batch("land-trusted", BATCH, &trust)
+        .unwrap();
+    let budgets = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &f.db,
+        Capacity {
+            pools: budgets.clone(),
+            hosts: BTreeMap::from([(
+                "sluss-host-test".into(),
+                Host {
+                    slots: 1,
+                    runner_ids: BTreeSet::from([7]),
+                    pools: budgets,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    scheduler.complete_ci_only(BATCH).unwrap();
+    let completed = f
+        .journal
+        .prepare_trusted_batch("land-trusted", BATCH, &trust)
+        .unwrap();
+    assert_eq!(before, completed);
+    scheduler.release_completed_ci_only(BATCH, 42).unwrap();
+    drop(scheduler);
+    f.journal = LandingJournal::open(&f.db).unwrap();
+    let resumed = f
+        .journal
+        .prepare_trusted_batch("land-trusted", BATCH, &trust)
+        .unwrap();
+    assert_eq!(before, resumed);
+    assert_eq!(
+        LandingJournal::inspect_trusted_batch(&f.db, BATCH, &trust)
+            .unwrap()
+            .staged_sha,
+        "b".repeat(40)
+    );
+    f.inbox
+        .record("changed", "pull_request_review", &[2; 32], 1, 2)
+        .unwrap();
+    let event = f.inbox.pending().unwrap().remove(0);
+    f.store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &[candidate("1", "3")],
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert!(
+        f.journal
+            .prepare_trusted_batch("land-trusted", BATCH, &trust)
+            .is_err()
+    );
+}
+
+#[test]
+fn completed_ci_requires_consistent_run_and_terminal_reservation_state() {
+    for mode in [
+        "wrong-run",
+        "bad-conclusion",
+        "missing-finished",
+        "receipt-conflict",
+    ] {
+        let mut f = setup();
+        let budgets = BTreeMap::from([("rust".into(), 1)]);
+        let mut scheduler = Scheduler::open(
+            &f.db,
+            Capacity {
+                pools: budgets.clone(),
+                hosts: BTreeMap::from([(
+                    "sluss-host-test".into(),
+                    Host {
+                        slots: 1,
+                        runner_ids: BTreeSet::from([7]),
+                        pools: budgets,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+        scheduler.complete_ci_only(BATCH).unwrap();
+        scheduler.release_completed_ci_only(BATCH, 42).unwrap();
+        let conn = rusqlite::Connection::open(&f.db).unwrap();
+        match mode {
+            "wrong-run" => {
+                conn.execute("UPDATE batches SET body=json_set(body,'$.state.CiComplete.run_id',43) WHERE id=?1", [BATCH]).unwrap();
+            }
+            "bad-conclusion" => {
+                conn.execute("UPDATE batches SET body=json_set(body,'$.state.CiComplete.conclusion','failure') WHERE id=?1", [BATCH]).unwrap();
+            }
+            "missing-finished" => {
+                conn.execute("DELETE FROM capacity_finished WHERE id=?1", [BATCH])
+                    .unwrap();
+            }
+            _ => {
+                conn.execute("INSERT INTO dispatch_receipt_conflicts(id,recovered_run,direct_run) VALUES(?1,'42','43')", [BATCH]).unwrap();
+            }
+        }
+        assert!(
+            f.journal
+                .prepare_trusted_batch("land-trusted", BATCH, &trusted_policy())
+                .is_err(),
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn candidate_inspection_is_read_only_and_does_not_create_a_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent.sqlite");
+    let policy = dir.path().join("trust.toml");
+    std::fs::write(&policy, toml::to_string(&trusted_policy()).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["inspect-staged-ci", "--batch-id", BATCH, "--policy"])
+        .arg(policy)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!db.exists());
+}

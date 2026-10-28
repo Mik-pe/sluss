@@ -3354,6 +3354,308 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     );
     let trust_file = data.path().join("trusted-ci.toml");
     std::fs::write(&trust_file, toml::to_string(&selected_trust).unwrap()).unwrap();
+    let mut candidate_original = sluss::landing::LandingJournal::open(&db).unwrap();
+    let original = observer_app
+        .verify_staged_ci(
+            &mut candidate_original,
+            (&fixture_token, &security_token),
+            &observer_policy,
+            &selected_trust,
+            id,
+        )
+        .await
+        .unwrap();
+    for invalid in [13, 16, 21, 22, 40, 63, 64, 67, 77, 104, 110, 117] {
+        mode.store(invalid, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        graphql_counts.store(0, Ordering::SeqCst);
+        assert!(
+            observer_app
+                .verify_staged_ci(
+                    &mut candidate_original,
+                    (&fixture_token, &security_token),
+                    &observer_policy,
+                    &selected_trust,
+                    id
+                )
+                .await
+                .is_err(),
+            "mode {invalid}"
+        );
+    }
+    mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        candidate_original
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(original.clone())
+    );
+    let candidate_race_db = data.path().join("ci-evidence-race.sqlite");
+    let race_conn = rusqlite::Connection::open(&db).unwrap();
+    race_conn
+        .execute("VACUUM INTO ?1", [candidate_race_db.to_str().unwrap()])
+        .unwrap();
+    let mut race_journal = sluss::landing::LandingJournal::open(&candidate_race_db).unwrap();
+    let mut race_inbox = Inbox::open(&candidate_race_db).unwrap();
+    mode.store(121, Ordering::SeqCst);
+    graphql_counts.store(0, Ordering::SeqCst);
+    let (raced, _) = tokio::join!(
+        observer_app.verify_staged_ci(
+            &mut race_journal,
+            (&fixture_token, &security_token),
+            &observer_policy,
+            &selected_trust,
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while graphql_counts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            race_inbox
+                .record("ci-candidate-race", "pull_request_review", &[44; 32], 42, 7)
+                .unwrap();
+            mode.store(0, Ordering::SeqCst);
+        }
+    );
+    assert!(
+        raced.is_err(),
+        "a webhook during the provider scan must reject recording"
+    );
+    let count: i64 = race_conn
+        .query_row("SELECT COUNT(*) FROM ci_evidence_candidates_v1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "a stale scan must not append new evidence");
+    mode.store(0, Ordering::SeqCst);
+    // A CI-only candidate does not require branch bypass and cannot create
+    // an App check or claim a landing intent.
+    let candidate_db = data.path().join("ci-evidence.sqlite");
+    let snapshot_conn = rusqlite::Connection::open(&db).unwrap();
+    snapshot_conn
+        .execute("VACUUM INTO ?1", [candidate_db.to_str().unwrap()])
+        .unwrap();
+    let candidate_conn = rusqlite::Connection::open(&candidate_db).unwrap();
+    let security_body: String = candidate_conn
+        .query_row(
+            "SELECT body FROM dispatch_branch_security WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut frozen_security: sluss::github::BranchSecurityObservation =
+        serde_json::from_str(&security_body).unwrap();
+    frozen_security.rulesets[0].detail["bypass_actors"] = json!([]);
+    let security_digest = frozen_security.digest().unwrap();
+    candidate_conn
+        .execute(
+            "UPDATE dispatch_branch_security SET body=?2,digest=?3 WHERE id=?1",
+            rusqlite::params![
+                id,
+                serde_json::to_string(&frozen_security).unwrap(),
+                security_digest
+            ],
+        )
+        .unwrap();
+    let mut candidate_journal = sluss::landing::LandingJournal::open(&candidate_db).unwrap();
+    let mut candidate_preview =
+        sluss::landing::LandingJournal::open_read_only(&candidate_db).unwrap();
+    mode.store(73, Ordering::SeqCst);
+    assert!(matches!(
+        observer_app
+            .preview_trusted_batch(
+                &mut candidate_preview,
+                &fixture_token,
+                &security_token,
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await,
+        Err(sluss::github::LandingRefreshError::UnsafeBranchPolicy)
+    ));
+    let writes_before = posts.load(Ordering::SeqCst);
+    let recorded = observer_app
+        .verify_staged_ci(
+            &mut candidate_journal,
+            (&fixture_token, &security_token),
+            &observer_policy,
+            &selected_trust,
+            id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recorded.candidate.snapshot.run.id, 123);
+    assert_eq!(recorded.candidate.plan.staged_sha, "a".repeat(40));
+    assert_eq!(recorded.candidate.app_id, 17);
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(recorded.clone())
+    );
+    let repeat = observer_app
+        .verify_staged_ci(
+            &mut candidate_journal,
+            (&fixture_token, &security_token),
+            &observer_policy,
+            &selected_trust,
+            id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recorded, repeat, "repeated observations must be idempotent");
+    assert_eq!(posts.load(Ordering::SeqCst), writes_before);
+    let count: i64 = candidate_conn
+        .query_row("SELECT COUNT(*) FROM ci_evidence_candidates_v1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 2);
+    candidate_conn
+        .execute(
+            "UPDATE ci_evidence_candidate_heads_v1 SET digest=?2 WHERE batch_id=?1",
+            rusqlite::params![id, original.digest],
+        )
+        .unwrap();
+    assert!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .is_err()
+    );
+    assert_eq!(
+        observer_app
+            .verify_staged_ci(
+                &mut candidate_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .unwrap(),
+        recorded
+    );
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(recorded.clone())
+    );
+    let db_arg = candidate_db.clone();
+    let config_arg = config.clone();
+    let policy_arg = trust_file.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let candidate_cli = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db_arg)
+            .args(["verify-staged-ci", "--batch-id", id, "--config"])
+            .arg(config_arg)
+            .arg("--policy")
+            .arg(policy_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        candidate_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&candidate_cli.stderr)
+    );
+    assert!(String::from_utf8_lossy(&candidate_cli.stdout).contains("no GitHub check was created"));
+    let inspect_cli = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&candidate_db)
+        .args(["inspect-staged-ci", "--batch-id", id, "--policy"])
+        .arg(&trust_file)
+        .output()
+        .unwrap();
+    assert!(inspect_cli.status.success());
+    assert!(String::from_utf8_lossy(&inspect_cli.stdout).contains(&recorded.digest));
+    let mut completed_scheduler =
+        sluss::scheduler::Scheduler::open(&candidate_db, observer_capacity.clone()).unwrap();
+    completed_scheduler.complete_ci_only(id).unwrap();
+    completed_scheduler
+        .release_completed_ci_only(id, 123)
+        .unwrap();
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(recorded.clone())
+    );
+    assert_eq!(
+        observer_app
+            .verify_staged_ci(
+                &mut candidate_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .unwrap(),
+        recorded
+    );
+    let corrupt_db = data.path().join("ci-evidence-corrupt.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [corrupt_db.to_str().unwrap()])
+        .unwrap();
+    let corrupt_conn = rusqlite::Connection::open(&corrupt_db).unwrap();
+    corrupt_conn
+        .execute(
+            "UPDATE ci_evidence_candidates_v1 SET body='{}' WHERE digest=?1",
+            [&recorded.digest],
+        )
+        .unwrap();
+    let mut corrupt_journal = sluss::landing::LandingJournal::open_read_only(&corrupt_db).unwrap();
+    assert!(matches!(
+        corrupt_journal.inspect_ci_candidate(id, &selected_trust),
+        Err(sluss::landing::LandingError::Corrupt)
+    ));
+    let mut wrong_trust = selected_trust.clone();
+    wrong_trust.workflow_id += 1;
+    assert!(
+        observer_app
+            .verify_staged_ci(
+                &mut candidate_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &wrong_trust,
+                id
+            )
+            .await
+            .is_err()
+    );
+    let mut candidate_inbox = Inbox::open(&candidate_db).unwrap();
+    candidate_inbox
+        .record("candidate-stale", "pull_request_review", &[33; 32], 42, 7)
+        .unwrap();
+    assert!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .is_err()
+    );
+    assert!(
+        observer_app
+            .verify_staged_ci(
+                &mut candidate_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .is_err()
+    );
+    mode.store(0, Ordering::SeqCst);
     let output = launch(vec![
         "preview-trusted-batch".into(),
         "--batch-id".into(),

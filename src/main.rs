@@ -128,6 +128,22 @@ enum Command {
         #[arg(long)]
         operation_id: String,
     },
+    /// Record provider-observed staging CI evidence under an operator policy.
+    VerifyStagedCi {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Inspect a saved CI evidence candidate against current local state.
+    InspectStagedCi {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        policy: PathBuf,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -896,6 +912,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
+    if let Command::InspectStagedCi { batch_id, policy } = &cli.command {
+        let trust = sluss::landing::TrustedCiPolicy::load(policy)?;
+        let mut journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        match journal.inspect_ci_candidate(batch_id, &trust)? {
+            Some(record) => println!(
+                "CI evidence candidate {}: run {}, commit {}, digest {}, first observed {} ms",
+                batch_id,
+                record.candidate.snapshot.run.id,
+                record.candidate.plan.staged_sha,
+                record.digest,
+                record.first_observed_ms
+            ),
+            None => println!("no recorded CI evidence candidate for this policy"),
+        }
+        println!(
+            "local comparison only; provider state may have changed; not an attestation or merge authorization"
+        );
+        return Ok(());
+    }
     if let Command::LandingRecovery { operation_id } = &cli.command {
         let journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
         let (plan, state) = journal.get(operation_id)?.ok_or("unknown landing intent")?;
@@ -1507,6 +1542,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("planning settings already match; Sluss remains paused");
             }
         }
+        Command::VerifyStagedCi {
+            batch_id,
+            config,
+            policy,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let trust = sluss::landing::TrustedCiPolicy::load(&policy)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id.clone(),
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let read = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let security = app
+                .runner_inventory_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+            let record = app
+                .verify_staged_ci(
+                    &mut journal,
+                    (&read, &security),
+                    &config.policy(),
+                    &trust,
+                    &batch_id,
+                )
+                .await?;
+            println!(
+                "CI evidence candidate {}: run {}, commit {}, digest {}, first observed {} ms",
+                batch_id,
+                record.candidate.snapshot.run.id,
+                record.candidate.plan.staged_sha,
+                record.digest,
+                record.first_observed_ms
+            );
+            println!(
+                "provider observation recorded; no GitHub check was created and no merge is authorized"
+            );
+        }
+        Command::InspectStagedCi { .. } => unreachable!(),
         Command::ObserveLandingRecovery {
             operation_id,
             config,

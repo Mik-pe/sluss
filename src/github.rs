@@ -1603,7 +1603,7 @@ impl App {
     ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
         let target = journal.refresh_target(operation_id, trusted_ci)?;
         let snapshot = self
-            .refresh_landing_provider(token, security_token, policy, &target)
+            .refresh_landing_provider(token, security_token, policy, &target, true)
             .await?;
         journal
             .claim_with_fresh_snapshot(operation_id, &snapshot, trusted_ci)
@@ -1623,18 +1623,49 @@ impl App {
     ) -> Result<crate::landing::LandingPlan, LandingRefreshError> {
         let target = journal.preview_target(batch_id, trusted_ci)?;
         let snapshot = self
-            .refresh_landing_provider(token, security_token, policy, &target)
+            .refresh_landing_provider(token, security_token, policy, &target, true)
             .await?;
         journal
             .verify_preview(&target, trusted_ci, &snapshot)
             .map_err(Into::into)
     }
+    /// Persist authenticated first-attempt CI evidence under an independent
+    /// operator policy. This does not create a check or authorize landing.
+    /// Unlike a landing claim, it does not require the App to bypass rules.
+    pub async fn verify_staged_ci(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        tokens: (&InstallationToken, &InstallationToken),
+        policy: &crate::reconcile::RepositoryPolicy,
+        trusted_ci: &crate::landing::TrustedCiPolicy,
+        batch_id: &str,
+    ) -> Result<crate::landing::CiEvidenceRecord, LandingRefreshError> {
+        let app = self.observe_app_identity().await?;
+        let target = journal.preview_target(batch_id, trusted_ci)?;
+        let snapshot = self
+            .refresh_landing_provider(tokens.0, tokens.1, policy, &target, false)
+            .await?;
+        if self.observe_app_identity().await? != app {
+            return Err(LandingRefreshError::Changed);
+        }
+        let now: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| GitHubError::Clock)?
+            .as_millis()
+            .try_into()
+            .map_err(|_| GitHubError::Clock)?;
+        journal
+            .record_ci_candidate(&target, trusted_ci, &snapshot, &app, now)
+            .map_err(Into::into)
+    }
+
     async fn refresh_landing_provider(
         &self,
         token: &InstallationToken,
         security_token: &InstallationToken,
         policy: &crate::reconcile::RepositoryPolicy,
         target: &crate::landing::RefreshTarget,
+        require_landing_bypass: bool,
     ) -> Result<ActionsSnapshot, LandingRefreshError> {
         #[derive(Deserialize, PartialEq, Eq)]
         struct Identity {
@@ -1645,6 +1676,7 @@ impl App {
         let repository = &policy.name;
         if !valid_name(owner)
             || !valid_name(repository)
+            || !token.checks_read
             || token.app_client_id != self.client_id
             || token.api_origin != self.api.as_str()
             || !security_token.runner_inventory_read
@@ -1695,7 +1727,8 @@ impl App {
         {
             return Err(LandingRefreshError::Changed);
         }
-        if !matches!(crate::verification::assess_visible_branch_policy(&security,app_identity.id),Ok(findings) if findings.is_empty())
+        if require_landing_bypass
+            && !matches!(crate::verification::assess_visible_branch_policy(&security,app_identity.id),Ok(findings) if findings.is_empty())
         {
             return Err(LandingRefreshError::UnsafeBranchPolicy);
         }
