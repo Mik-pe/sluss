@@ -595,30 +595,77 @@ pub async fn prepare_once(
     verification_policy: Option<&std::path::Path>,
 ) -> Result<Option<crate::coordinator::PreparedIntegration>, String> {
     let store = Store::open(db).map_err(|e| e.to_string())?;
-    let batch = store
+    let batches = store
         .active_batches()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .find(|batch| {
+        .filter(|batch| {
             matches!(
                 batch.state,
                 crate::batch::State::Planned | crate::batch::State::Building
             )
         });
-    let Some(batch) = batch else {
-        return Ok(None);
-    };
-    crate::coordinator::prepare_github_from_provider(
-        db,
-        app,
-        policy,
-        &batch.id,
-        policy_paths,
-        verification_policy,
-    )
+    prepare_candidates(batches, |batch| async move {
+        crate::coordinator::prepare_github_from_provider(
+            db,
+            app,
+            policy,
+            &batch.id,
+            policy_paths,
+            verification_policy,
+        )
+        .await
+    })
     .await
-    .map(Some)
-    .map_err(|e| e.to_string())
+}
+
+// Only skip errors known to belong to this batch. Global or uncertain errors
+// stop the pass so a provider outage cannot cause a burst of repeated calls.
+async fn prepare_candidates<I, F, Fut>(
+    batches: I,
+    mut prepare: F,
+) -> Result<Option<crate::coordinator::PreparedIntegration>, String>
+where
+    I: IntoIterator<Item = crate::batch::Batch>,
+    F: FnMut(crate::batch::Batch) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                crate::coordinator::PreparedIntegration,
+                crate::coordinator::ProviderPrepareError,
+            >,
+        >,
+{
+    use crate::{
+        coordinator::{PrepareError, ProviderPrepareError},
+        github::StagingError,
+        integration::{IntegrationError, PolicyError, StageError},
+    };
+    let mut first_error = None;
+    for batch in batches {
+        let id = batch.id.clone();
+        match prepare(batch).await {
+            Ok(prepared) => return Ok(Some(prepared)),
+            Err(
+                error @ ProviderPrepareError::Prepare(
+                    PrepareError::Integration(
+                        IntegrationError::Conflict | IntegrationError::AlreadyIntegrated,
+                    )
+                    | PrepareError::Policy(PolicyError::Changed)
+                    | PrepareError::ChangedWorkflow(_)
+                    | PrepareError::GitHubStage(StagingError::Git(StageError::Conflict)),
+                ),
+            ) => {
+                let message = format!("batch {id}: {error}");
+                eprintln!("automatic staging skipped: {message}");
+                first_error.get_or_insert(message);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 pub async fn supervise_preparation(
@@ -1000,5 +1047,117 @@ pub async fn supervise_ci_release_with_wakeup(
                 sleep(delay).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::prepare_candidates;
+    use crate::{
+        batch::{Batch, Candidate},
+        coordinator::{PrepareError, PreparedIntegration, ProviderPrepareError},
+        github::StagingError,
+        integration::{StageError, StagingWorkflowError},
+        store::Store,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn queued_batches() -> (tempfile::TempDir, Vec<Batch>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("queue.sqlite")).unwrap();
+        for number in 1..=3 {
+            let candidate = Candidate {
+                number,
+                head_sha: format!("head-{number}"),
+            };
+            store.observe_candidate(&candidate).unwrap();
+            store
+                .insert_batch(
+                    &Batch::new(format!("batch-{number}"), "base".into(), vec![candidate]).unwrap(),
+                )
+                .unwrap();
+        }
+        (dir, store.active_batches().unwrap())
+    }
+
+    #[tokio::test]
+    async fn batch_specific_failures_do_not_starve_later_preparations() {
+        let (_dir, batches) = queued_batches();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let result = prepare_candidates(batches, |batch| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(batch.id.clone());
+                match batch.id.as_str() {
+                    "batch-1" => Err(ProviderPrepareError::Prepare(PrepareError::GitHubStage(
+                        StagingError::Git(StageError::Conflict),
+                    ))),
+                    "batch-2" => Err(ProviderPrepareError::Prepare(
+                        PrepareError::ChangedWorkflow(StagingWorkflowError::CreateTrigger(
+                            ".github/workflows/unsafe.yml".into(),
+                        )),
+                    )),
+                    _ => Ok(PreparedIntegration {
+                        batch_id: batch.id,
+                        sha: "staged-later".into(),
+                        reference: "refs/heads/sluss/batch-3".into(),
+                        policy_digest: "policy".into(),
+                    }),
+                }
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.batch_id, "batch-3");
+        assert_eq!(*seen.lock().unwrap(), ["batch-1", "batch-2", "batch-3"]);
+    }
+
+    #[tokio::test]
+    async fn global_or_uncertain_errors_stop_the_pass_and_skipped_errors_remain_visible() {
+        let (_dir, batches) = queued_batches();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let error = prepare_candidates(batches.clone(), |batch| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(batch.id.clone());
+                if batch.id == "batch-1" {
+                    Err(ProviderPrepareError::Prepare(PrepareError::GitHubStage(
+                        StagingError::Git(StageError::Conflict),
+                    )))
+                } else {
+                    Err(ProviderPrepareError::MissingPolicy)
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("no usable policy files"));
+        assert_eq!(*seen.lock().unwrap(), ["batch-1", "batch-2"]);
+
+        let uncertain_seen = Arc::new(Mutex::new(Vec::new()));
+        let error = prepare_candidates(batches.clone(), |batch| {
+            let seen = Arc::clone(&uncertain_seen);
+            async move {
+                seen.lock().unwrap().push(batch.id);
+                Err(ProviderPrepareError::Prepare(PrepareError::GitHubStage(
+                    StagingError::Git(StageError::Uncertain),
+                )))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("result is uncertain"));
+        assert_eq!(*uncertain_seen.lock().unwrap(), ["batch-1"]);
+
+        let error = prepare_candidates(batches.into_iter().take(1), |_| async {
+            Err(ProviderPrepareError::Prepare(PrepareError::GitHubStage(
+                StagingError::Git(StageError::Conflict),
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("batch batch-1"));
+        assert!(error.contains("staging ref already points to a different commit"));
     }
 }
