@@ -1437,6 +1437,13 @@ pub struct AppCheckObservation {
     pub conclusion: Option<String>,
     pub app: AppCheckIssuer,
     pub check_suite: AppCheckSuite,
+    #[serde(default)]
+    pub output: Option<AppCheckOutput>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppCheckOutput {
+    pub title: Option<String>,
+    pub summary: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AppCheckIssuer {
@@ -1453,6 +1460,8 @@ pub enum FailureCheckError {
     Scope,
     #[error("the check request may have succeeded; reconcile without retrying")]
     Uncertain,
+    #[error("the supplied check does not match the recorded failure")]
+    CandidateMismatch,
     #[error(transparent)]
     GitHub(#[from] GitHubError),
     #[error(transparent)]
@@ -1464,6 +1473,7 @@ pub enum FailureCheckError {
 pub enum FailureCheckOutcome {
     Created(u64),
     AlreadyCreated(u64),
+    Recovered(u64),
 }
 impl App {
     /// Publish only a failed CI observation to the exact staged commit. The
@@ -1503,9 +1513,16 @@ impl App {
         match state {
             FailureCheckState::Sending { .. } => return Err(FailureCheckError::Uncertain),
             FailureCheckState::Created { app_id, check_id } if app_id == app.id => {
+                if scheduler
+                    .failure_check_source(batch_id)?
+                    .is_some_and(|(direct, recovered)| !direct && recovered)
+                {
+                    return Ok(FailureCheckOutcome::Recovered(check_id));
+                }
                 return Ok(FailureCheckOutcome::AlreadyCreated(check_id));
             }
             FailureCheckState::Created { .. } => return Err(FailureCheckError::Scope),
+            FailureCheckState::Conflict { .. } => return Err(FailureCheckError::Uncertain),
             FailureCheckState::Prepared => {}
         }
         let root = format!("repos/{owner}/{repository}");
@@ -1570,6 +1587,83 @@ impl App {
             .record_failure_check(batch_id, app.id, result.id)
             .map_err(|_| FailureCheckError::Uncertain)?;
         Ok(FailureCheckOutcome::Created(result.id))
+    }
+    /// Associate a matching historical failure check without retrying the POST.
+    /// Matching fields do not prove which request created the candidate.
+    pub async fn recover_failed_check(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        batch_id: &str,
+        check_id: u64,
+    ) -> Result<FailureCheckOutcome, FailureCheckError> {
+        use crate::scheduler::FailureCheckState;
+        if !token.checks_read
+            || !valid_name(owner)
+            || !valid_name(repository)
+            || !valid_name(batch_id)
+            || check_id == 0
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+        {
+            return Err(FailureCheckError::Scope);
+        }
+        let (intent, state) = scheduler
+            .failure_check(batch_id)?
+            .ok_or(FailureCheckError::Uncertain)?;
+        if intent.installation_id != token.installation_id
+            || intent.repository_id != token.repository_id
+        {
+            return Err(FailureCheckError::Scope);
+        }
+        let app_id = match state {
+            FailureCheckState::Sending { app_id } | FailureCheckState::Created { app_id, .. } => {
+                app_id
+            }
+            _ => return Err(FailureCheckError::Uncertain),
+        };
+        let app = self.observe_app_identity().await?;
+        let root = format!("repos/{owner}/{repository}");
+        let first_repo: Repository = self.get_json(token, &root, None).await?;
+        let path = format!("{root}/check-runs/{check_id}");
+        let first: AppCheckObservation = self.get_json(token, &path, None).await?;
+        let last: AppCheckObservation = self.get_json(token, &path, None).await?;
+        let last_repo: Repository = self.get_json(token, &root, None).await?;
+        let last_app = self.observe_app_identity().await?;
+        let summary = format!(
+            "Recorded CI run {} failed. This check is not an attestation and does not authorize a merge.",
+            intent.run_id
+        );
+        if app != last_app
+            || app.id != app_id
+            || first_repo.id != intent.repository_id
+            || last_repo.id != intent.repository_id
+            || first != last
+            || last.id != check_id
+            || last.name != "sluss/verified"
+            || last.head_sha != intent.integration_sha
+            || last.external_id.as_deref() != Some(batch_id)
+            || last.status != "completed"
+            || last.conclusion.as_deref() != Some("failure")
+            || last.app.id != app.id
+            || last.app.node_id != app.node_id
+            || last.check_suite.id == 0
+            || !last.output.as_ref().is_some_and(|o| {
+                o.title.as_deref() == Some("Staging CI failed")
+                    && o.summary.as_deref() == Some(summary.as_str())
+            })
+        {
+            return Err(FailureCheckError::CandidateMismatch);
+        }
+        scheduler.record_recovered_failure_check(batch_id, app.id, check_id)?;
+        let source = scheduler.failure_check_source(batch_id)?;
+        if source.is_some_and(|(direct, _)| direct) {
+            Ok(FailureCheckOutcome::AlreadyCreated(check_id))
+        } else {
+            Ok(FailureCheckOutcome::Recovered(check_id))
+        }
     }
     /// Read an already existing successful `sluss/verified` check twice and
     /// compare GitHub's issuing App and exact SHA with independently scoped

@@ -99,6 +99,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_branch_security (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS failure_check_intents (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','sending','created')), app_id TEXT, check_id TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS failure_check_unique_receipt ON failure_check_intents(check_id) WHERE check_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS failure_check_receipt_sources (id TEXT PRIMARY KEY NOT NULL, direct INTEGER NOT NULL CHECK(direct IN (0,1)), recovered INTEGER NOT NULL CHECK(recovered IN (0,1)));
+            CREATE TABLE IF NOT EXISTS failure_check_conflicts (id TEXT PRIMARY KEY NOT NULL, other_check_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
@@ -1267,8 +1269,18 @@ pub struct FailureCheckIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureCheckState {
     Prepared,
-    Sending { app_id: u64 },
-    Created { app_id: u64, check_id: u64 },
+    Sending {
+        app_id: u64,
+    },
+    Created {
+        app_id: u64,
+        check_id: u64,
+    },
+    Conflict {
+        app_id: u64,
+        check_id: u64,
+        other_check_id: u64,
+    },
 }
 fn failure_check_state(
     tx: &rusqlite::Transaction<'_>,
@@ -1302,7 +1314,7 @@ fn failure_check_state(
             return Err(SchedulerError::Corrupt);
         }
         let number = |v: Option<String>| v.and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0);
-        let state = match (state.as_str(), app, check) {
+        let mut state = match (state.as_str(), app, check) {
             ("prepared", None, None) => FailureCheckState::Prepared,
             ("sending", Some(app), None) => FailureCheckState::Sending {
                 app_id: number(Some(app)).ok_or(SchedulerError::Corrupt)?,
@@ -1313,6 +1325,28 @@ fn failure_check_state(
             },
             _ => return Err(SchedulerError::Corrupt),
         };
+        let other: Option<String> = tx
+            .query_row(
+                "SELECT other_check_id FROM failure_check_conflicts WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = other {
+            if let FailureCheckState::Created { app_id, check_id } = state {
+                let other_check_id = number(Some(other)).ok_or(SchedulerError::Corrupt)?;
+                if other_check_id == check_id {
+                    return Err(SchedulerError::Corrupt);
+                }
+                state = FailureCheckState::Conflict {
+                    app_id,
+                    check_id,
+                    other_check_id,
+                };
+            } else {
+                return Err(SchedulerError::Corrupt);
+            }
+        }
         Ok((intent, state))
     })
     .transpose()
@@ -1380,6 +1414,32 @@ fn current_failure(
     ))
 }
 impl Scheduler {
+    pub fn failure_check(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<(FailureCheckIntent, FailureCheckState)>, SchedulerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = failure_check_state(&tx, id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+    /// Missing provenance indicates a receipt written by an older version.
+    pub fn failure_check_source(&self, id: &str) -> Result<Option<(bool, bool)>, SchedulerError> {
+        let source = self
+            .conn
+            .query_row(
+                "SELECT direct,recovered FROM failure_check_receipt_sources WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if source == Some((false, false)) {
+            return Err(SchedulerError::Corrupt);
+        }
+        Ok(source)
+    }
     /// Record at most one failure-only check intent. This is not attestation.
     pub fn prepare_failure_check(
         &mut self,
@@ -1437,6 +1497,23 @@ impl Scheduler {
         app_id: u64,
         check_id: u64,
     ) -> Result<(), SchedulerError> {
+        self.record_failure_check_source(id, app_id, check_id, true)
+    }
+    pub(crate) fn record_recovered_failure_check(
+        &mut self,
+        id: &str,
+        app_id: u64,
+        check_id: u64,
+    ) -> Result<(), SchedulerError> {
+        self.record_failure_check_source(id, app_id, check_id, false)
+    }
+    fn record_failure_check_source(
+        &mut self,
+        id: &str,
+        app_id: u64,
+        check_id: u64,
+        direct: bool,
+    ) -> Result<(), SchedulerError> {
         if app_id == 0 || check_id == 0 {
             return Err(SchedulerError::FailureCheckConflict);
         }
@@ -1445,6 +1522,12 @@ impl Scheduler {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, state) =
             failure_check_state(&tx, id)?.ok_or(SchedulerError::FailureCheckConflict)?;
+        let legacy_direct = matches!(state, FailureCheckState::Created { .. })
+            && tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM failure_check_receipt_sources WHERE id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )?;
         match state {
             FailureCheckState::Sending { app_id: known } if known == app_id => {
                 tx.execute("UPDATE failure_check_intents SET state='created',check_id=?2 WHERE id=?1 AND state='sending'",params![id,check_id.to_string()])?;
@@ -1453,8 +1536,26 @@ impl Scheduler {
                 app_id: known,
                 check_id: known_check,
             } if known == app_id && known_check == check_id => {}
+            FailureCheckState::Created {
+                app_id: known,
+                check_id: known_check,
+            } if direct && known == app_id && known_check != check_id => {
+                let recovered: Option<bool> = tx
+                    .query_row(
+                        "SELECT recovered FROM failure_check_receipt_sources WHERE id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if recovered == Some(true) {
+                    tx.execute("INSERT OR IGNORE INTO failure_check_conflicts(id,other_check_id) VALUES(?1,?2)", params![id,check_id.to_string()])?;
+                    tx.commit()?;
+                }
+                return Err(SchedulerError::FailureCheckConflict);
+            }
             _ => return Err(SchedulerError::FailureCheckConflict),
         }
+        tx.execute("INSERT INTO failure_check_receipt_sources(id,direct,recovered) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET direct=MAX(direct,excluded.direct),recovered=MAX(recovered,excluded.recovered)", params![id, direct || legacy_direct, !direct])?;
         tx.commit()?;
         Ok(())
     }
