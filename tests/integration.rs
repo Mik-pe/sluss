@@ -245,3 +245,63 @@ fn rejects_invalid_github_staging_inputs_before_connecting() {
         ));
     }
 }
+
+#[test]
+fn policy_snapshot_detects_policy_changes_and_rejects_missing_or_invalid_paths() {
+    use sluss::integration::PolicyError;
+    let (dir, _, _, _) = fixture();
+    std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    std::fs::write(
+        dir.path().join(".github/workflows/ci.yml"),
+        "trusted policy\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "policy"],
+    );
+    let base = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(dir.path(), &["checkout", "-b", "safe-change"]);
+    std::fs::write(dir.path().join("safe"), "change\n").unwrap();
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "safe"],
+    );
+    let safe = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(dir.path(), &["checkout", "-b", "policy-change", &base]);
+    std::fs::write(
+        dir.path().join(".github/workflows/ci.yml"),
+        "weakened policy\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "changed"],
+    );
+    let changed = git(dir.path(), &["rev-parse", "HEAD"]);
+    let paths = vec![".github/workflows/ci.yml".to_string()];
+    let good = build(dir.path(), &base, &[safe]).unwrap();
+    let snapshot = good.check_policy(&base, &paths).unwrap();
+    assert_eq!(snapshot.digest.len(), 64);
+    assert_eq!(snapshot, good.check_policy(&base, &paths).unwrap());
+    let bad = build(dir.path(), &base, &[changed]).unwrap();
+    assert!(matches!(
+        bad.check_policy(&base, &paths),
+        Err(PolicyError::Changed)
+    ));
+    assert!(matches!(
+        good.check_policy(&base, &["missing".into()]),
+        Err(PolicyError::Changed)
+    ));
+    assert!(matches!(
+        good.check_policy(&base, &["../main".into()]),
+        Err(PolicyError::Invalid)
+    ));
+    assert!(matches!(
+        good.check_policy(&base, &[paths[0].clone(), paths[0].clone()]),
+        Err(PolicyError::Invalid)
+    ));
+}

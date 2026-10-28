@@ -1,5 +1,5 @@
 //! Local, isolated construction of deterministic merge commits.
-//! This module does not push a ref, start CI, or authorize a merge.
+//! Staging publication is explicit; this module does not start CI or authorize a merge.
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -431,4 +431,127 @@ fn run_git(mut cmd: Command, capture: bool) -> Result<Output, StageError> {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// Digest of explicitly selected policy files, with their exact bytes and modes.
+/// The caller remains responsible for selecting all relevant files, pinning
+/// external actions, validating workflow behavior and protecting the base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySnapshot {
+    pub digest: String,
+    pub paths: Vec<String>,
+}
+#[derive(Debug, Error)]
+pub enum PolicyError {
+    #[error("invalid base commit or policy paths")]
+    Invalid,
+    #[error("a policy file is missing, not a regular file, too large, or changed")]
+    Changed,
+    #[error("could not read a policy object")]
+    Git,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+impl Integration {
+    /// Verify declared policy files against a frozen base and hash the exact
+    /// contents. This does not authenticate the base or validate the policy.
+    pub fn check_policy(
+        &self,
+        base: &str,
+        paths: &[String],
+    ) -> Result<PolicySnapshot, PolicyError> {
+        use sha2::{Digest, Sha256};
+        if !valid_sha(base) || paths.is_empty() || paths.len() > 128 {
+            return Err(PolicyError::Invalid);
+        }
+        let mut paths = paths.to_vec();
+        paths.sort();
+        if paths.windows(2).any(|pair| pair[0] == pair[1])
+            || paths.iter().any(|p| !valid_policy_path(p))
+        {
+            return Err(PolicyError::Invalid);
+        }
+        let repo = self.repository();
+        let kind = git(&repo).args(["cat-file", "-t", base]).output()?;
+        if !kind.status.success() || kind.stdout != b"commit\n" {
+            return Err(PolicyError::Invalid);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"sluss-policy-files-v1\0");
+        for path in &paths {
+            let (base_mode, base_object) = policy_entry(&repo, base, path)?;
+            let (mode, object) = policy_entry(&repo, self.sha(), path)?;
+            if mode != base_mode || object != base_object {
+                return Err(PolicyError::Changed);
+            }
+            let size = git(&repo).args(["cat-file", "-s", &object]).output()?;
+            if !size.status.success() {
+                return Err(PolicyError::Git);
+            }
+            let size: usize = std::str::from_utf8(&size.stdout)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or(PolicyError::Git)?;
+            if size > 1024 * 1024 {
+                return Err(PolicyError::Changed);
+            }
+            let content = git(&repo).args(["cat-file", "blob", &object]).output()?;
+            if !content.status.success() || content.stdout.len() != size {
+                return Err(PolicyError::Git);
+            }
+            hasher.update((path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(mode.as_bytes());
+            hasher.update((size as u64).to_be_bytes());
+            hasher.update(content.stdout);
+        }
+        Ok(PolicySnapshot {
+            digest: hex::encode(hasher.finalize()),
+            paths,
+        })
+    }
+}
+fn valid_policy_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".." && part != ".git")
+}
+fn policy_entry(repo: &Path, commit: &str, path: &str) -> Result<(String, String), PolicyError> {
+    let output = git(repo)
+        .args([
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            commit,
+            "--",
+            path,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(PolicyError::Git);
+    }
+    let Some(line) = output.stdout.strip_suffix(b"\0") else {
+        return Err(PolicyError::Changed);
+    };
+    let line = std::str::from_utf8(line).map_err(|_| PolicyError::Changed)?;
+    let (info, actual_path) = line.split_once('\t').ok_or(PolicyError::Changed)?;
+    let mut words = info.split(' ');
+    let (Some(mode), Some(kind), Some(object)) = (words.next(), words.next(), words.next()) else {
+        return Err(PolicyError::Changed);
+    };
+    if actual_path != path
+        || words.next().is_some()
+        || !matches!(mode, "100644" | "100755")
+        || kind != "blob"
+        || !valid_sha(object)
+    {
+        return Err(PolicyError::Changed);
+    }
+    Ok((mode.into(), object.into()))
 }
