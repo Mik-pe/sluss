@@ -25,6 +25,9 @@ pub struct LandingPlan {
     pub repository_node_id: String,
     pub target_ref: String,
     pub staging_ref: String,
+    /// A per-operation reference reserved for the experimental atomic receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_ref: Option<String>,
     pub base_sha: String,
     pub staged_sha: String,
     pub policy_digest: String,
@@ -204,7 +207,13 @@ impl LandingPlan {
             || !reference(&self.staging_ref)
             || self.target_ref.starts_with("refs/heads/sluss/")
             || !self.staging_ref.starts_with("refs/heads/sluss/")
+            || self.staging_ref.starts_with("refs/heads/sluss/receipts/")
             || self.target_ref == self.staging_ref
+            || self.marker_ref.as_ref().is_some_and(|marker| {
+                !hex(&self.operation_id, 32)
+                    || *marker != format!("refs/heads/sluss/receipts/{}", self.operation_id)
+                    || *marker == self.staging_ref
+            })
             || !hex(&self.base_sha, 40)
             || !hex(&self.staged_sha, 40)
             || self.base_sha == self.staged_sha
@@ -233,12 +242,16 @@ impl LandingPlan {
     /// not send it or attest that its inputs are authorized or current.
     pub fn graphql_request(&self) -> Result<serde_json::Value, LandingError> {
         self.validate()?;
+        let mut refs = vec![
+            serde_json::json!({"name":self.target_ref,"beforeOid":self.base_sha,"afterOid":self.staged_sha,"force":false}),
+            serde_json::json!({"name":self.staging_ref,"beforeOid":self.staged_sha,"afterOid":self.staged_sha,"force":false}),
+        ];
+        if let Some(marker) = &self.marker_ref {
+            refs.push(serde_json::json!({"name":marker,"beforeOid":self.base_sha,"afterOid":self.staged_sha,"force":false}));
+        }
         Ok(serde_json::json!({"query":QUERY,"variables":{"input":{
             "repositoryId":self.repository_node_id,"clientMutationId":self.operation_id,
-            "refUpdates":[
-                {"name":self.target_ref,"beforeOid":self.base_sha,"afterOid":self.staged_sha,"force":false},
-                {"name":self.staging_ref,"beforeOid":self.staged_sha,"afterOid":self.staged_sha,"force":false}
-            ]
+            "refUpdates":refs
         }}}))
     }
 }
@@ -251,12 +264,19 @@ pub struct LandingRecoveryObservation {
     pub plan: LandingPlan,
     pub target_sha: String,
     pub staging_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_sha: Option<String>,
     pub observed_ms: u64,
 }
 impl LandingRecoveryObservation {
     fn validate(&self) -> Result<(), LandingError> {
         self.plan.validate()?;
-        if !hex(&self.target_sha, 40) || !hex(&self.staging_sha, 40) || self.observed_ms == 0 {
+        if !hex(&self.target_sha, 40)
+            || !hex(&self.staging_sha, 40)
+            || self.plan.marker_ref.is_some() != self.marker_sha.is_some()
+            || self.marker_sha.as_deref().is_some_and(|sha| !hex(sha, 40))
+            || self.observed_ms == 0
+        {
             return Err(LandingError::Corrupt);
         }
         Ok(())
@@ -996,7 +1016,7 @@ impl LandingJournal {
         batch_id: &str,
         repository_node_id: &str,
     ) -> Result<LandingPlan, LandingError> {
-        self.prepare_observed_batch_inner(operation_id, batch_id, repository_node_id, None)
+        self.prepare_observed_batch_inner(operation_id, batch_id, repository_node_id, None, false)
     }
     /// Bind an independently supplied operator policy atomically with the
     /// observed batch. This is a trust prerequisite, not merge authorization.
@@ -1011,6 +1031,24 @@ impl LandingJournal {
             batch_id,
             &policy.repository_node_id,
             Some(policy),
+            false,
+        )
+    }
+    /// Freeze an experimental marker with a trusted batch. The 32-character
+    /// lowercase hexadecimal operation ID must be generated uniquely by the
+    /// operator. This creates no provider ref and authorizes no write.
+    pub fn prepare_trusted_batch_with_marker(
+        &mut self,
+        operation_id: &str,
+        batch_id: &str,
+        policy: &TrustedCiPolicy,
+    ) -> Result<LandingPlan, LandingError> {
+        self.prepare_observed_batch_inner(
+            operation_id,
+            batch_id,
+            &policy.repository_node_id,
+            Some(policy),
+            true,
         )
     }
     fn prepare_observed_batch_inner(
@@ -1019,11 +1057,16 @@ impl LandingJournal {
         batch_id: &str,
         repository_node_id: &str,
         policy: Option<&TrustedCiPolicy>,
+        marker: bool,
     ) -> Result<LandingPlan, LandingError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut plan = observed_plan(&tx, operation_id, batch_id, repository_node_id)?;
+        if marker {
+            plan.marker_ref = Some(format!("refs/heads/sluss/receipts/{operation_id}"));
+            plan.validate()?;
+        }
         if let Some(policy) = policy {
             verify_trusted_policy(&tx, &plan, policy)?;
             plan.trusted_ci_policy_digest = Some(policy.digest()?);
@@ -1125,6 +1168,7 @@ impl LandingJournal {
         }
         let mut now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
         now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
+        now.marker_ref = plan.marker_ref.clone();
         if now != plan {
             return Err(LandingError::StaleBatch);
         }
@@ -1179,6 +1223,7 @@ impl LandingJournal {
         }
         let mut now = observed_plan(&tx, operation_id, &plan.batch_id, &plan.repository_node_id)?;
         now.trusted_ci_policy_digest = plan.trusted_ci_policy_digest.clone();
+        now.marker_ref = plan.marker_ref.clone();
         if now != plan {
             return Err(LandingError::StaleBatch);
         }
@@ -1752,6 +1797,7 @@ fn observed_plan(
         repository_node_id: repository_node_id.into(),
         target_ref: format!("refs/heads/{target}"),
         staging_ref: dispatch.staging_ref,
+        marker_ref: None,
         base_sha: batch.base_sha,
         staged_sha: integration.clone(),
         policy_digest: dispatch.policy_digest,

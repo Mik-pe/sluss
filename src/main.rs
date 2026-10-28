@@ -1266,6 +1266,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 observed.staging_sha,
                 observed.observed_ms
             );
+            if let Some(sha) = &observed.marker_sha {
+                println!(
+                    "marker {} observed at {}",
+                    observed.plan.marker_ref.as_deref().unwrap_or("unknown"),
+                    sha
+                );
+            }
         } else {
             println!("no recorded ref observation");
         }
@@ -2247,6 +2254,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 observed.observed_ms
             );
+            if let Some(sha) = &observed.marker_sha {
+                println!(
+                    "marker {} observed at {}",
+                    observed.plan.marker_ref.as_deref().unwrap_or("unknown"),
+                    sha
+                );
+            }
             println!(
                 "historical observation only; operation remains uncertain and the target stays locked"
             );

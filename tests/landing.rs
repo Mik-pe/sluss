@@ -10,6 +10,7 @@ fn plan(id: &str) -> LandingPlan {
         repository_node_id: "R_kgDOVZy43Q".into(),
         target_ref: "refs/heads/main".into(),
         staging_ref: "refs/heads/sluss/batch-123".into(),
+        marker_ref: None,
         base_sha: "a".repeat(40),
         staged_sha: "b".repeat(40),
         policy_digest: "c".repeat(64),
@@ -43,6 +44,59 @@ fn request_checks_both_frozen_refs_without_force() {
 }
 
 #[test]
+fn marked_plan_freezes_atomic_marker_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("journal.sqlite");
+    let id = "123456789abcdef0123456789abcdef0";
+    let mut p = plan(id);
+    p.marker_ref = Some(format!("refs/heads/sluss/receipts/{id}"));
+    let request = p.graphql_request().unwrap();
+    let refs = request["variables"]["input"]["refUpdates"]
+        .as_array()
+        .unwrap();
+    assert_eq!(refs.len(), 3);
+    assert_eq!(refs[2]["name"], p.marker_ref.as_deref().unwrap());
+    assert_eq!(refs[2]["beforeOid"], p.base_sha);
+    assert_eq!(refs[2]["afterOid"], p.staged_sha);
+    assert_eq!(refs[2]["force"], false);
+    let mut journal = LandingJournal::open(&db).unwrap();
+    journal.prepare(&p).unwrap();
+    assert_eq!(journal.claim(id).unwrap(), Some(p.clone()));
+    drop(journal);
+    let mut journal = LandingJournal::open(&db).unwrap();
+    assert_eq!(
+        journal.get(id).unwrap(),
+        Some((p.clone(), IntentState::Sending))
+    );
+    assert!(journal.claim(id).unwrap().is_none());
+    let mut without_marker = p.clone();
+    without_marker.marker_ref = None;
+    assert!(matches!(
+        journal.prepare(&without_marker),
+        Err(LandingError::IdConflict)
+    ));
+    for marker in [
+        "refs/heads/main",
+        "refs/heads/sluss/receipts/other",
+        &p.staging_ref,
+    ] {
+        let mut invalid = p.clone();
+        invalid.marker_ref = Some(marker.into());
+        assert!(matches!(
+            invalid.graphql_request(),
+            Err(LandingError::Invalid)
+        ));
+    }
+    let mut invalid = p.clone();
+    invalid.operation_id = "not-random".into();
+    invalid.marker_ref = Some("refs/heads/sluss/receipts/not-random".into());
+    assert!(matches!(
+        invalid.graphql_request(),
+        Err(LandingError::Invalid)
+    ));
+}
+
+#[test]
 fn invalid_plans_cannot_be_prepared_or_encoded() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = LandingJournal::open(dir.path().join("journal.sqlite")).unwrap();
@@ -58,6 +112,9 @@ fn invalid_plans_cannot_be_prepared_or_encoded() {
     cases.push(p);
     let mut p = plan("invalid");
     p.staging_ref = "refs/heads/other".into();
+    cases.push(p);
+    let mut p = plan("invalid");
+    p.staging_ref = "refs/heads/sluss/receipts/other".into();
     cases.push(p);
     let mut p = plan("invalid");
     p.target_ref = "refs/heads/sluss/main".into();

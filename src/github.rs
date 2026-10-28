@@ -1849,13 +1849,31 @@ impl App {
                 .strip_prefix("refs/")
                 .ok_or(LandingRefreshError::Scope)?
         );
+        let marker_path = plan.marker_ref.as_ref().map(|name| {
+            format!(
+                "{root}/git/ref/{}",
+                name.strip_prefix("refs/").expect("validated marker")
+            )
+        });
         let first_repo: Identity = self.get_json(token, &root, None).await?;
         let first_target: DispatchRef = self.get_json(token, &target, None).await?;
         let first_staging: DispatchRef = self.get_json(token, &staging, None).await?;
+        let first_marker: Option<DispatchRef> = match &marker_path {
+            Some(path) => Some(self.get_json(token, path, None).await?),
+            None => None,
+        };
+        let last_marker: Option<DispatchRef> = match &marker_path {
+            Some(path) => Some(self.get_json(token, path, None).await?),
+            None => None,
+        };
         let last_staging: DispatchRef = self.get_json(token, &staging, None).await?;
         let last_target: DispatchRef = self.get_json(token, &target, None).await?;
         let last_repo: Identity = self.get_json(token, &root, None).await?;
-        if first_repo != last_repo || first_target != last_target || first_staging != last_staging {
+        if first_repo != last_repo
+            || first_target != last_target
+            || first_staging != last_staging
+            || first_marker != last_marker
+        {
             return Err(LandingRefreshError::Changed);
         }
         if first_repo.id != token.repository_id
@@ -1864,6 +1882,10 @@ impl App {
             || first_staging.reference != plan.staging_ref
             || first_target.object.kind != "commit"
             || first_staging.object.kind != "commit"
+            || first_marker.as_ref().is_some_and(|marker| {
+                Some(marker.reference.as_str()) != plan.marker_ref.as_deref()
+                    || marker.object.kind != "commit"
+            })
         {
             return Err(LandingRefreshError::Scope);
         }
@@ -1877,6 +1899,7 @@ impl App {
             plan,
             target_sha: first_target.object.sha,
             staging_sha: first_staging.object.sha,
+            marker_sha: first_marker.map(|marker| marker.object.sha),
             observed_ms,
         };
         journal.record_recovery_observation(&observation)?;
@@ -2005,9 +2028,9 @@ impl App {
         operation_id: &str,
     ) -> Result<Option<crate::landing::LandingPlan>, LandingRefreshError> {
         let target = journal.refresh_target(operation_id, trusted_ci)?;
-        let snapshot = self
-            .refresh_landing_provider(token, security_token, policy, &target, true)
-            .await?;
+        let snapshot =
+            Box::pin(self.refresh_landing_provider(token, security_token, policy, &target, true))
+                .await?;
         journal
             .claim_with_fresh_snapshot(
                 operation_id,
@@ -2030,9 +2053,9 @@ impl App {
         batch_id: &str,
     ) -> Result<crate::landing::LandingPlan, LandingRefreshError> {
         let target = journal.preview_target(batch_id, trusted_ci)?;
-        let snapshot = self
-            .refresh_landing_provider(token, security_token, policy, &target, true)
-            .await?;
+        let snapshot =
+            Box::pin(self.refresh_landing_provider(token, security_token, policy, &target, true))
+                .await?;
         journal
             .verify_preview(&target, trusted_ci, &snapshot)
             .map_err(Into::into)
@@ -2063,9 +2086,9 @@ impl App {
     ) -> Result<(crate::landing::CiEvidenceRecord, i64), LandingRefreshError> {
         let app = self.observe_app_identity().await?;
         let target = journal.preview_target(batch_id, trusted_ci)?;
-        let snapshot = self
-            .refresh_landing_provider(tokens.0, tokens.1, policy, &target, false)
-            .await?;
+        let snapshot =
+            Box::pin(self.refresh_landing_provider(tokens.0, tokens.1, policy, &target, false))
+                .await?;
         if self.observe_app_identity().await? != app {
             return Err(LandingRefreshError::Changed);
         }
@@ -2164,6 +2187,21 @@ impl App {
         {
             return Err(LandingRefreshError::Changed);
         }
+        let marker_path = plan.marker_ref.as_ref().map(|marker| {
+            format!(
+                "{root}/git/ref/{}",
+                marker.strip_prefix("refs/").expect("validated marker")
+            )
+        });
+        if let Some(path) = &marker_path {
+            let marker: DispatchRef = self.get_json(token, path, None).await?;
+            if Some(marker.reference.as_str()) != plan.marker_ref.as_deref()
+                || marker.object.kind != "commit"
+                || marker.object.sha != plan.base_sha
+            {
+                return Err(LandingRefreshError::Changed);
+            }
+        }
         let mut provider_reviews = Vec::with_capacity(target.members.len());
         for member in &target.members {
             let review = self
@@ -2231,6 +2269,15 @@ impl App {
             }
         }
         let last_stage: DispatchRef = self.get_json(token, &ref_path, None).await?;
+        if let Some(path) = &marker_path {
+            let marker: DispatchRef = self.get_json(token, path, None).await?;
+            if Some(marker.reference.as_str()) != plan.marker_ref.as_deref()
+                || marker.object.kind != "commit"
+                || marker.object.sha != plan.base_sha
+            {
+                return Err(LandingRefreshError::Changed);
+            }
+        }
         let last_rules = self
             .observe_branch_rules(token, owner, repository, &policy.target_branch)
             .await?;

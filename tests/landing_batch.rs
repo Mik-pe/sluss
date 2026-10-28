@@ -403,6 +403,42 @@ fn trusted_policy() -> sluss::landing::TrustedCiPolicy {
     }
 }
 #[test]
+fn trusted_marker_is_frozen_with_batch_and_cannot_be_downgraded() {
+    let mut f = setup();
+    let trusted = trusted_policy();
+    let id = "123456789abcdef0123456789abcdef0";
+    assert!(matches!(
+        f.journal
+            .prepare_trusted_batch_with_marker("not-hex", BATCH, &trusted),
+        Err(LandingError::Invalid)
+    ));
+    let plan = f
+        .journal
+        .prepare_trusted_batch_with_marker(id, BATCH, &trusted)
+        .unwrap();
+    assert_eq!(
+        plan.marker_ref.as_deref(),
+        Some(format!("refs/heads/sluss/receipts/{id}").as_str())
+    );
+    f.journal = LandingJournal::open(&f.db).unwrap();
+    assert_eq!(
+        f.journal
+            .prepare_trusted_batch_with_marker(id, BATCH, &trusted)
+            .unwrap(),
+        plan
+    );
+    assert!(matches!(
+        f.journal.prepare_trusted_batch(id, BATCH, &trusted),
+        Err(LandingError::IdConflict)
+    ));
+    assert!(matches!(
+        f.journal.claim_observed_batch(id),
+        Err(LandingError::TrustPolicy)
+    ));
+    assert_eq!(f.journal.get(id).unwrap().unwrap().1, IntentState::Prepared);
+}
+
+#[test]
 fn operator_trust_is_bound_to_the_observed_workflow_and_cannot_be_replaced() {
     let mut f = setup();
     let trusted = trusted_policy();

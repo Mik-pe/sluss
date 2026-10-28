@@ -2219,6 +2219,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         )
         .route("/repos/owner/repo/rulesets/10", get(doctor_ruleset))
         .route(
+            "/repos/owner/repo/git/ref/heads/sluss/receipts/123456789abcdef0123456789abcdef0",
+            get(landing_marker_preflight),
+        )
+        .route(
             "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
             get(dispatch_ref),
         )
@@ -4111,14 +4115,14 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     mode.store(121, Ordering::SeqCst);
     graphql_counts.store(0, Ordering::SeqCst);
     let (claim, _) = tokio::join!(
-        observer_app.refresh_and_claim_observed_landing(
+        Box::pin(observer_app.refresh_and_claim_observed_landing(
             &mut claim_journal,
             &fixture_token,
             &security_token,
             &observer_policy,
             &selected_trust,
             "land-race"
-        ),
+        )),
         async {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while graphql_counts.load(Ordering::SeqCst) == 0 {
@@ -5728,27 +5732,30 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     .await
     .unwrap();
     let frozen_landing = landing
-        .prepare_trusted_batch("land-refresh", id, &selected_trust)
+        .prepare_trusted_batch_with_marker("123456789abcdef0123456789abcdef0", id, &selected_trust)
         .unwrap();
     let mut wider_trust = selected_trust.clone();
     wider_trust.runner_ids.insert(2);
     assert!(matches!(
-        observer_app
-            .refresh_and_claim_observed_landing(
-                &mut landing,
-                &fixture_token,
-                &security_token,
-                &observer_policy,
-                &wider_trust,
-                "land-refresh"
-            )
-            .await,
+        Box::pin(observer_app.refresh_and_claim_observed_landing(
+            &mut landing,
+            &fixture_token,
+            &security_token,
+            &observer_policy,
+            &wider_trust,
+            "123456789abcdef0123456789abcdef0"
+        ))
+        .await,
         Err(sluss::github::LandingRefreshError::Journal(
             sluss::landing::LandingError::TrustPolicy
         ))
     ));
     assert_eq!(
-        landing.get("land-refresh").unwrap().unwrap().1,
+        landing
+            .get("123456789abcdef0123456789abcdef0")
+            .unwrap()
+            .unwrap()
+            .1,
         sluss::landing::IntentState::Prepared
     );
     for invalid in [
@@ -5759,20 +5766,49 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         graphql_counts.store(0, Ordering::SeqCst);
         mode.store(invalid, Ordering::SeqCst);
         assert!(
-            observer_app
-                .refresh_and_claim_observed_landing(
-                    &mut landing,
-                    &fixture_token,
-                    &security_token,
-                    &observer_policy,
-                    &selected_trust,
-                    "land-refresh"
-                )
-                .await
-                .is_err()
+            Box::pin(observer_app.refresh_and_claim_observed_landing(
+                &mut landing,
+                &fixture_token,
+                &security_token,
+                &observer_policy,
+                &selected_trust,
+                "123456789abcdef0123456789abcdef0"
+            ))
+            .await
+            .is_err()
         );
         assert_eq!(
-            landing.get("land-refresh").unwrap().unwrap().1,
+            landing
+                .get("123456789abcdef0123456789abcdef0")
+                .unwrap()
+                .unwrap()
+                .1,
+            sluss::landing::IntentState::Prepared
+        );
+    }
+    for invalid in [201, 202, 203, 204, 205] {
+        MARKER_PREFLIGHT_READS.store(0, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        mode.store(invalid, Ordering::SeqCst);
+        assert!(
+            Box::pin(observer_app.refresh_and_claim_observed_landing(
+                &mut landing,
+                &fixture_token,
+                &security_token,
+                &observer_policy,
+                &selected_trust,
+                "123456789abcdef0123456789abcdef0"
+            ))
+            .await
+            .is_err(),
+            "marker mode {invalid}"
+        );
+        assert_eq!(
+            landing
+                .get("123456789abcdef0123456789abcdef0")
+                .unwrap()
+                .unwrap()
+                .1,
             sluss::landing::IntentState::Prepared
         );
     }
@@ -5781,34 +5817,36 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     let mut changed_policy = observer_policy.clone();
     changed_policy.required_reviews = 2;
     assert!(matches!(
-        observer_app
-            .refresh_and_claim_observed_landing(
-                &mut landing,
-                &fixture_token,
-                &security_token,
-                &changed_policy,
-                &selected_trust,
-                "land-refresh"
-            )
-            .await,
+        Box::pin(observer_app.refresh_and_claim_observed_landing(
+            &mut landing,
+            &fixture_token,
+            &security_token,
+            &changed_policy,
+            &selected_trust,
+            "123456789abcdef0123456789abcdef0"
+        ))
+        .await,
         Err(sluss::github::LandingRefreshError::Scope)
     ));
     assert_eq!(
-        observer_app
-            .refresh_and_claim_observed_landing(
-                &mut landing,
-                &fixture_token,
-                &security_token,
-                &observer_policy,
-                &selected_trust,
-                "land-refresh"
-            )
-            .await
-            .unwrap(),
+        Box::pin(observer_app.refresh_and_claim_observed_landing(
+            &mut landing,
+            &fixture_token,
+            &security_token,
+            &observer_policy,
+            &selected_trust,
+            "123456789abcdef0123456789abcdef0"
+        ))
+        .await
+        .unwrap(),
         Some(frozen_landing)
     );
     assert_eq!(
-        landing.get("land-refresh").unwrap().unwrap().1,
+        landing
+            .get("123456789abcdef0123456789abcdef0")
+            .unwrap()
+            .unwrap()
+            .1,
         sluss::landing::IntentState::Sending
     );
     // A restarted observer reads the same receipt without duplicating measurements.
@@ -6543,6 +6581,7 @@ async fn uncertain_landing_records_stable_github_refs_without_claiming_success()
         repository_node_id: "R_repo".into(),
         target_ref: "refs/heads/main".into(),
         staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
+        marker_ref: None,
         base_sha: "b".repeat(40),
         staged_sha: "a".repeat(40),
         policy_digest: "c".repeat(64),
@@ -7103,4 +7142,166 @@ async fn benchmark_collection_fetches_attempts_and_merges_without_claiming_compl
     assert_eq!(annotated.sluss.deliveries[0].observed_ready_at, None);
     assert!(!db_path.exists());
     server.abort();
+}
+
+async fn recovery_marker_ref(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let count = state.permissions.fetch_add(1, Ordering::SeqCst);
+    if mode == 125 {
+        return (StatusCode::NOT_FOUND, Json(json!({"message":"missing"})));
+    }
+    let sha = if mode == 121 || (mode == 122 && count > 0) {
+        "a"
+    } else {
+        "b"
+    };
+    let name = if mode == 123 {
+        "refs/heads/sluss/receipts/other"
+    } else {
+        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+    };
+    (
+        StatusCode::OK,
+        Json(
+            json!({"ref":name,"object":{"sha":sha.repeat(40),"type":if mode == 124 {"tree"} else {"commit"}}}),
+        ),
+    )
+}
+
+#[tokio::test]
+async fn uncertain_landing_observes_marker_without_resolving_or_unlocking() {
+    use sluss::landing::{IntentState, LandingJournal, LandingPlan};
+    let (_key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let marker_reads = Arc::new(AtomicUsize::new(0));
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let server = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/git/ref/heads/main", get(recovery_ref))
+        .route(
+            "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
+            get(recovery_ref),
+        )
+        .route(
+            "/repos/owner/repo/git/ref/heads/sluss/receipts/123456789abcdef0123456789abcdef0",
+            get(recovery_marker_ref),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: reads,
+            permissions: marker_reads.clone(),
+            token_calls,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let token = app.read_token(42, 7).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("recovery.sqlite");
+    let mut journal = LandingJournal::open(&db).unwrap();
+    let id = "123456789abcdef0123456789abcdef0";
+    let plan = LandingPlan {
+        operation_id: id.into(),
+        batch_id: "batch-0123456789abcdef".into(),
+        installation_id: 42,
+        repository_id: 7,
+        repository_node_id: "R_repo".into(),
+        target_ref: "refs/heads/main".into(),
+        staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
+        marker_ref: Some(format!("refs/heads/sluss/receipts/{id}")),
+        base_sha: "b".repeat(40),
+        staged_sha: "a".repeat(40),
+        policy_digest: "c".repeat(64),
+        admission_digest: "d".repeat(64),
+        ci_evidence_digest: "e".repeat(64),
+        trusted_ci_policy_digest: None,
+        branch_rules_digest: None,
+        branch_security_digest: None,
+    };
+    journal.prepare(&plan).unwrap();
+    journal.claim(id).unwrap().unwrap();
+    for (current, expected) in [(120, "b"), (121, "a")] {
+        mode.store(current, Ordering::SeqCst);
+        marker_reads.store(0, Ordering::SeqCst);
+        let observation = app
+            .observe_landing_recovery(&mut journal, &token, ("owner", "repo"), id)
+            .await
+            .unwrap();
+        assert_eq!(observation.marker_sha, Some(expected.repeat(40)));
+        assert_eq!(
+            journal.last_recovery_observation(id).unwrap(),
+            Some(observation)
+        );
+        assert_eq!(journal.get(id).unwrap().unwrap().1, IntentState::Sending);
+        assert!(journal.claim(id).unwrap().is_none());
+    }
+    for current in [122, 123, 124, 125] {
+        mode.store(current, Ordering::SeqCst);
+        marker_reads.store(0, Ordering::SeqCst);
+        assert!(
+            app.observe_landing_recovery(&mut journal, &token, ("owner", "repo"), id)
+                .await
+                .is_err(),
+            "mode {current}"
+        );
+        assert_eq!(
+            journal
+                .last_recovery_observation(id)
+                .unwrap()
+                .unwrap()
+                .marker_sha,
+            Some("a".repeat(40))
+        );
+        assert_eq!(journal.get(id).unwrap().unwrap().1, IntentState::Sending);
+    }
+    drop(journal);
+    let reopened = LandingJournal::open_read_only(&db).unwrap();
+    assert_eq!(
+        reopened
+            .last_recovery_observation(id)
+            .unwrap()
+            .unwrap()
+            .marker_sha,
+        Some("a".repeat(40))
+    );
+    server.abort();
+}
+
+static MARKER_PREFLIGHT_READS: AtomicUsize = AtomicUsize::new(0);
+
+async fn landing_marker_preflight(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 202 {
+        return (StatusCode::NOT_FOUND, Json(json!({"message":"missing"})));
+    }
+    let sha = if mode == 201
+        || (mode == 205 && MARKER_PREFLIGHT_READS.fetch_add(1, Ordering::SeqCst) > 0)
+    {
+        "a"
+    } else {
+        "b"
+    };
+    let reference = if mode == 203 {
+        "refs/heads/sluss/receipts/other"
+    } else {
+        "refs/heads/sluss/receipts/123456789abcdef0123456789abcdef0"
+    };
+    (
+        StatusCode::OK,
+        Json(
+            json!({"ref":reference,"object":{"sha":sha.repeat(40),"type":if mode == 204 {"tree"} else {"commit"}}}),
+        ),
+    )
 }
