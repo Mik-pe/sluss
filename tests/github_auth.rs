@@ -168,7 +168,7 @@ async fn dispatch_post(
     assert_eq!(headers["x-github-api-version"], "2026-03-10");
     assert_eq!(
         body,
-        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef"})
+        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "inputs":{"sluss_host":"sluss-host-test"}})
     );
     state.permissions.fetch_add(1, Ordering::SeqCst);
     if state.mode.load(Ordering::SeqCst) == 17 {
@@ -787,7 +787,7 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         db.path().join("db"),
         Capacity {
             pools: pools.clone(),
-            hosts: BTreeMap::from([("host".into(), Host { slots: 3, pools })]),
+            hosts: BTreeMap::from([("sluss-host-test".into(), Host { slots: 3, pools })]),
         },
     )
     .unwrap();
@@ -1031,5 +1031,150 @@ async fn staging_tokens_are_scoped_and_never_sent_from_a_non_github_origin() {
         store.batch(id).unwrap().unwrap().0.state,
         sluss::batch::State::Building
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
+    use sluss::{
+        batch::Candidate,
+        store::{AdmissionCandidate, Store},
+        webhook::Inbox,
+    };
+    let (key_dir, _private, public) = keys();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route(
+            "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
+            get(dispatch_ref),
+        )
+        .route(
+            "/repos/owner/repo/actions/workflows/17/dispatches",
+            post(dispatch_post),
+        )
+        .route("/repos/owner/repo/actions/runs/123", get(dispatched_run))
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/1",
+            get(dispatched_run),
+        )
+        .route(
+            "/repos/owner/repo/actions/runs/123/attempts/1/jobs",
+            get(actions_jobs),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: Arc::new(AtomicU8::new(0)),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: posts.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let data = tempfile::tempdir().unwrap();
+    let db = data.path().join("queue.sqlite");
+    let config = data.path().join("sluss.toml");
+    let capacity = data.path().join("capacity.toml");
+    std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
+    std::fs::write(&capacity, "[pools]\nrust=1\n[hosts.sluss-host-test]\nslots=1\n[hosts.sluss-host-test.pools]\nrust=1\n").unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let mut store = Store::open(&db).unwrap();
+    inbox
+        .record("initial", "pull_request", &[1; 32], 42, 7)
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation(
+            &event,
+            &"f".repeat(64),
+            &[AdmissionCandidate {
+                candidate: Candidate {
+                    number: 1,
+                    head_sha: "c".repeat(40),
+                },
+                evidence_digest: "d".repeat(64),
+            }],
+        )
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    store
+        .plan_batch(id, &"b".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"a".repeat(40), &"e".repeat(64))
+        .unwrap();
+    drop(store);
+    let launch = |args: Vec<String>| {
+        let db = db.clone();
+        let key = key_dir.path().join("test-key.pem");
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_sluss"))
+                .arg("--db")
+                .arg(db)
+                .args(args)
+                .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+                .output()
+                .unwrap()
+        })
+    };
+    let output = launch(vec![
+        "dispatch-github".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--pool".into(),
+        "rust=1".into(),
+        "--workflow-id".into(),
+        "17".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("dispatched run 123 to reserved host sluss-host-test")
+    );
+    let output = launch(vec![
+        "observe-dispatch".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--config".into(),
+        config.to_str().unwrap().into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+        "--runner-id".into(),
+        "1".into(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Confirmed { runner_id: 1 }"));
+    let output = launch(vec![
+        "cancel-dispatch".into(),
+        "--batch-id".into(),
+        id.into(),
+        "--capacity".into(),
+        capacity.to_str().unwrap().into(),
+    ])
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("already claimed"));
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
     server.abort();
 }

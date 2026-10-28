@@ -74,6 +74,40 @@ enum Command {
         #[arg(long, required = true)]
         policy_file: Vec<String>,
     },
+    /// Reserve capacity and dispatch one prepared batch to GitHub Actions.
+    DispatchGithub {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        /// TOML file describing global pools and physical hosts.
+        #[arg(long)]
+        capacity: PathBuf,
+        /// Resource request, repeat as name=count.
+        #[arg(long, required = true)]
+        pool: Vec<String>,
+        #[arg(long)]
+        workflow_id: u64,
+    },
+    /// Observe a dispatched run and check the reserved host's runner IDs.
+    ObserveDispatch {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        capacity: PathBuf,
+        /// All GitHub runner IDs belonging to the reserved physical host.
+        #[arg(long, required = true)]
+        runner_id: Vec<u64>,
+    },
+    /// Release a reservation only if its dispatch has not been claimed.
+    CancelDispatch {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        capacity: PathBuf,
+    },
     /// Show local queue state and implementation status.
     Status,
     /// Show reconciled PR observations.
@@ -179,7 +213,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut store = Store::open(&cli.db)?;
         sluss::reconcile::reconcile_once(&app, &token, &mut store, &job, &config).await?;
-        println!("repository observations updated; CI dispatch and landing remain disabled");
+        println!(
+            "repository observations updated; automatic CI dispatch and landing remain disabled"
+        );
         return Ok(());
     }
     if matches!(cli.command, Command::Doctor) {
@@ -188,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
-    let store = Store::open(cli.db)?;
+    let store = Store::open(&cli.db)?;
     match cli.command {
         Command::Serve { .. } => unreachable!(),
         Command::Reconcile(_) => unreachable!(),
@@ -276,8 +312,137 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("CI and landing are not authorized by this result");
         }
+        Command::DispatchGithub {
+            batch_id,
+            config,
+            capacity,
+            pool,
+            workflow_id,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            if store.repository_scope()?
+                != (
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+            {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let (batch, _) = store.batch(&batch_id)?.ok_or("unknown batch")?;
+            let sha = match batch.state {
+                sluss::batch::State::Testing { integration_sha } => integration_sha,
+                _ => return Err("batch has not been staged for testing".into()),
+            };
+            let policy_digest = store
+                .batch_policy_digest(&batch_id)?
+                .ok_or("batch has no policy snapshot")?;
+            let plan = sluss::scheduler::DispatchPlan {
+                installation_id: config.github.installation_id as u64,
+                repository_id: config.github.repository_id as u64,
+                workflow_id,
+                integration_sha: sha,
+                staging_ref: format!("refs/heads/sluss/{batch_id}"),
+                policy_digest,
+            };
+            let request = sluss::scheduler::Request {
+                pools: parse_pools(&pool)?,
+            };
+            let capacity = load_capacity(&capacity)?;
+            if capacity
+                .hosts
+                .keys()
+                .any(|name| !sluss::github::valid_runner_label(name))
+            {
+                return Err("each host must use a unique sluss-host-* runner label".into());
+            }
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app =
+                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let token = app
+                .dispatch_token(plan.installation_id, plan.repository_id)
+                .await?;
+            let mut scheduler = sluss::scheduler::Scheduler::open(&cli.db, capacity)?;
+            let Some(reservation) = scheduler.reserve_batch_dispatch(&batch_id, &request, &plan)?
+            else {
+                println!("no compatible capacity available");
+                return Ok(());
+            };
+            let run = app
+                .issue_dispatch(
+                    &mut scheduler,
+                    &token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &batch_id,
+                )
+                .await?;
+            println!(
+                "dispatched run {run} to reserved host {}; awaiting observation",
+                reservation.host
+            );
+        }
+        Command::ObserveDispatch {
+            batch_id,
+            config,
+            capacity,
+            runner_id,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            if store.repository_scope()?
+                != (
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+            {
+                return Err("repository does not match the reconciled queue".into());
+            }
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let key = std::fs::read(key_path)?;
+            let app =
+                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let token = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let snapshot = app
+                .reconcile_dispatch(
+                    &mut scheduler,
+                    &token,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &batch_id,
+                )
+                .await?;
+            let placement = sluss::verification::check_host_placement(
+                &snapshot,
+                &runner_id.into_iter().collect(),
+            )?;
+            println!(
+                "run {}: status {}, conclusion {:?}, placement {:?}",
+                snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement
+            );
+            println!("observation does not authorize landing or release reserved capacity");
+        }
+        Command::CancelDispatch { batch_id, capacity } => {
+            let mut scheduler =
+                sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
+            if scheduler.cancel_prepared(&batch_id)? {
+                println!("cancelled unstarted dispatch");
+            } else {
+                println!(
+                    "dispatch is absent or already claimed; reconcile before releasing capacity"
+                );
+            }
+        }
         Command::Status => println!(
-            "paused: {}\nqueued observations: {}\nCI dispatch: unavailable\nlanding: disabled",
+            "paused: {}\nqueued observations: {}\nautomatic CI dispatch: unavailable\nmanual dispatch: experimental\nlanding: disabled",
             store.paused()?,
             store.candidates()?.len()
         ),
@@ -309,4 +474,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Doctor => unreachable!(),
     }
     Ok(())
+}
+
+fn load_capacity(
+    path: &std::path::Path,
+) -> Result<sluss::scheduler::Capacity, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > 65536 {
+        return Err("capacity configuration is too large".into());
+    }
+    Ok(toml::from_str(std::str::from_utf8(&bytes)?)?)
+}
+fn parse_pools(
+    values: &[String],
+) -> Result<std::collections::BTreeMap<String, u32>, Box<dyn std::error::Error>> {
+    let mut pools = std::collections::BTreeMap::new();
+    for value in values {
+        let (name, count) = value.split_once('=').ok_or("pool must be name=count")?;
+        let count: u32 = count.parse()?;
+        if name.is_empty() || count == 0 || pools.insert(name.into(), count).is_some() {
+            return Err("invalid or duplicate pool".into());
+        }
+    }
+    if pools.is_empty() {
+        return Err("at least one pool is required".into());
+    }
+    Ok(pools)
 }

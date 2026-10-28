@@ -1,0 +1,15 @@
+# Operator-controlled: each host key must be a unique GitHub runner label.
+[pools]
+rust = 2
+macos = 1
+
+[hosts.sluss-host-linux]
+slots = 1
+[hosts.sluss-host-linux.pools]
+rust = 1
+
+[hosts.sluss-host-mac]
+slots = 1
+[hosts.sluss-host-mac.pools]
+rust = 1
+macos = 1

@@ -7,6 +7,7 @@ use thiserror::Error;
 type Budgets = BTreeMap<String, u32>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Host {
     /// Maximum number of simultaneous jobs on this physical host.
     pub slots: u32,
@@ -14,6 +15,7 @@ pub struct Host {
     pub pools: Budgets,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capacity {
     pub pools: Budgets,
     /// Keys identify physical machines, not runner labels.

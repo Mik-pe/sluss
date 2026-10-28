@@ -33,3 +33,17 @@ fn published_example_is_valid() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/sluss.toml");
     assert!(Config::load(&path).is_ok());
 }
+
+#[test]
+fn example_capacity_has_valid_host_labels_and_can_open_scheduler() {
+    let capacity: sluss::scheduler::Capacity =
+        toml::from_str(include_str!("../examples/capacity.toml")).unwrap();
+    assert!(
+        capacity
+            .hosts
+            .keys()
+            .all(|label| sluss::github::valid_runner_label(label))
+    );
+    let dir = tempfile::tempdir().unwrap();
+    sluss::scheduler::Scheduler::open(dir.path().join("capacity.sqlite"), capacity).unwrap();
+}

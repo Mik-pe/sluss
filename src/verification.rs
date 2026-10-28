@@ -109,3 +109,48 @@ fn is_hex(value: &str, length: usize) -> bool {
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
+
+/// Placement observations do not enforce runner labels or validate policy.
+/// The operator must bind every allowed runner ID to the reserved physical host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    Waiting,
+    Confirmed { runner_id: u64 },
+}
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PlacementError {
+    #[error("the reserved host has no valid runner identities")]
+    InvalidHost,
+    #[error("multiple executable jobs cannot be covered by one host slot")]
+    MultipleJobs,
+    #[error("job ran on a runner outside the reserved physical host")]
+    WrongHost,
+    #[error("completed job has no runner identity")]
+    MissingRunner,
+}
+/// Check a provider-observed snapshot for the conservative single-job routing
+/// contract. This is not a guarantee that GitHub enforced the requested label.
+pub fn check_host_placement(
+    snapshot: &crate::github::ActionsSnapshot,
+    allowed_runner_ids: &BTreeSet<u64>,
+) -> Result<Placement, PlacementError> {
+    if allowed_runner_ids.is_empty() || allowed_runner_ids.contains(&0) {
+        return Err(PlacementError::InvalidHost);
+    }
+    let mut jobs = snapshot
+        .jobs
+        .iter()
+        .filter(|job| !(job.status == "completed" && job.conclusion.as_deref() == Some("skipped")));
+    let Some(job) = jobs.next() else {
+        return Ok(Placement::Waiting);
+    };
+    if jobs.next().is_some() {
+        return Err(PlacementError::MultipleJobs);
+    }
+    match job.runner_id {
+        Some(id) if allowed_runner_ids.contains(&id) => Ok(Placement::Confirmed { runner_id: id }),
+        Some(_) => Err(PlacementError::WrongHost),
+        None if job.status == "completed" => Err(PlacementError::MissingRunner),
+        None => Ok(Placement::Waiting),
+    }
+}

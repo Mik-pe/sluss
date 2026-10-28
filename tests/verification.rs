@@ -116,3 +116,79 @@ fn partial_failed_or_ambiguous_results_fail_closed() {
         Err(EvidenceError::InvalidExpectation)
     );
 }
+
+#[test]
+fn physical_host_observation_rejects_wrong_runners_and_multiple_jobs() {
+    use sluss::{
+        github::{ActionsJob, ActionsRepository, ActionsRun, ActionsSnapshot},
+        verification::{Placement, PlacementError, check_host_placement},
+    };
+    let run = ActionsRun {
+        id: 2,
+        run_attempt: 1,
+        workflow_id: 3,
+        head_sha: "a".repeat(40),
+        head_branch: Some("sluss/test".into()),
+        path: ".github/workflows/ci.yml".into(),
+        event: "workflow_dispatch".into(),
+        status: "in_progress".into(),
+        conclusion: None,
+        repository: ActionsRepository { id: 1 },
+        head_repository: Some(ActionsRepository { id: 1 }),
+    };
+    let job = ActionsJob {
+        id: 4,
+        run_id: 2,
+        head_sha: "a".repeat(40),
+        name: "test".into(),
+        status: "queued".into(),
+        conclusion: None,
+        started_at: None,
+        completed_at: None,
+        runner_id: None,
+    };
+    let mut snapshot = ActionsSnapshot {
+        run,
+        jobs: vec![job],
+    };
+    let allowed = BTreeSet::from([10, 11]);
+    assert_eq!(
+        check_host_placement(&snapshot, &allowed),
+        Ok(Placement::Waiting)
+    );
+    snapshot.jobs[0].runner_id = Some(10);
+    snapshot.jobs[0].status = "in_progress".into();
+    assert_eq!(
+        check_host_placement(&snapshot, &allowed),
+        Ok(Placement::Confirmed { runner_id: 10 })
+    );
+    snapshot.jobs[0].runner_id = Some(12);
+    assert_eq!(
+        check_host_placement(&snapshot, &allowed),
+        Err(PlacementError::WrongHost)
+    );
+    snapshot.jobs[0].runner_id = None;
+    snapshot.jobs[0].status = "completed".into();
+    assert_eq!(
+        check_host_placement(&snapshot, &allowed),
+        Err(PlacementError::MissingRunner)
+    );
+    snapshot.jobs[0].runner_id = Some(10);
+    snapshot.jobs.push(ActionsJob {
+        id: 5,
+        ..snapshot.jobs[0].clone()
+    });
+    assert_eq!(
+        check_host_placement(&snapshot, &allowed),
+        Err(PlacementError::MultipleJobs)
+    );
+    snapshot.jobs[1].conclusion = Some("skipped".into());
+    assert_eq!(
+        check_host_placement(&snapshot, &allowed),
+        Ok(Placement::Confirmed { runner_id: 10 })
+    );
+    assert_eq!(
+        check_host_placement(&snapshot, &BTreeSet::new()),
+        Err(PlacementError::InvalidHost)
+    );
+}

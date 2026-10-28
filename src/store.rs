@@ -704,6 +704,18 @@ impl Store {
             .transpose()
     }
 
+    /// Return the declared-file policy digest for a prepared batch.
+    pub fn batch_policy_digest(&self, id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT digest FROM batch_policy WHERE batch_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Begin or resume a frozen integration after checking the queue atomically.
     pub fn start_integration(&mut self, id: &str) -> Result<Batch, StoreError> {
         let tx = self

@@ -775,6 +775,10 @@ impl App {
         if pending.state != DispatchState::Prepared {
             return Err(DispatchError::AlreadyClaimed);
         }
+        let host_label = &pending.reservation.host;
+        if !valid_runner_label(host_label) {
+            return Err(DispatchError::Invalid);
+        }
         let repo_path = format!("repos/{owner}/{repository}");
         let observed_repo: Repository = self.get_json(token, &repo_path, None).await?;
         if observed_repo.id != pending.plan.repository_id {
@@ -807,7 +811,7 @@ impl App {
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2026-03-10")
             .bearer_auth(token.secret())
-            .json(&serde_json::json!({"ref": pending.plan.staging_ref}))
+            .json(&serde_json::json!({"ref": pending.plan.staging_ref, "inputs": {"sluss_host": host_label}}))
             .send()
             .await
             .map_err(|_| DispatchError::Uncertain)?;
@@ -944,4 +948,13 @@ impl App {
         .map_err(|_| StagingError::Worker)?
         .map_err(StagingError::Git)
     }
+}
+
+/// A reserved host must use a dedicated, operator-managed runner label.
+pub fn valid_runner_label(label: &str) -> bool {
+    label.starts_with("sluss-host-")
+        && (12..=100).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
