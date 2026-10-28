@@ -5,6 +5,7 @@
 
 pub mod admission;
 pub mod batch;
+pub mod benchmark;
 pub mod config;
 pub mod coordinator;
 pub mod dispatch;

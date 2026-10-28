@@ -73,6 +73,8 @@ The expected GitHub job names are frozen in each dispatch. `observe-dispatch` co
 
 `sluss metrics` sums actual start-to-finish time for completed, host-checked jobs observed by Sluss. Repeated reads of the same job do not double count it. It also reports completed scheduling-delay intervals grouped by requested pool: from the first failed capacity observation to a later eligible reservation, including polling gaps, pauses or outages. A request for multiple pools appears under each pool; this is not proof that any specific pool was saturated and must not be summed as runner time. Incomplete intervals and requests never attempted by the scheduler are excluded. Both measures use partial observations; jobs Sluss has not observed, unverified placement and rerun attempts are excluded, and delivered PRs and per-PR savings are not yet reported.
 
+`sluss benchmark --input examples/benchmark.json` demonstrates a separate before/after report using **synthetic data**. For a real pilot, operators must collect complete job attempts and delivered PRs independently and describe the cohort boundaries and omissions. The command reports runner time per delivery, reruns, optional run-to-PR associations and ready-to-merge samples; it does not validate the source data or prove savings. See [pilot measurement](docs/benchmark.md).
+
 The database defaults to `sluss.sqlite` in the current directory; use `--db PATH` to select another. The pause flag and observations survive restarts; pause also stops the experimental batch planner. Queue entries must eventually be reconciled against GitHub; an observation is never an approval.
 
 ## Intended operation

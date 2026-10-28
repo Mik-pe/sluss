@@ -246,6 +246,11 @@ enum Command {
     },
     /// Show runner time for completed jobs observed by Sluss.
     Metrics,
+    /// Compare two operator-collected cohorts of jobs and delivered PRs.
+    Benchmark {
+        #[arg(long)]
+        input: PathBuf,
+    },
     /// Show reconciled PR observations.
     Queue,
     /// Persist a pause for future scheduler implementations.
@@ -288,6 +293,52 @@ struct ReconcileArgs {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::Benchmark { input } = &cli.command {
+        let report = sluss::benchmark::Input::load(input)?.report()?;
+        for (label, cohort) in [("baseline", &report.baseline), ("sluss", &report.sluss)] {
+            println!(
+                "{label}: {} jobs, {} attempts with measured jobs ({} reruns), {:.2} runner-minutes, {} delivered PRs",
+                cohort.jobs,
+                cohort.attempts,
+                cohort.rerun_attempts,
+                cohort.runner_ms as f64 / 60_000.0,
+                cohort.delivered
+            );
+            println!(
+                "  operator-assigned deliveries: {} across {} run attempts; ready-to-merge samples: {}/{}",
+                cohort.attributed_deliveries,
+                cohort.attempts_with_delivery,
+                cohort.latency_samples,
+                cohort.delivered
+            );
+            if let (Some(median), Some(p90)) = (cohort.median_latency_ms, cohort.p90_latency_ms) {
+                println!(
+                    "  observed ready-to-merge: median {:.2} minutes, p90 {:.2} minutes",
+                    median as f64 / 60_000.0,
+                    p90 as f64 / 60_000.0
+                );
+            }
+            if cohort.complete && cohort.delivered > 0 {
+                println!(
+                    "  runner-minutes per delivered PR: {:.2}",
+                    cohort.runner_ms as f64 / 60_000.0 / cohort.delivered as f64
+                );
+            } else {
+                println!("  runner-minutes per PR unavailable: incomplete cohort or no deliveries");
+            }
+        }
+        if let Some(change) = report.runner_time_change_percent {
+            println!("observed change in runner-minutes per delivered PR: {change:+.1}%");
+        } else {
+            println!(
+                "runner-minutes comparison unavailable: incomplete cohort, no deliveries, or zero baseline time"
+            );
+        }
+        println!(
+            "Operator-supplied observations and completeness assertions are not independently verified. This comparison does not establish causation, CI trust, or merge authorization."
+        );
+        return Ok(());
+    }
     if let Command::Serve {
         listen,
         config,
@@ -1179,6 +1230,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "Scheduling delay spans first unavailable observation to a later eligible reservation; it includes polling gaps and is not runner time or proof of pool saturation."
             );
+        }
+        Command::Benchmark { .. } => {
+            unreachable!("benchmark is handled before opening the database")
         }
         Command::Queue => {
             let failed: std::collections::BTreeMap<_, _> = store
