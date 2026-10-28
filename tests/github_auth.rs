@@ -96,12 +96,22 @@ async fn reviews(
     Json(json!(items))
 }
 async fn open_pulls(
+    State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     assert_eq!(query.get("page").map(String::as_str), Some("1"));
-    Json(json!([{"number":19}]))
+    if matches!(state.mode.load(Ordering::SeqCst), 46 | 47) {
+        Json(json!([{"number":19}, {"number":20}]))
+    } else {
+        Json(json!([{"number":19}]))
+    }
+}
+async fn pull20(state: State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    let Json(mut value) = pull(state, headers).await;
+    value["number"] = json!(20);
+    Json(value)
 }
 async fn actions_run(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -253,10 +263,10 @@ async fn repository_runners(
     assert_eq!(query["page"], "1");
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    if mode == 44 || mode == 45 {
+    if matches!(mode, 44..=47) {
         return Json(json!({"total_count":2,"runners":[
             {"id":2,"name":"busy-runner","status":"online","busy":true,"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
-            {"id":1,"name":"runner","status":"online","busy":mode == 45,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}
+            {"id":1,"name":"runner","status":"online","busy":mode == 45 || mode == 47,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}
         ]}));
     }
     let id = if mode == 28 || (mode == 29 && count % 2 == 1) {
@@ -1377,6 +1387,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         .route("/repos/owner/repo/pulls", get(open_pulls))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route("/repos/owner/repo/pulls/20", get(pull20))
+        .route("/repos/owner/repo/pulls/20/reviews", get(reviews))
         .route(
             "/repos/owner/repo/collaborators/reviewer/permission",
             get(dispatch_permission),
@@ -1513,6 +1525,97 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         }
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    posts.store(0, Ordering::SeqCst);
+    // A previously prepared intent is pinned to a now-busy host. A second
+    // batch must still reach the other idle host, without resending the first.
+    mode.store(46, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let queue_db = data.path().join("no-head-of-line.sqlite");
+    let mut queue_inbox = Inbox::open(&queue_db).unwrap();
+    let mut queue_store = Store::open(&queue_db).unwrap();
+    queue_inbox
+        .record("queue", "pull_request", &[8; 32], 42, 7)
+        .unwrap();
+    let queue_event = queue_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut queue_store,
+        &queue_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    let pinned_id = "batch-0000000000000000";
+    for batch_id in [pinned_id, id] {
+        queue_store
+            .plan_batch(batch_id, &"b".repeat(40), 1, 2)
+            .unwrap()
+            .unwrap();
+        queue_store.start_integration(batch_id).unwrap();
+        queue_store
+            .finish_integration(batch_id, &"a".repeat(40), &"e".repeat(64))
+            .unwrap();
+    }
+    let plan = sluss::scheduler::DispatchPlan {
+        installation_id: 42,
+        repository_id: 7,
+        workflow_id: 17,
+        integration_sha: "a".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{pinned_id}"),
+        policy_digest: "e".repeat(64),
+        required_jobs: ["job-1-0".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    let mut queue_scheduler =
+        sluss::scheduler::Scheduler::open(&queue_db, independent_capacity.clone()).unwrap();
+    let original = queue_scheduler
+        .reserve_batch_dispatch_on(
+            pinned_id,
+            &settings.request,
+            &plan,
+            &["sluss-host-busy".into()].into(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.host, "sluss-host-busy");
+    mode.store(47, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::dispatch_once(
+            &fixture_app,
+            &queue_db,
+            &fixture_policy,
+            &independent_capacity,
+            &settings
+        )
+        .await
+        .unwrap(),
+        Some(sluss::dispatch::Outcome::NoCapacity)
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    mode.store(46, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::dispatch_once(
+            &fixture_app,
+            &queue_db,
+            &fixture_policy,
+            &independent_capacity,
+            &settings
+        )
+        .await
+        .unwrap(),
+        Some(sluss::dispatch::Outcome::Sent {
+            run: 123,
+            host: "sluss-host-test".into()
+        })
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let pending = queue_scheduler.pending_dispatches().unwrap();
+    assert!(pending.iter().any(|item| item.reservation.id == pinned_id
+        && item.state == sluss::scheduler::DispatchState::Prepared));
+    assert!(pending.iter().any(|item| item.reservation.id == id
+        && item.state == (sluss::scheduler::DispatchState::Accepted { run_id: 123 })));
     posts.store(0, Ordering::SeqCst);
     mode.store(0, Ordering::SeqCst);
     reads.store(0, Ordering::SeqCst);

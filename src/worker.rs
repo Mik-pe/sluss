@@ -442,7 +442,8 @@ pub async fn supervise_preparation(
     }
 }
 
-/// Find one staged batch whose dispatch is absent or still safely prepared.
+/// Try staged batches in queue order until one dispatches. A prepared batch
+/// pinned to a busy host must not block another batch on an independent host.
 /// Claimed, accepted and observed intents are never sent again.
 pub async fn dispatch_once(
     app: &App,
@@ -467,24 +468,30 @@ pub async fn dispatch_once(
     let scheduler =
         crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
     let intents = scheduler.pending_dispatches().map_err(|e| e.to_string())?;
-    let batch = store
+    let batches = store
         .active_batches()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .find(|batch| {
+        .filter(|batch| {
             matches!(batch.state, State::Testing { .. })
                 && !intents.iter().any(|intent| {
                     intent.reservation.id == batch.id
                         && !matches!(intent.state, DispatchState::Prepared)
                 })
         });
-    let Some(batch) = batch else {
-        return Ok(None);
-    };
-    crate::dispatch::batch(db, app, policy, capacity, settings, &batch.id)
-        .await
-        .map(Some)
-        .map_err(|e| e.to_string())
+    let mut no_capacity = false;
+    for batch in batches {
+        match crate::dispatch::batch(db, app, policy, capacity, settings, &batch.id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            sent @ crate::dispatch::Outcome::Sent { .. } => return Ok(Some(sent)),
+            crate::dispatch::Outcome::NoCapacity => no_capacity = true,
+            // Another worker claimed this batch between selection and dispatch.
+            crate::dispatch::Outcome::AlreadyStarted => {}
+        }
+    }
+    Ok(no_capacity.then_some(crate::dispatch::Outcome::NoCapacity))
 }
 
 /// Automatic dispatch remains explicit opt-in and never authorizes landing.
