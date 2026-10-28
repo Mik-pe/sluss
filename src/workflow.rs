@@ -77,9 +77,18 @@ fn parse(bytes: &[u8]) -> Result<Cursor, InvalidWorkflow> {
     Ok(Cursor { events, index: 0 })
 }
 
-/// Prove that this workflow cannot run on a push to the exact staging branch.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StagingTriggers {
+    pub push_excluded: bool,
+    pub create_excluded: bool,
+}
+
+/// Inspect branch creation and pushes for the exact staging branch.
 /// Unsupported, aliased or ambiguous syntax is rejected rather than guessed.
-pub(crate) fn excludes_staging_push(bytes: &[u8], branch: &str) -> Result<bool, InvalidWorkflow> {
+pub(crate) fn inspect_staging_triggers(
+    bytes: &[u8],
+    branch: &str,
+) -> Result<StagingTriggers, InvalidWorkflow> {
     let mut cursor = parse(bytes)?;
     cursor.expect(Event::StreamStart)?;
     cursor.expect(Event::DocumentStart)?;
@@ -197,9 +206,15 @@ impl Cursor {
         }
     }
 
-    fn staging_triggers(&mut self, branch: &str) -> Result<bool, InvalidWorkflow> {
+    fn staging_triggers(&mut self, branch: &str) -> Result<StagingTriggers, InvalidWorkflow> {
         match self.peek()? {
-            Event::Scalar(..) => Ok(self.string_scalar()? != "push"),
+            Event::Scalar(..) => {
+                let name = self.string_scalar()?;
+                Ok(StagingTriggers {
+                    push_excluded: name != "push",
+                    create_excluded: name != "create",
+                })
+            }
             Event::SequenceStart(_, None) => {
                 self.take()?;
                 let mut names = BTreeSet::new();
@@ -210,25 +225,31 @@ impl Cursor {
                     }
                 }
                 self.expect(Event::SequenceEnd)?;
-                Ok(!names.contains("push"))
+                Ok(StagingTriggers {
+                    push_excluded: !names.contains("push"),
+                    create_excluded: !names.contains("create"),
+                })
             }
             Event::MappingStart(_, None) => {
                 self.take()?;
                 let mut names = BTreeSet::new();
-                let mut safe = true;
+                let mut push_excluded = true;
                 while !matches!(self.peek()?, Event::MappingEnd) {
                     let name = self.string_scalar()?;
                     if name == "<<" || !names.insert(name.clone()) {
                         return Err(InvalidWorkflow);
                     }
                     if name == "push" {
-                        safe = self.staging_push_filter(branch)?;
+                        push_excluded = self.staging_push_filter(branch)?;
                     } else {
                         self.skip_node()?;
                     }
                 }
                 self.expect(Event::MappingEnd)?;
-                Ok(safe)
+                Ok(StagingTriggers {
+                    push_excluded,
+                    create_excluded: !names.contains("create"),
+                })
             }
             _ => Err(InvalidWorkflow),
         }
@@ -407,7 +428,7 @@ mod tests {
             "on: {push: {branches-ignore: ['sluss/batch-0123456789abcdef']}}\n",
         ] {
             assert_eq!(
-                excludes_staging_push(text.as_bytes(), branch),
+                inspect_staging_triggers(text.as_bytes(), branch).map(|s| s.push_excluded),
                 Ok(true),
                 "{text}"
             );
@@ -427,7 +448,7 @@ mod tests {
             "on: {push: {branches: ['!sluss/**']}}\n",
         ] {
             assert_eq!(
-                excludes_staging_push(text.as_bytes(), branch),
+                inspect_staging_triggers(text.as_bytes(), branch).map(|s| s.push_excluded),
                 Ok(false),
                 "{text}"
             );
@@ -440,7 +461,38 @@ mod tests {
             "on: {push: {<<: *missing}}\n",
         ] {
             assert!(
-                excludes_staging_push(text.as_bytes(), branch).is_err(),
+                inspect_staging_triggers(text.as_bytes(), branch)
+                    .map(|s| s.push_excluded)
+                    .is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_branch_creation_across_trigger_forms() {
+        let branch = "sluss/batch-0123456789abcdef";
+        for text in [
+            "on: create\n",
+            "on: [push, create]\n",
+            "on: {create: {}, workflow_dispatch: {}}\n",
+        ] {
+            assert!(
+                !inspect_staging_triggers(text.as_bytes(), branch)
+                    .unwrap()
+                    .create_excluded,
+                "{text}"
+            );
+        }
+        for text in [
+            "on: workflow_dispatch\n",
+            "on: [pull_request, workflow_dispatch]\n",
+            "on: {push: {branches: [main]}}\n",
+        ] {
+            assert!(
+                inspect_staging_triggers(text.as_bytes(), branch)
+                    .unwrap()
+                    .create_excluded,
                 "{text}"
             );
         }

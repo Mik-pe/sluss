@@ -1209,7 +1209,7 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
     let safe = git(source.path(), &["rev-parse", "HEAD"]);
     let id = "batch-0123456789abcdef";
     let integration = build(source.path(), &base, &[safe]).unwrap();
-    integration.check_staging_push_workflows(id).unwrap();
+    integration.check_staging_workflows(id).unwrap();
     git(source.path(), &["checkout", "-b", "unsafe", &base]);
     // This file was not in the base or any operator-selected policy list.
     std::fs::write(
@@ -1231,12 +1231,39 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
     let unsafe_head = git(source.path(), &["rev-parse", "HEAD"]);
     let integration = build(source.path(), &base, &[unsafe_head]).unwrap();
     assert!(
-        matches!(integration.check_staging_push_workflows(id), Err(StagingWorkflowError::PushTrigger(path)) if path == ".github/workflows/new.yml")
+        matches!(integration.check_staging_workflows(id), Err(StagingWorkflowError::PushTrigger(path)) if path == ".github/workflows/new.yml")
     );
     #[cfg(unix)]
     assert!(matches!(
         integration.stage_github("owner", "repo", "not-a-real-token", id),
         Err(StageError::Workflow(StagingWorkflowError::PushTrigger(_)))
+    ));
+    git(source.path(), &["checkout", "-b", "create-trigger", &base]);
+    std::fs::write(
+        source.path().join(".github/workflows/create.yml"),
+        "on: [create, workflow_dispatch]\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "create trigger",
+        ],
+    );
+    let head = git(source.path(), &["rev-parse", "HEAD"]);
+    let integration = build(source.path(), &base, &[head]).unwrap();
+    assert!(
+        matches!(integration.check_staging_workflows(id), Err(StagingWorkflowError::CreateTrigger(path)) if path == ".github/workflows/create.yml")
+    );
+    #[cfg(unix)]
+    assert!(matches!(
+        integration.stage_github("owner", "repo", "not-a-real-token", id),
+        Err(StageError::Workflow(StagingWorkflowError::CreateTrigger(_)))
     ));
     git(source.path(), &["checkout", "-b", "ambiguous", &base]);
     std::fs::write(
@@ -1252,7 +1279,7 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
     let ambiguous = git(source.path(), &["rev-parse", "HEAD"]);
     let integration = build(source.path(), &base, &[ambiguous]).unwrap();
     assert!(
-        matches!(integration.check_staging_push_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github/workflows/new.yaml")
+        matches!(integration.check_staging_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github/workflows/new.yaml")
     );
     git(source.path(), &["checkout", "-b", "oversized", &base]);
     std::fs::write(
@@ -1268,7 +1295,7 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
     let head = git(source.path(), &["rev-parse", "HEAD"]);
     let integration = build(source.path(), &base, &[head]).unwrap();
     assert!(
-        matches!(integration.check_staging_push_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github/workflows/large.yml")
+        matches!(integration.check_staging_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github/workflows/large.yml")
     );
     #[cfg(unix)]
     {
@@ -1283,7 +1310,7 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
         let head = git(source.path(), &["rev-parse", "HEAD"]);
         let integration = build(source.path(), &base, &[head]).unwrap();
         assert!(
-            matches!(integration.check_staging_push_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github/workflows/link.yml")
+            matches!(integration.check_staging_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github/workflows/link.yml")
         );
         git(source.path(), &["checkout", "-b", "parent-link", &base]);
         std::fs::remove_dir_all(source.path().join(".github")).unwrap();
@@ -1296,7 +1323,7 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
         let head = git(source.path(), &["rev-parse", "HEAD"]);
         let integration = build(source.path(), &base, &[head]).unwrap();
         assert!(
-            matches!(integration.check_staging_push_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github")
+            matches!(integration.check_staging_workflows(id), Err(StagingWorkflowError::Ambiguous(path)) if path == ".github")
         );
     }
 }

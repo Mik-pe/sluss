@@ -206,7 +206,7 @@ fn valid_staging_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// A conservative check of push-triggered Actions in the integration commit.
+/// A conservative check of push- and create-triggered Actions in the integration commit.
 /// Other events, organization runners, external automation and workflow trust
 /// remain independent operator responsibilities.
 #[derive(Debug, Error)]
@@ -217,6 +217,8 @@ pub enum StagingWorkflowError {
     Tree,
     #[error("workflow {0} could run on the staging push; restrict its branch filter")]
     PushTrigger(String),
+    #[error("workflow {0} could run when the staging branch is created")]
+    CreateTrigger(String),
     #[error("workflow {0} has unsupported or ambiguous trigger syntax")]
     Ambiguous(String),
     #[error(transparent)]
@@ -265,8 +267,8 @@ fn tree_entry(line: &[u8]) -> Result<(&str, &str, &str, &str), StagingWorkflowEr
 
 impl Integration {
     /// Inspect every direct .yml/.yaml workflow file from this exact commit.
-    /// This does not prove that other events or external systems cannot start CI.
-    pub fn check_staging_push_workflows(&self, id: &str) -> Result<(), StagingWorkflowError> {
+    /// Also rejects create triggers. Other events and external systems can still start CI.
+    pub fn check_staging_workflows(&self, id: &str) -> Result<(), StagingWorkflowError> {
         if !valid_staging_id(id) {
             return Err(StagingWorkflowError::Invalid);
         }
@@ -356,9 +358,14 @@ impl Integration {
             if blob.len() != size {
                 return Err(StagingWorkflowError::Tree);
             }
-            match crate::workflow::excludes_staging_push(&blob, &branch) {
-                Ok(true) => {}
-                Ok(false) => return Err(StagingWorkflowError::PushTrigger(path)),
+            match crate::workflow::inspect_staging_triggers(&blob, &branch) {
+                Ok(triggers) if !triggers.create_excluded => {
+                    return Err(StagingWorkflowError::CreateTrigger(path));
+                }
+                Ok(triggers) if !triggers.push_excluded => {
+                    return Err(StagingWorkflowError::PushTrigger(path));
+                }
+                Ok(_) => {}
                 Err(_) => return Err(StagingWorkflowError::Ambiguous(path)),
             }
         }
@@ -419,7 +426,7 @@ impl Integration {
         {
             return Err(StageError::Invalid);
         }
-        self.check_staging_push_workflows(id)?;
+        self.check_staging_workflows(id)?;
         let remote = format!("https://github.com/{owner}/{repository}.git");
         self.stage(std::ffi::OsStr::new(&remote), id, Some(token))
     }
