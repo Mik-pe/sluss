@@ -1,0 +1,26 @@
+# Example adapter: install as a workflow on the default and target branches.
+# Replace project-ci.yml and its inputs with your reviewed reusable workflow.
+name: Sluss reusable workflow adapter
+on:
+  workflow_dispatch:
+    inputs:
+      sluss_host:
+        description: Unique label of the reserved physical host
+        required: true
+        type: string
+      sluss_suites:
+        description: Comma-separated verification suites selected by Sluss
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    # The called workflow must declare workflow_call inputs with these names,
+    # actually use runner_label in its runs-on labels, and validate its suites.
+    # Include this file, the called workflow and all executable dependencies
+    # in the operator's trusted policy. No secrets are inherited by this example.
+    uses: ./.github/workflows/project-ci.yml
+    with:
+      runner_label: ${{ inputs.sluss_host }}
+      suites: ${{ inputs.sluss_suites }}

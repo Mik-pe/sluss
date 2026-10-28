@@ -599,6 +599,18 @@ mod tests {
         let example = include_bytes!("../examples/github-actions/sluss-ci.yml");
         assert_eq!(supports_sluss_dispatch(example), Ok(true));
     }
+
+    #[test]
+    fn reusable_workflow_adapter_declares_dispatch_without_staging_triggers() {
+        let example = include_bytes!("../examples/github-actions/reusable-dispatch.yml");
+        assert_eq!(supports_sluss_dispatch(example), Ok(true));
+        let triggers = inspect_staging_triggers(example, "sluss/batch-0123456789abcdef").unwrap();
+        assert!(triggers.push_excluded && triggers.create_excluded);
+        assert_eq!(
+            declared_events(example).unwrap(),
+            ["workflow_dispatch".to_string()].into_iter().collect()
+        );
+    }
     #[test]
     fn rejects_ambiguous_or_unbounded_trigger_declarations() {
         for text in [
