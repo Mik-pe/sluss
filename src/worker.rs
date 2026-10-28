@@ -348,6 +348,38 @@ pub async fn observe_dispatches_once(
     observe_dispatches_with_completion(app, db, capacity, policy, false).await
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ObservationPassError {
+    #[error("queue has not been bound by provider reconciliation")]
+    Unbound,
+    #[error("{0}")]
+    Other(String),
+}
+impl From<String> for ObservationPassError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
+impl From<&str> for ObservationPassError {
+    fn from(value: &str) -> Self {
+        Self::Other(value.into())
+    }
+}
+fn observation_scope(store: &Store, policy: &RepositoryPolicy) -> Result<(), ObservationPassError> {
+    let scope = match store.repository_scope() {
+        Ok(scope) => scope,
+        Err(crate::store::StoreError::Unbound) => return Err(ObservationPassError::Unbound),
+        Err(error) => return Err(ObservationPassError::Other(error.to_string())),
+    };
+    if policy.installation <= 0
+        || policy.repository <= 0
+        || scope != (policy.installation as u64, policy.repository as u64)
+    {
+        return Err("repository does not match the reconciled queue".into());
+    }
+    Ok(())
+}
+
 /// CI-only completion retires the scheduling batch while retaining its reservation.
 pub async fn observe_dispatches_with_completion(
     app: &App,
@@ -356,13 +388,21 @@ pub async fn observe_dispatches_with_completion(
     policy: &RepositoryPolicy,
     complete_ci_only: bool,
 ) -> Result<(), String> {
+    observe_dispatches_inner(app, db, capacity, policy, complete_ci_only)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn observe_dispatches_inner(
+    app: &App,
+    db: &std::path::Path,
+    capacity: &crate::scheduler::Capacity,
+    policy: &RepositoryPolicy,
+    complete_ci_only: bool,
+) -> Result<(), ObservationPassError> {
     use crate::{batch::State, scheduler::DispatchState};
     let store = Store::open(db).map_err(|e| e.to_string())?;
-    if store.repository_scope().map_err(|e| e.to_string())?
-        != (policy.installation as u64, policy.repository as u64)
-    {
-        return Err("repository does not match the reconciled queue".into());
-    }
+    observation_scope(&store, policy)?;
     let mut scheduler =
         crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
     let pending = scheduler.pending_dispatches().map_err(|e| e.to_string())?;
@@ -515,21 +555,25 @@ pub async fn supervise_dispatch_observation_with_signals(
             sleep(poll.max(Duration::from_secs(1))).await;
             continue;
         }
-        if let Err(error) =
-            observe_dispatches_with_completion(&app, &db, &capacity, &policy, complete_ci_only)
-                .await
-        {
-            eprintln!("dispatch observation pass failed: {error}");
-            delay = delay.saturating_mul(2).min(Duration::from_secs(300));
-            sleep(delay).await;
-        } else {
-            if let Some(release) = &wakeups.release {
-                release.notify_one();
+        match observe_dispatches_inner(&app, &db, &capacity, &policy, complete_ci_only).await {
+            Err(ObservationPassError::Unbound) => {
+                delay = minimum;
+                sleep(poll.max(Duration::from_secs(1))).await;
             }
-            delay = minimum;
-            tokio::select! {
-                _ = sleep(minimum) => {}
-                _ = wakeups.ci.notified() => sleep(wake_delay).await,
+            Err(ObservationPassError::Other(error)) => {
+                eprintln!("dispatch observation pass failed: {error}");
+                delay = delay.saturating_mul(2).min(Duration::from_secs(300));
+                sleep(delay).await;
+            }
+            Ok(()) => {
+                if let Some(release) = &wakeups.release {
+                    release.notify_one();
+                }
+                delay = minimum;
+                tokio::select! {
+                    _ = sleep(minimum) => {}
+                    _ = wakeups.ci.notified() => sleep(wake_delay).await,
+                }
             }
         }
     }
@@ -1175,5 +1219,46 @@ mod preparation_tests {
         .unwrap_err();
         assert!(error.contains("batch batch-1"));
         assert!(error.contains("staging ref already points to a different commit"));
+    }
+}
+
+#[cfg(test)]
+mod observation_startup_tests {
+    use super::{ObservationPassError, observation_scope};
+    use crate::{reconcile::RepositoryPolicy, store::Store, webhook::Inbox};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn unbound_startup_is_distinct_from_a_real_scope_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("queue.sqlite");
+        let mut store = Store::open(&db).unwrap();
+        let mut policy = RepositoryPolicy {
+            installation: 1,
+            repository: 2,
+            owner: "owner".into(),
+            name: "repo".into(),
+            target_branch: "main".into(),
+            required_reviews: 1,
+            block_labels: BTreeSet::new(),
+        };
+        assert!(matches!(
+            observation_scope(&store, &policy),
+            Err(ObservationPassError::Unbound)
+        ));
+        let mut inbox = Inbox::open(&db).unwrap();
+        inbox
+            .record("initial", "pull_request", &[1; 32], 1, 2)
+            .unwrap();
+        let event = inbox.pending().unwrap().remove(0);
+        store
+            .apply_admission_reconciliation(&event, &"f".repeat(64), &[])
+            .unwrap();
+        assert!(observation_scope(&store, &policy).is_ok());
+        policy.repository = 3;
+        assert!(matches!(
+            observation_scope(&store, &policy),
+            Err(ObservationPassError::Other(_))
+        ));
     }
 }
