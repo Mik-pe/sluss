@@ -10,6 +10,8 @@ The current development preview contains a durable SQLite queue, batch state mac
 
 An experimental library function can advance a branch in a trusted **local bare Git repository** using a reference transaction. It is not connected to the service or CLI, does not provide authorization, and is not GitHub landing. See the [protocol](docs/protocol.md) for its assumptions and limitations.
 
+An independent experimental landing journal can freeze a prospective GitHub ref update and retain uncertain attempts across process restarts. It does not send requests, authenticate evidence, or authorize landing; recovery of an uncertain attempt is not implemented.
+
 ```sh
 cargo test
 cargo run -- status
