@@ -87,7 +87,7 @@ pub async fn reconcile_once(
         .observe_target_branch(token, &config.owner, &config.name, &config.target_branch)
         .await?;
     let numbers = app
-        .open_pull_numbers(token, &config.owner, &config.name)
+        .open_pull_numbers(token, &config.owner, &config.name, &config.target_branch)
         .await?;
     let mut candidates = Vec::new();
     let observations = app
@@ -126,7 +126,7 @@ pub async fn reconcile_once(
         }
     }
     if app
-        .open_pull_numbers(token, &config.owner, &config.name)
+        .open_pull_numbers(token, &config.owner, &config.name, &config.target_branch)
         .await?
         != numbers
     {

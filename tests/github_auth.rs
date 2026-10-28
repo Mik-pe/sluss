@@ -108,11 +108,17 @@ async fn open_pulls(
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
     assert_eq!(query.get("page").map(String::as_str), Some("1"));
-    if matches!(state.mode.load(Ordering::SeqCst), 46 | 47) {
-        Json(json!([{"number":19}, {"number":20}]))
+    assert_eq!(query.get("state").map(String::as_str), Some("open"));
+    let branch = query.get("base").expect("base branch filter");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let row = |number| json!({"number":number, "state":"open", "base":{"ref":if mode == 218 {"wrong"} else {branch}, "repo":{"id":7}}});
+    Json(if matches!(mode, 46 | 47) {
+        json!([row(19), row(20)])
+    } else if mode == 222 {
+        json!([row(20)])
     } else {
-        Json(json!([{"number":19}]))
-    }
+        json!([row(19)])
+    })
 }
 async fn pull20(state: State<ServerState>, headers: HeaderMap) -> Json<Value> {
     let Json(mut value) = pull(state, headers).await;
@@ -935,6 +941,27 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let token = client.read_token(42, 7).await.unwrap();
     assert_eq!(token.secret(), "fake-installation-token");
     assert!(!format!("{token:?}").contains(token.secret()));
+    assert_eq!(
+        client
+            .open_pull_numbers(&token, "owner", "repo", "release/one")
+            .await
+            .unwrap(),
+        vec![19]
+    );
+    assert!(
+        client
+            .open_pull_numbers(&token, "owner", "repo", "main?state=closed")
+            .await
+            .is_err()
+    );
+    mode.store(218, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .open_pull_numbers(&token, "owner", "repo", "main")
+            .await,
+        Err(GitHubError::UnstableObservation)
+    ));
+    mode.store(0, Ordering::SeqCst);
     permissions.store(0, Ordering::SeqCst);
     let shared = client
         .observe_authorized_pulls(&token, "owner", "repo", &[19, 20])
@@ -1005,6 +1032,10 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .unwrap();
     assert_eq!(scan_store.candidates().unwrap().len(), 2);
     assert_eq!(permissions.load(Ordering::SeqCst), 2);
+    let frozen = scan_store
+        .plan_batch("batch-9123456789abcdef", &"b".repeat(40), 4, 1)
+        .unwrap()
+        .unwrap();
     scan_inbox
         .record("shared-changed", "pull_request_review", &[32; 32], 42, 7)
         .unwrap();
@@ -1018,6 +1049,32 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     );
     assert_eq!(scan_store.candidates().unwrap().len(), 2);
     assert_eq!(scan_inbox.pending().unwrap().len(), 1);
+    mode.store(222, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut scan_store, &job, &scan_policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_store
+            .candidates()
+            .unwrap()
+            .iter()
+            .map(|p| p.number)
+            .collect::<Vec<_>>(),
+        vec![20]
+    );
+    assert!(matches!(
+        scan_store.batch(&frozen.id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    scan_inbox
+        .record("retarget-back", "pull_request", &[33; 32], 42, 7)
+        .unwrap();
+    let job = scan_inbox.pending().unwrap().remove(0);
+    mode.store(46, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut scan_store, &job, &scan_policy)
+        .await
+        .unwrap();
+    assert_eq!(scan_store.candidates().unwrap().len(), 2);
     mode.store(0, Ordering::SeqCst);
     let actions = client
         .observe_actions_attempt(&token, "owner", "repo", 123, 2)

@@ -820,20 +820,34 @@ impl App {
 #[derive(Deserialize)]
 struct PullNumber {
     number: u64,
+    state: String,
+    base: PullListBase,
+}
+#[derive(Deserialize)]
+struct PullListBase {
+    #[serde(rename = "ref")]
+    branch: String,
+    repo: PullRepository,
 }
 impl App {
-    /// Enumerate open pull requests twice. A changed or truncated listing is not usable.
+    /// Enumerate open pull requests targeting one branch twice. A changed,
+    /// inconsistent or truncated listing is not usable.
     pub async fn open_pull_numbers(
         &self,
         token: &InstallationToken,
         owner: &str,
         repository: &str,
+        target: &str,
     ) -> Result<Vec<u64>, GitHubError> {
         if !valid_name(owner) || !valid_name(repository) {
             return Err(GitHubError::InvalidConfiguration);
         }
-        let first = self.fetch_open_pulls(token, owner, repository).await?;
-        let second = self.fetch_open_pulls(token, owner, repository).await?;
+        let first = self
+            .fetch_open_pulls(token, owner, repository, target)
+            .await?;
+        let second = self
+            .fetch_open_pulls(token, owner, repository, target)
+            .await?;
         if first != second {
             return Err(GitHubError::UnstableObservation);
         }
@@ -844,19 +858,26 @@ impl App {
         token: &InstallationToken,
         owner: &str,
         repository: &str,
+        target: &str,
     ) -> Result<Vec<u64>, GitHubError> {
-        let path = format!("repos/{owner}/{repository}/pulls");
+        let target_encoded =
+            encoded_branch_segment(target).ok_or(GitHubError::InvalidConfiguration)?;
+        let path = format!("repos/{owner}/{repository}/pulls?state=open&base={target_encoded}");
         let mut result = Vec::new();
         let mut unique = std::collections::BTreeSet::new();
         for page in 1..=100u32 {
-            // GitHub defaults to state=open for this endpoint.
             let pulls: Vec<PullNumber> = self.get_json(token, &path, Some(page)).await?;
             if pulls.len() > 100 {
                 return Err(GitHubError::UnstableObservation);
             }
             let done = pulls.len() < 100;
             for pull in pulls {
-                if pull.number == 0 || !unique.insert(pull.number) {
+                if pull.number == 0
+                    || pull.state != "open"
+                    || pull.base.branch != target
+                    || pull.base.repo.id != token.repository_id
+                    || !unique.insert(pull.number)
+                {
                     return Err(GitHubError::UnstableObservation);
                 }
                 result.push(pull.number);
