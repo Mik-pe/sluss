@@ -908,6 +908,17 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
             runner_id: Some(7),
         }],
     };
+    snapshot.jobs.push(ActionsJob {
+        id: 12,
+        run_id: 9,
+        head_sha: "b".repeat(40),
+        name: "skipped".into(),
+        status: "completed".into(),
+        conclusion: Some("skipped".into()),
+        started_at: None,
+        completed_at: None,
+        runner_id: None,
+    });
     let mut wrong_workflow = snapshot.clone();
     wrong_workflow.run.path = ".github/workflows/other.yml@refs/heads/sluss/example".into();
     assert!(matches!(
@@ -920,16 +931,89 @@ fn ci_observation_is_immutable_and_rejected_when_review_changes() {
         scheduler.record_ci_observation(id, &snapshot).unwrap(),
         CiObservation::Successful
     );
+    snapshot.jobs.swap(0, 1);
     assert_eq!(
         scheduler.record_ci_observation(id, &snapshot).unwrap(),
         CiObservation::Successful
     );
-    snapshot.run.conclusion = Some("failure".into());
+    snapshot.jobs.swap(0, 1);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let original: String = conn
+        .query_row("SELECT body FROM ci_observations WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_str(&original).unwrap();
+    legacy.as_object_mut().unwrap().remove("snapshot");
+    legacy.as_object_mut().unwrap().remove("runner_id");
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        rusqlite::params![id, legacy.to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        scheduler.record_ci_observation(id, &snapshot).unwrap(),
+        CiObservation::Successful
+    );
+    assert!(
+        store
+            .ci_evidence(id)
+            .unwrap()
+            .unwrap()
+            .record
+            .snapshot
+            .is_none(),
+        "a later read must not invent historical details"
+    );
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        rusqlite::params![id, original],
+    )
+    .unwrap();
+    snapshot.jobs[0].id = 13;
+    assert!(
+        matches!(
+            scheduler.record_job_metrics(id, &snapshot),
+            Err(SchedulerError::CiConflict)
+        ),
+        "metrics must not record contradictory jobs first"
+    );
+    assert!(
+        matches!(
+            scheduler.record_ci_observation(id, &snapshot),
+            Err(SchedulerError::StaleBatch)
+        ),
+        "a contradictory job ID invalidates the active batch"
+    );
+    let evidence = store.ci_evidence(id).unwrap().unwrap();
+    assert!(evidence.conflicted);
+    assert_eq!(evidence.record.snapshot.unwrap().jobs[0].id, 11);
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["ci-evidence", "--batch-id", id])
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    assert!(String::from_utf8_lossy(&report.stdout).contains("conflict: true"));
+    snapshot.jobs[0].id = 11;
+    drop(scheduler);
+    let mut scheduler = Scheduler::open(&db, capacity.clone()).unwrap();
+    assert!(
+        matches!(
+            scheduler.record_ci_observation(id, &snapshot),
+            Err(SchedulerError::StaleBatch)
+        ),
+        "the invalidation survives restart even if later reads match"
+    );
     assert!(matches!(
-        scheduler.record_ci_observation(id, &snapshot),
+        scheduler.complete_ci_only(id),
         Err(SchedulerError::CiConflict)
     ));
-    snapshot.run.conclusion = Some("success".into());
+    assert!(matches!(
+        scheduler.record_job_metrics(id, &snapshot),
+        Err(SchedulerError::CiConflict)
+    ));
     inbox
         .record("review", "pull_request_review", &[5; 32], 1, 2)
         .unwrap();

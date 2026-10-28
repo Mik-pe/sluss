@@ -59,6 +59,14 @@ pub struct PlanningSettings {
     pub batch_window: Duration,
 }
 
+/// Historical CI comparison and any durable conflict marker. This is not
+/// authenticated attestation or permission to land.
+#[derive(Debug)]
+pub struct CiEvidence {
+    pub record: crate::scheduler::CiObservationRecord,
+    pub conflicted: bool,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -108,6 +116,37 @@ impl Store {
     /// Summarize completed jobs observed by Sluss, not all repository CI.
     pub fn metrics(&self) -> Result<crate::metrics::Summary, StoreError> {
         Ok(crate::metrics::summarize(&self.conn)?)
+    }
+
+    /// Read a completed CI observation without constructing a scheduler.
+    pub fn ci_evidence(&self, id: &str) -> Result<Option<CiEvidence>, StoreError> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let body: Option<String> = self
+            .conn
+            .query_row("SELECT body FROM ci_observations WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let has_conflicts: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observation_conflicts')", [], |r| r.get(0))?;
+        let conflicted = if has_conflicts {
+            self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )?
+        } else {
+            false
+        };
+        Ok(Some(CiEvidence {
+            record: serde_json::from_str(&body)?,
+            conflicted,
+        }))
     }
 
     /// Scope fixed by successful repository reconciliation.

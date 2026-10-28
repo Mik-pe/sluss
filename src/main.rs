@@ -219,6 +219,11 @@ enum Command {
     },
     /// Show local queue state and implementation status.
     Status,
+    /// Inspect a historical CI observation; this is not an attestation.
+    CiEvidence {
+        #[arg(long)]
+        batch_id: String,
+    },
     /// Show runner time for completed jobs observed by Sluss.
     Metrics,
     /// Show reconciled PR observations.
@@ -921,6 +926,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     batch.candidates.len(),
                     batch.base_sha
                 );
+            }
+        }
+        Command::CiEvidence { batch_id } => {
+            if let Some(evidence) = store.ci_evidence(&batch_id)? {
+                let record = evidence.record;
+                println!(
+                    "CI observation for batch {:?}: {:?}; conflict: {}",
+                    batch_id, record.observation, evidence.conflicted
+                );
+                println!(
+                    "repository: {}; run: {}; workflow ID: {}; commit: {}; policy digest: {}",
+                    record.plan.repository_id,
+                    record.run_id,
+                    record.plan.workflow_id,
+                    record.plan.integration_sha,
+                    record.plan.policy_digest
+                );
+                println!(
+                    "frozen workflow path: {:?}; observed runner: {:?}",
+                    record.workflow_path, record.runner_id
+                );
+                if let Some(snapshot) = record.snapshot {
+                    println!(
+                        "attempt: {}; run status: {:?}; conclusion: {:?}",
+                        snapshot.run.run_attempt, snapshot.run.status, snapshot.run.conclusion
+                    );
+                    for job in snapshot.jobs {
+                        println!(
+                            "job {} {:?}: status {:?}, conclusion {:?}, runner {:?}",
+                            job.id, job.name, job.status, job.conclusion, job.runner_id
+                        );
+                    }
+                } else {
+                    println!("historical record has no original job snapshot");
+                }
+                println!(
+                    "This is a provider observation, not a trusted attestation or merge approval."
+                );
+            } else {
+                println!("no completed CI observation for batch {:?}", batch_id);
             }
         }
         Command::Metrics => {

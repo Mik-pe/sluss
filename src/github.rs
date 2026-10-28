@@ -608,7 +608,7 @@ impl App {
 
 /// Provider data only. This is not an attestation or evidence that workflow
 /// code, runner environment, or a later merge is trusted.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionsRun {
     pub id: u64,
     pub run_attempt: u32,
@@ -622,11 +622,11 @@ pub struct ActionsRun {
     pub repository: ActionsRepository,
     pub head_repository: Option<ActionsRepository>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionsRepository {
     pub id: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionsJob {
     pub id: u64,
     pub run_id: u64,
@@ -638,7 +638,7 @@ pub struct ActionsJob {
     pub completed_at: Option<String>,
     pub runner_id: Option<u64>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionsSnapshot {
     pub run: ActionsRun,
     pub jobs: Vec<ActionsJob>,

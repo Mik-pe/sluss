@@ -93,6 +93,7 @@ fn finish_selected(
         suite,
         ".github/workflows/ci.yml",
         None,
+        false,
     );
 }
 
@@ -106,6 +107,7 @@ fn finish_with_workflow(
     suite: Option<&str>,
     workflow: &str,
     legacy_db: Option<&std::path::Path>,
+    retain_reservation: bool,
 ) {
     let id = &batch.id;
     store
@@ -202,7 +204,9 @@ fn finish_with_workflow(
     scheduler.record_ci_observation(id, &snapshot).unwrap();
     scheduler.complete_ci_only(id).unwrap();
     scheduler.complete_ci_only(id).unwrap(); // repeated recovery is idempotent
-    scheduler.finish_dispatch(id, run_id).unwrap(); // local test assumes the runner is no longer consuming capacity
+    if !retain_reservation {
+        scheduler.finish_dispatch(id, run_id).unwrap(); // local test assumes the runner is no longer consuming capacity
+    }
 }
 
 #[test]
@@ -916,6 +920,7 @@ fn ci_investigation_requires_comparable_frozen_workflow_paths() {
         None,
         ".github/workflows/other.yml",
         None,
+        false,
     );
     assert!(
         store
@@ -941,6 +946,7 @@ fn matching_children_with_a_different_parent_workflow_are_inconclusive() {
         None,
         ".github/workflows/other.yml",
         None,
+        false,
     );
     let right = plan(&mut store, 3).unwrap();
     finish_with_workflow(
@@ -952,6 +958,7 @@ fn matching_children_with_a_different_parent_workflow_are_inconclusive() {
         None,
         ".github/workflows/other.yml",
         None,
+        false,
     );
     assert!(
         store
@@ -975,6 +982,7 @@ fn legacy_run_without_a_workflow_binding_remains_observable_but_is_not_bisected(
         None,
         ".github/workflows/ci.yml",
         Some(&dir.path().join("queue.sqlite")),
+        false,
     );
     assert!(store.ci_investigations().unwrap().is_empty());
     assert!(plan(&mut store, 2).is_none());
@@ -1059,5 +1067,234 @@ fn competing_batch_claims_atomically_freeze_one_workflow_across_restart() {
     assert!(matches!(
         scheduler.pending_dispatches().unwrap()[0].state,
         sluss::scheduler::DispatchState::Sending
+    ));
+}
+
+#[test]
+fn ci_evidence_command_shows_preserved_jobs_without_claiming_attestation() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "success");
+    let saved = store.ci_evidence(&root.id).unwrap().unwrap();
+    assert!(!saved.conflicted);
+    assert_eq!(saved.record.runner_id, Some(7));
+    assert_eq!(saved.record.snapshot.unwrap().jobs[0].id, 101);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args(["ci-evidence", "--batch-id", &root.id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(report.contains("job 101"));
+    assert!(report.contains("not a trusted attestation"));
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM ci_observations WHERE id=?1",
+            [&root.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_str(&body).unwrap();
+    legacy.as_object_mut().unwrap().remove("snapshot");
+    legacy.as_object_mut().unwrap().remove("runner_id");
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        rusqlite::params![root.id, legacy.to_string()],
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(dir.path().join("queue.sqlite"))
+        .args(["ci-evidence", "--batch-id", &root.id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("historical record has no original job snapshot")
+    );
+}
+
+#[test]
+fn legacy_parent_without_original_job_snapshot_cannot_drive_bisection() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish(&mut store, &mut scheduler, &root, 1, "failure");
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM ci_observations WHERE id=?1",
+            [&root.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut old: serde_json::Value = serde_json::from_str(&body).unwrap();
+    old.as_object_mut().unwrap().remove("snapshot");
+    old.as_object_mut().unwrap().remove("runner_id");
+    conn.execute(
+        "UPDATE ci_observations SET body=?2 WHERE id=?1",
+        rusqlite::params![root.id, old.to_string()],
+    )
+    .unwrap();
+    let left = plan(&mut store, 2).unwrap();
+    finish(&mut store, &mut scheduler, &left, 2, "failure");
+    let right = plan(&mut store, 3).unwrap();
+    finish(&mut store, &mut scheduler, &right, 3, "success");
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "inconclusive".into()))
+    );
+    assert!(plan(&mut store, 4).is_none());
+}
+
+#[test]
+fn contradictory_completed_run_invalidates_its_pending_investigation() {
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_with_workflow(
+        &mut store,
+        &mut scheduler,
+        &root,
+        1,
+        "failure",
+        None,
+        ".github/workflows/ci.yml",
+        None,
+        true,
+    );
+    let child = plan(&mut store, 2).unwrap();
+    assert!(matches!(child.state, State::Planned));
+    let mut changed = store
+        .ci_evidence(&root.id)
+        .unwrap()
+        .unwrap()
+        .record
+        .snapshot
+        .unwrap();
+    changed.jobs[0].id += 1000;
+    assert!(matches!(
+        scheduler.record_job_metrics(&root.id, &changed),
+        Err(sluss::scheduler::SchedulerError::CiConflict)
+    ));
+    assert!(store.ci_evidence(&root.id).unwrap().unwrap().conflicted);
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id.clone(), "stale".into()))
+    );
+    assert!(matches!(
+        store.batch(&child.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert!(store.ci_only_completions().unwrap().is_empty());
+    assert!(matches!(
+        scheduler.release_completed_ci_only(&root.id, 1),
+        Err(sluss::scheduler::SchedulerError::CiConflict)
+    ));
+    drop(store);
+    let mut store = Store::open(dir.path().join("queue.sqlite")).unwrap();
+    assert!(store.ci_evidence(&root.id).unwrap().unwrap().conflicted);
+    assert_eq!(numbers(&plan(&mut store, 3).unwrap()), [1, 2, 3, 4]);
+}
+
+#[test]
+fn missing_previously_observed_job_creates_a_durable_conflict() {
+    use sluss::{scheduler::SchedulerError, verification::CiObservationError};
+    let (dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    store
+        .bind_policy_paths(&root.id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(&root.id).unwrap();
+    store
+        .finish_integration(&root.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{}", root.id),
+        policy_digest: "c".repeat(64),
+        required_jobs: ["test".into()].into(),
+        suites: ["full".into()].into(),
+        selection_policy_digest: None,
+    };
+    scheduler
+        .reserve_batch_dispatch(
+            &root.id,
+            &Request {
+                pools: [("rust".into(), 1)].into(),
+            },
+            &plan,
+        )
+        .unwrap()
+        .unwrap();
+    scheduler
+        .claim_batch_dispatch(&root.id, ".github/workflows/ci.yml")
+        .unwrap();
+    scheduler.record_receipt(&root.id, 1).unwrap();
+    scheduler.observe_dispatch(&root.id, 1).unwrap();
+    let mut snapshot = ActionsSnapshot {
+        run: ActionsRun {
+            id: 1,
+            run_attempt: 1,
+            workflow_id: 3,
+            head_sha: "b".repeat(40),
+            head_branch: Some(format!("sluss/{}", root.id)),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 101,
+            run_id: 1,
+            head_sha: "b".repeat(40),
+            name: "test".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            runner_id: Some(7),
+        }],
+    };
+    scheduler
+        .record_ci_observation(&root.id, &snapshot)
+        .unwrap();
+    snapshot.run.id = 99;
+    assert!(matches!(
+        scheduler.record_ci_observation(&root.id, &snapshot),
+        Err(SchedulerError::CiObservation(CiObservationError::Identity))
+    ));
+    assert!(!store.ci_evidence(&root.id).unwrap().unwrap().conflicted);
+    snapshot.run.id = 1;
+    snapshot.jobs.clear();
+    assert!(matches!(
+        scheduler.record_ci_observation(&root.id, &snapshot),
+        Err(SchedulerError::CiConflict)
+    ));
+    assert!(matches!(
+        store.batch(&root.id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    drop(store);
+    let store = Store::open(dir.path().join("queue.sqlite")).unwrap();
+    assert!(store.ci_evidence(&root.id).unwrap().unwrap().conflicted);
+    assert!(matches!(
+        scheduler.complete_ci_only(&root.id),
+        Err(SchedulerError::CiConflict)
     ));
 }

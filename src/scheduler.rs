@@ -94,6 +94,7 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_workflows (id TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ci_observation_conflicts (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_receipt_sources (id TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS stale_cancellations (id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL);")?;
         crate::metrics::ensure_schema(&conn)?;
@@ -964,6 +965,88 @@ fn validate_batch_dispatch(
     Ok(())
 }
 
+fn canonical_snapshot(snapshot: &crate::github::ActionsSnapshot) -> crate::github::ActionsSnapshot {
+    let mut result = snapshot.clone();
+    result.jobs.sort_by_key(|job| job.id);
+    result
+}
+
+/// Persist the contradiction and invalidate work derived from its CI
+/// investigation. Existing external jobs still need normal reconciliation.
+fn mark_ci_conflict(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), SchedulerError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO ci_observation_conflicts(id) VALUES(?1)",
+        [id],
+    )?;
+    let affected: Vec<String> = {
+        let mut stmt = tx.prepare("WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM split_tasks t JOIN ancestors a ON t.child_id=a.id WHERE t.child_id IS NOT NULL), descendants(id) AS (SELECT ?1 UNION SELECT i.batch_id FROM ci_investigations i JOIN ancestors a ON i.batch_id=a.id UNION SELECT t.child_id FROM split_tasks t JOIN descendants d ON t.parent_id=d.id WHERE t.child_id IS NOT NULL) SELECT id FROM descendants")?;
+        let rows = stmt.query_map([id], |r| r.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for batch_id in affected {
+        tx.execute(
+            "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
+            [&batch_id],
+        )?;
+        tx.execute(
+            "UPDATE split_tasks SET state='stale' WHERE parent_id=?1 AND state='pending'",
+            [&batch_id],
+        )?;
+        tx.execute(
+            "DELETE FROM ci_candidate_completions WHERE batch_id=?1",
+            [&batch_id],
+        )?;
+        let body: Option<String> = tx
+            .query_row("SELECT body FROM batches WHERE id=?1", [&batch_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(body) = body {
+            let mut batch: crate::batch::Batch = serde_json::from_str(&body)?;
+            if batch
+                .invalidate("contradictory CI observations".into())
+                .is_ok()
+            {
+                tx.execute(
+                    "UPDATE batches SET body=?1,version=version+1 WHERE id=?2",
+                    params![serde_json::to_string(&batch)?, batch_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compare only when a prior complete snapshot exists. Legacy summaries have
+/// no original jobs to compare and are never silently upgraded.
+fn compatible_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    snapshot: &crate::github::ActionsSnapshot,
+) -> Result<bool, SchedulerError> {
+    let conflicted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if conflicted {
+        return Ok(false);
+    }
+    let body: Option<String> = tx
+        .query_row("SELECT body FROM ci_observations WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(true);
+    };
+    let previous: CiObservationRecord = serde_json::from_str(&body)?;
+    Ok(previous
+        .snapshot
+        .as_ref()
+        .is_none_or(|saved| *saved == canonical_snapshot(snapshot)))
+}
+
 impl Scheduler {
     /// Record completed, host-checked job timings from a provider observation.
     /// This is accounting data only, not CI attestation or permission to land.
@@ -1029,6 +1112,11 @@ impl Scheduler {
             .ok_or(SchedulerError::Corrupt)?;
         let placement = check_host_placement(snapshot, &host_config.runner_ids)
             .map_err(|_| MetricsError::InvalidJob)?;
+        if !compatible_snapshot(&tx, id, snapshot)? {
+            mark_ci_conflict(&tx, id)?;
+            tx.commit()?;
+            return Err(SchedulerError::CiConflict);
+        }
         let runner_id = match placement {
             Placement::Waiting => return Ok(0),
             Placement::Confirmed { runner_id } => runner_id,
@@ -1083,13 +1171,19 @@ impl Scheduler {
     }
 }
 
+/// Persisted provider-shaped observations, not authenticated attestation or
+/// merge authorization. Legacy records may lack their original job snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredCiObservation {
-    run_id: u64,
-    plan: DispatchPlan,
+pub struct CiObservationRecord {
+    pub run_id: u64,
+    pub plan: DispatchPlan,
     #[serde(default)]
-    workflow_path: Option<String>,
-    observation: crate::verification::CiObservation,
+    pub workflow_path: Option<String>,
+    pub observation: crate::verification::CiObservation,
+    #[serde(default)]
+    pub snapshot: Option<crate::github::ActionsSnapshot>,
+    #[serde(default)]
+    pub runner_id: Option<u64>,
 }
 impl Scheduler {
     /// Persist a provider result comparison for a still-current batch. This is
@@ -1126,6 +1220,14 @@ impl Scheduler {
             return Err(SchedulerError::DispatchTransition);
         }
         validate_batch_dispatch(&tx, &batch_id, &plan)?;
+        let conflicted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflicted {
+            return Err(SchedulerError::CiConflict);
+        }
         let workflow_path: Option<String> = tx
             .query_row(
                 "SELECT path FROM dispatch_workflows WHERE id=?1",
@@ -1139,7 +1241,16 @@ impl Scheduler {
         {
             return Err(CiObservationError::Identity.into());
         }
-        let observation = observe_ci(&plan, run_id, snapshot)?;
+        let observation = observe_ci(&plan, run_id, snapshot);
+        if snapshot.run.status == "completed"
+            && !matches!(&observation, Err(CiObservationError::Identity))
+            && !compatible_snapshot(&tx, id, snapshot)?
+        {
+            mark_ci_conflict(&tx, id)?;
+            tx.commit()?;
+            return Err(SchedulerError::CiConflict);
+        }
+        let observation = observation?;
         let host_config = self
             .capacity
             .hosts
@@ -1150,14 +1261,18 @@ impl Scheduler {
         if matches!(observation, CiObservation::Pending) {
             return Ok(observation);
         }
-        if !matches!(placement, Placement::Confirmed { .. }) {
-            return Err(CiObservationError::Ambiguous.into());
-        }
-        let record = StoredCiObservation {
+        let runner_id = match placement {
+            Placement::Confirmed { runner_id } => runner_id,
+            Placement::Waiting => return Err(CiObservationError::Ambiguous.into()),
+        };
+        let canonical = canonical_snapshot(snapshot);
+        let record = CiObservationRecord {
             run_id,
             plan,
             workflow_path,
             observation: observation.clone(),
+            snapshot: Some(canonical),
+            runner_id: Some(runner_id),
         };
         let existing: Option<String> = tx
             .query_row("SELECT body FROM ci_observations WHERE id=?1", [id], |r| {
@@ -1165,8 +1280,17 @@ impl Scheduler {
             })
             .optional()?;
         if let Some(body) = existing {
-            let previous: StoredCiObservation = serde_json::from_str(&body)?;
-            if previous != record {
+            let previous: CiObservationRecord = serde_json::from_str(&body)?;
+            let mut comparable = record.clone();
+            if previous.snapshot.is_none() && previous.runner_id.is_none() {
+                // Historical summaries cannot be upgraded into evidence by a
+                // later read; keep them historical while preserving recovery.
+                comparable.snapshot = None;
+                comparable.runner_id = None;
+            }
+            if previous != comparable {
+                mark_ci_conflict(&tx, id)?;
+                tx.commit()?;
                 return Err(SchedulerError::CiConflict);
             }
         } else {
@@ -1334,7 +1458,15 @@ impl Scheduler {
         let (plan_body, state, run, batch_id, batch_body, version, observation_body) =
             row.ok_or(SchedulerError::DispatchTransition)?;
         let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
-        let observation: StoredCiObservation = serde_json::from_str(&observation_body)?;
+        let observation: CiObservationRecord = serde_json::from_str(&observation_body)?;
+        let conflicted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflicted {
+            return Err(SchedulerError::CiConflict);
+        }
         let run_id = run
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
@@ -1401,6 +1533,29 @@ impl Scheduler {
         investigate_ci_batch(&tx, &batch)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn has_job_snapshot(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, SchedulerError> {
+    let conflicted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if conflicted {
+        return Ok(false);
+    }
+    let body: Option<String> = tx
+        .query_row("SELECT body FROM ci_observations WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    match body {
+        Some(body) => {
+            let record: CiObservationRecord = serde_json::from_str(&body)?;
+            Ok(record.snapshot.is_some() && record.runner_id.is_some())
+        }
+        None => Ok(false),
     }
 }
 
@@ -1519,7 +1674,10 @@ fn investigate_ci_batch(
             .transpose()?;
         // Children always use the full suite, so the parent's suite subset can
         // differ. Their workflow and other policy identities must still match.
-        let comparable = paths[0].is_some()
+        let comparable = has_job_snapshot(tx, &parent)?
+            && has_job_snapshot(tx, &observed[0].0.id)?
+            && has_job_snapshot(tx, &observed[1].0.id)?
+            && paths[0].is_some()
             && paths[0] == paths[1]
             && parent_path == paths[0]
             && parent_plan.as_ref().is_some_and(|plan| {
@@ -1571,7 +1729,7 @@ fn investigate_ci_batch(
             [&batch.id],
             |r| r.get(0),
         )?;
-        if !bound {
+        if !bound || !has_job_snapshot(tx, &batch.id)? {
             return Ok(());
         }
         crate::store::enqueue_bisection(tx, batch)?;
@@ -1613,7 +1771,15 @@ impl Scheduler {
             row.ok_or(SchedulerError::DispatchTransition)?;
         let plan: DispatchPlan = serde_json::from_str(&plan_body)?;
         let batch: Batch = serde_json::from_str(&batch_body)?;
-        let observed: StoredCiObservation = serde_json::from_str(&observation_body)?;
+        let observed: CiObservationRecord = serde_json::from_str(&observation_body)?;
+        let conflicted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_observation_conflicts WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if conflicted {
+            return Err(SchedulerError::CiConflict);
+        }
         let conclusion = match &observed.observation {
             crate::verification::CiObservation::Successful => "success",
             crate::verification::CiObservation::Failed { conclusion } if !conclusion.is_empty() => {
