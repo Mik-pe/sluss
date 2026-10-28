@@ -769,6 +769,7 @@ fn completed_ci_requires_consistent_run_and_terminal_reservation_state() {
         "bad-conclusion",
         "missing-finished",
         "receipt-conflict",
+        "wrong-selection",
     ] {
         let mut f = setup();
         let budgets = BTreeMap::from([("rust".into(), 1)]);
@@ -800,6 +801,9 @@ fn completed_ci_requires_consistent_run_and_terminal_reservation_state() {
             "missing-finished" => {
                 conn.execute("DELETE FROM capacity_finished WHERE id=?1", [BATCH])
                     .unwrap();
+            }
+            "wrong-selection" => {
+                conn.execute("INSERT INTO staging_selection_config(id,mode) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET mode=excluded.mode", ["d".repeat(64)]).unwrap();
             }
             _ => {
                 conn.execute("INSERT INTO dispatch_receipt_conflicts(id,recovered_run,direct_run) VALUES(?1,'42','43')", [BATCH]).unwrap();

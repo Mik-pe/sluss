@@ -1606,7 +1606,12 @@ impl App {
             .refresh_landing_provider(token, security_token, policy, &target, true)
             .await?;
         journal
-            .claim_with_fresh_snapshot(operation_id, &snapshot, trusted_ci)
+            .claim_with_fresh_snapshot(
+                operation_id,
+                &snapshot,
+                trusted_ci,
+                target.delivery_revision,
+            )
             .map_err(Into::into)
     }
     /// Compare a current provider scan with the frozen local batch. This is a

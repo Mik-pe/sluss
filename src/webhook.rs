@@ -220,6 +220,11 @@ impl Inbox {
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             delivery_id TEXT NOT NULL UNIQUE, event TEXT NOT NULL, digest BLOB NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS webhook_collisions (
+            delivery_id TEXT NOT NULL, event TEXT NOT NULL, digest BLOB NOT NULL,
+            installation INTEGER NOT NULL, repository INTEGER NOT NULL,
+            PRIMARY KEY(delivery_id,event,digest,installation,repository)
+        );
         CREATE TABLE IF NOT EXISTS reconciliations (
             installation INTEGER NOT NULL, repository INTEGER NOT NULL, revision INTEGER NOT NULL,
             PRIMARY KEY(installation, repository)
@@ -249,11 +254,28 @@ impl Inbox {
             )
             .optional()?;
         if let Some((old_event, old_digest)) = previous {
-            return Ok(if old_event == event && old_digest == digest {
-                Record::Duplicate
-            } else {
-                Record::Collision
-            });
+            if old_event == event && old_digest == digest {
+                return Ok(Record::Duplicate);
+            }
+            // A distinct signed body or event under an existing delivery ID
+            // cannot be discarded as a duplicate. Journal it once and wake a
+            // fresh reconciliation without replacing the original delivery.
+            let inserted = tx.execute("INSERT OR IGNORE INTO webhook_collisions(delivery_id,event,digest,installation,repository) VALUES(?1,?2,?3,?4,?5)", params![delivery,event,digest.as_slice(),installation,repository])?;
+            if inserted != 0 {
+                tx.execute("INSERT INTO webhook_deliveries(delivery_id,event,digest) VALUES('collision-' || lower(hex(randomblob(16))), '__collision__', zeroblob(32))", [])?;
+                let revision = tx.last_insert_rowid();
+                tx.execute("INSERT INTO reconciliations(installation,repository,revision) VALUES(?1,?2,?3) ON CONFLICT(installation,repository) DO UPDATE SET revision=excluded.revision", params![installation,repository,revision])?;
+                tx.execute(
+                    "DELETE FROM webhook_deliveries WHERE sequence=?1",
+                    [revision],
+                )?;
+                crate::store::invalidate_ci_candidate_hint(&tx, installation, repository)?;
+                if security_event(event) {
+                    crate::store::invalidate_security_event(&tx, installation, repository)?;
+                }
+            }
+            tx.commit()?;
+            return Ok(Record::Collision);
         }
         tx.execute(
             "INSERT INTO webhook_deliveries(delivery_id, event, digest) VALUES(?1, ?2, ?3)",
@@ -265,6 +287,7 @@ impl Inbox {
             ON CONFLICT(installation, repository) DO UPDATE SET revision=excluded.revision",
             params![installation, repository, revision],
         )?;
+        crate::store::invalidate_ci_candidate_hint(&tx, installation, repository)?;
         if security_event(event) {
             crate::store::invalidate_security_event(&tx, installation, repository)?;
         }

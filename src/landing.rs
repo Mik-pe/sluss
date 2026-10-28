@@ -320,6 +320,7 @@ pub(crate) struct RefreshTarget {
     pub members: Vec<crate::store::AdmissionCandidate>,
     pub repository_policy_digest: String,
     pub snapshot: crate::github::ActionsSnapshot,
+    pub delivery_revision: i64,
 }
 impl LandingJournal {
     /// Open an existing database without creating or modifying its schema.
@@ -763,7 +764,7 @@ impl LandingJournal {
         &mut self,
         operation_id: &str,
     ) -> Result<Option<LandingPlan>, LandingError> {
-        self.claim_observed_batch_inner(operation_id, None, None)
+        self.claim_observed_batch_inner(operation_id, None, None, None)
     }
 
     pub(crate) fn claim_with_fresh_snapshot(
@@ -771,8 +772,9 @@ impl LandingJournal {
         operation_id: &str,
         snapshot: &crate::github::ActionsSnapshot,
         policy: &TrustedCiPolicy,
+        revision: i64,
     ) -> Result<Option<LandingPlan>, LandingError> {
-        self.claim_observed_batch_inner(operation_id, Some(snapshot), Some(policy))
+        self.claim_observed_batch_inner(operation_id, Some(snapshot), Some(policy), Some(revision))
     }
 
     fn claim_observed_batch_inner(
@@ -780,6 +782,7 @@ impl LandingJournal {
         operation_id: &str,
         snapshot: Option<&crate::github::ActionsSnapshot>,
         policy: Option<&TrustedCiPolicy>,
+        revision: Option<i64>,
     ) -> Result<Option<LandingPlan>, LandingError> {
         let tx = self
             .conn
@@ -804,6 +807,11 @@ impl LandingJournal {
         verify_trust_binding(&tx, &plan, policy)?;
         if let Some(policy) = policy {
             verify_trusted_policy(&tx, &plan, policy)?;
+        }
+        if let Some(revision) = revision
+            && delivery_revision(&tx)? != revision
+        {
+            return Err(LandingError::StaleBatch);
         }
         if let Some(snapshot) = snapshot {
             let body: String = tx.query_row(
@@ -929,6 +937,24 @@ impl LandingJournal {
     }
 }
 
+/// The AUTOINCREMENT value also advances for internal scans whose temporary
+/// delivery row has already been deleted. It therefore detects ABA changes
+/// even when the reconciliation has completed before a provider scan ends.
+fn delivery_revision(tx: &rusqlite::Transaction<'_>) -> Result<i64, LandingError> {
+    let seq: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='webhook_deliveries'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let seq = seq.unwrap_or(0);
+    if seq < 0 {
+        return Err(LandingError::Corrupt);
+    }
+    Ok(seq)
+}
+
 fn refresh_target_details(
     tx: &rusqlite::Transaction<'_>,
     plan: LandingPlan,
@@ -963,6 +989,7 @@ fn refresh_target_details(
         members,
         repository_policy_digest,
         snapshot: saved.snapshot.ok_or(LandingError::StaleBatch)?,
+        delivery_revision: delivery_revision(tx)?,
     })
 }
 fn verify_trust_binding(
@@ -1143,6 +1170,23 @@ fn observed_plan(
         )
         .optional()?;
     let paths: Vec<String> = serde_json::from_str(&paths.ok_or(LandingError::StaleBatch)?)?;
+    let current_selection: Option<String> = tx
+        .query_row(
+            "SELECT mode FROM staging_selection_config WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let frozen_selection = dispatch
+        .selection_policy_digest
+        .as_deref()
+        .unwrap_or("full");
+    if current_selection
+        .as_deref()
+        .is_some_and(|mode| mode != frozen_selection)
+    {
+        return Err(LandingError::StaleBatch);
+    }
     let selection: Option<String> = tx
         .query_row(
             "SELECT body FROM batch_selection WHERE batch_id=?1",

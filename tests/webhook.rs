@@ -460,7 +460,9 @@ async fn unscoped_and_foreign_security_events_do_not_invalidate_the_repository()
 #[tokio::test]
 async fn failed_security_invalidation_does_not_commit_a_partial_delivery() {
     let (_dir, db, _store, inbox) = security_fixture();
+    let _journal = sluss::landing::LandingJournal::open(&db).unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO ci_evidence_candidate_heads_v1(batch_id,policy_digest,digest) VALUES('batch-0000000000000001','policy','evidence')", []).unwrap();
     conn.execute(
         "UPDATE batches SET body='not-json' WHERE id='batch-0000000000000001'",
         [],
@@ -488,4 +490,167 @@ async fn failed_security_invalidation_does_not_commit_a_partial_delivery() {
         )
         .unwrap();
     assert_eq!(count, 0);
+    let heads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_evidence_candidate_heads_v1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        heads, 1,
+        "evidence invalidation must roll back with the failed delivery"
+    );
+}
+
+#[test]
+fn conflicting_delivery_is_journaled_once_and_invalidates_current_evidence() {
+    let (_dir, db, store, mut inbox) = security_fixture();
+    let _journal = sluss::landing::LandingJournal::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        inbox
+            .record("same-id", "pull_request", &[1; 32], 17, 25)
+            .unwrap(),
+        Record::New
+    );
+    let original = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(inbox.acknowledge(&original).unwrap());
+    conn.execute("INSERT INTO ci_evidence_candidate_heads_v1(batch_id,policy_digest,digest) VALUES('batch-0000000000000001','policy','evidence')", []).unwrap();
+    assert_eq!(
+        inbox
+            .record("same-id", "repository_ruleset", &[2; 32], 17, 25)
+            .unwrap(),
+        Record::Collision
+    );
+    let wake = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(wake.revision > original.revision);
+    assert!(matches!(
+        store
+            .batch("batch-0000000000000001")
+            .unwrap()
+            .unwrap()
+            .0
+            .state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    let heads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_evidence_candidate_heads_v1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(heads, 0);
+    assert!(inbox.acknowledge(&wake).unwrap());
+    conn.execute("INSERT INTO ci_evidence_candidate_heads_v1(batch_id,policy_digest,digest) VALUES('batch-0000000000000001','policy','fresh')", []).unwrap();
+    assert_eq!(
+        inbox
+            .record("same-id", "repository_ruleset", &[2; 32], 17, 25)
+            .unwrap(),
+        Record::Collision
+    );
+    assert!(inbox.pending_for(17, 25).unwrap().is_none());
+    let heads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_evidence_candidate_heads_v1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        heads, 1,
+        "duplicate collision must not erase freshly observed evidence"
+    );
+    assert_eq!(
+        inbox
+            .record("same-id", "repository_ruleset", &[3; 32], 17, 25)
+            .unwrap(),
+        Record::Collision
+    );
+    assert!(inbox.pending_for(17, 25).unwrap().is_some());
+    let heads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_evidence_candidate_heads_v1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(heads, 0);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM webhook_collisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn failed_conflicting_delivery_rolls_back_its_journal_and_invalidation() {
+    let (_dir, db, _store, mut inbox) = security_fixture();
+    let _journal = sluss::landing::LandingJournal::open(&db).unwrap();
+    inbox
+        .record("same-id", "pull_request", &[1; 32], 17, 25)
+        .unwrap();
+    let wake = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(inbox.acknowledge(&wake).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO ci_evidence_candidate_heads_v1(batch_id,policy_digest,digest) VALUES('batch-0000000000000001','policy','evidence')", []).unwrap();
+    conn.execute(
+        "UPDATE batches SET body='not-json' WHERE id='batch-0000000000000001'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        inbox
+            .record("same-id", "repository_ruleset", &[2; 32], 17, 25)
+            .is_err()
+    );
+    assert!(inbox.pending_for(17, 25).unwrap().is_none());
+    let heads: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_evidence_candidate_heads_v1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let conflicts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM webhook_collisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!((heads, conflicts), (1, 0));
+}
+
+#[test]
+fn concurrent_duplicate_collisions_create_one_reconciliation() {
+    use std::sync::{Arc, Barrier};
+    let (_dir, db, _store, mut inbox) = security_fixture();
+    inbox
+        .record("collision-id", "pull_request", &[1; 32], 17, 25)
+        .unwrap();
+    let original = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert!(inbox.acknowledge(&original).unwrap());
+    let barrier = Arc::new(Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut inbox = Inbox::open(db).unwrap();
+                barrier.wait();
+                inbox
+                    .record("collision-id", "push", &[2; 32], 17, 25)
+                    .unwrap()
+            })
+        })
+        .collect();
+    assert!(
+        workers
+            .into_iter()
+            .all(|worker| worker.join().unwrap() == Record::Collision)
+    );
+    let pending = inbox.pending_for(17, 25).unwrap().unwrap();
+    assert_eq!(pending.revision, original.revision + 1);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM webhook_collisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
 }

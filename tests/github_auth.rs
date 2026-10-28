@@ -3418,6 +3418,18 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             race_inbox
                 .record("ci-candidate-race", "pull_request_review", &[44; 32], 42, 7)
                 .unwrap();
+            let event = race_inbox.pending().unwrap().remove(0);
+            let mut reconciled = Store::open(&candidate_race_db).unwrap();
+            sluss::reconcile::reconcile_once(
+                &observer_app,
+                &fixture_token,
+                &mut reconciled,
+                &event,
+                &observer_policy,
+            )
+            .await
+            .unwrap();
+            assert!(race_inbox.pending().unwrap().is_empty());
             mode.store(0, Ordering::SeqCst);
         }
     );
@@ -3425,13 +3437,133 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         raced.is_err(),
         "a webhook during the provider scan must reject recording"
     );
-    let count: i64 = race_conn
+    let candidate_race_conn = rusqlite::Connection::open(&candidate_race_db).unwrap();
+    let count: i64 = candidate_race_conn
         .query_row("SELECT COUNT(*) FROM ci_evidence_candidates_v1", [], |r| {
             r.get(0)
         })
         .unwrap();
     assert_eq!(count, 1, "a stale scan must not append new evidence");
+    assert_eq!(
+        race_journal
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        None
+    );
     mode.store(0, Ordering::SeqCst);
+    let revalidated = observer_app
+        .verify_staged_ci(
+            &mut race_journal,
+            (&fixture_token, &security_token),
+            &observer_policy,
+            &selected_trust,
+            id,
+        )
+        .await
+        .unwrap();
+    mode.store(121, Ordering::SeqCst);
+    graphql_counts.store(0, Ordering::SeqCst);
+    let (periodic_race, _) = tokio::join!(
+        observer_app.verify_staged_ci(
+            &mut race_journal,
+            (&fixture_token, &security_token),
+            &observer_policy,
+            &selected_trust,
+            id
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while graphql_counts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(race_inbox.schedule_if_idle(42, 7).unwrap());
+            let event = race_inbox.pending().unwrap().remove(0);
+            let mut reconciled = Store::open(&candidate_race_db).unwrap();
+            sluss::reconcile::reconcile_once(
+                &observer_app,
+                &fixture_token,
+                &mut reconciled,
+                &event,
+                &observer_policy,
+            )
+            .await
+            .unwrap();
+            assert!(race_inbox.pending().unwrap().is_empty());
+            mode.store(0, Ordering::SeqCst);
+        }
+    );
+    assert!(matches!(
+        periodic_race,
+        Err(sluss::github::LandingRefreshError::Journal(
+            sluss::landing::LandingError::StaleBatch
+        ))
+    ));
+    assert_eq!(
+        race_journal
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(revalidated)
+    );
+
+    let claim_race_db = data.path().join("landing-claim-race.sqlite");
+    race_conn
+        .execute("VACUUM INTO ?1", [claim_race_db.to_str().unwrap()])
+        .unwrap();
+    let mut claim_journal = sluss::landing::LandingJournal::open(&claim_race_db).unwrap();
+    claim_journal
+        .prepare_trusted_batch("land-race", id, &selected_trust)
+        .unwrap();
+    let mut claim_inbox = Inbox::open(&claim_race_db).unwrap();
+    mode.store(121, Ordering::SeqCst);
+    graphql_counts.store(0, Ordering::SeqCst);
+    let (claim, _) = tokio::join!(
+        observer_app.refresh_and_claim_observed_landing(
+            &mut claim_journal,
+            &fixture_token,
+            &security_token,
+            &observer_policy,
+            &selected_trust,
+            "land-race"
+        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while graphql_counts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            claim_inbox
+                .record("land-race-event", "pull_request_review", &[45; 32], 42, 7)
+                .unwrap();
+            let event = claim_inbox.pending().unwrap().remove(0);
+            let mut reconciled = Store::open(&claim_race_db).unwrap();
+            sluss::reconcile::reconcile_once(
+                &observer_app,
+                &fixture_token,
+                &mut reconciled,
+                &event,
+                &observer_policy,
+            )
+            .await
+            .unwrap();
+            assert!(claim_inbox.pending().unwrap().is_empty());
+            mode.store(0, Ordering::SeqCst);
+        }
+    );
+    assert!(matches!(
+        claim,
+        Err(sluss::github::LandingRefreshError::Journal(
+            sluss::landing::LandingError::StaleBatch
+        ))
+    ));
+    assert_eq!(
+        claim_journal.get("land-race").unwrap().unwrap().1,
+        sluss::landing::IntentState::Prepared
+    );
     // A CI-only candidate does not require branch bypass and cannot create
     // an App check or claim a landing intent.
     let candidate_db = data.path().join("ci-evidence.sqlite");
@@ -3604,6 +3736,124 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
             .unwrap(),
         recorded
     );
+    let mut security_inbox = Inbox::open(&candidate_db).unwrap();
+    security_inbox
+        .record("security-change", "repository_ruleset", &[51; 32], 42, 7)
+        .unwrap();
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        None
+    );
+    let security_event = security_inbox.pending().unwrap().remove(0);
+    let mut security_store = Store::open(&candidate_db).unwrap();
+    sluss::reconcile::reconcile_once(
+        &observer_app,
+        &fixture_token,
+        &mut security_store,
+        &security_event,
+        &observer_policy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        None,
+        "acknowledging a security event must not revive old evidence"
+    );
+    mode.store(77, Ordering::SeqCst);
+    assert!(
+        observer_app
+            .verify_staged_ci(
+                &mut candidate_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        None
+    );
+    mode.store(73, Ordering::SeqCst);
+    assert_eq!(
+        observer_app
+            .verify_staged_ci(
+                &mut candidate_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .unwrap(),
+        recorded
+    );
+    assert!(matches!(
+        security_inbox
+            .record("security-change", "repository_ruleset", &[51; 32], 42, 7)
+            .unwrap(),
+        sluss::webhook::Record::Duplicate
+    ));
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(recorded.clone())
+    );
+    security_inbox
+        .record("other-repository", "repository_ruleset", &[52; 32], 42, 999)
+        .unwrap();
+    assert_eq!(
+        candidate_preview
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        Some(recorded.clone())
+    );
+    let migration_db = data.path().join("ci-evidence-migration.sqlite");
+    candidate_conn
+        .execute("VACUUM INTO ?1", [migration_db.to_str().unwrap()])
+        .unwrap();
+    let mut migration_store = Store::open(&migration_db).unwrap();
+    migration_store.set_paused(true).unwrap();
+    let previous_mode = migration_store
+        .staging_selection_mode()
+        .unwrap()
+        .unwrap_or_else(|| "unbound".into());
+    assert!(
+        migration_store
+            .migrate_staging_selection(&previous_mode, &"d".repeat(64), false)
+            .unwrap()
+    );
+    migration_store.set_paused(false).unwrap();
+    let mut migration_journal = sluss::landing::LandingJournal::open(&migration_db).unwrap();
+    assert_eq!(
+        migration_journal
+            .inspect_ci_candidate(id, &selected_trust)
+            .unwrap(),
+        None
+    );
+    assert!(
+        observer_app
+            .verify_staged_ci(
+                &mut migration_journal,
+                (&fixture_token, &security_token),
+                &observer_policy,
+                &selected_trust,
+                id
+            )
+            .await
+            .is_err(),
+        "a new selection policy cannot reuse prior evidence"
+    );
     let corrupt_db = data.path().join("ci-evidence-corrupt.sqlite");
     candidate_conn
         .execute("VACUUM INTO ?1", [corrupt_db.to_str().unwrap()])
@@ -3638,10 +3888,11 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     candidate_inbox
         .record("candidate-stale", "pull_request_review", &[33; 32], 42, 7)
         .unwrap();
-    assert!(
+    assert_eq!(
         candidate_preview
             .inspect_ci_candidate(id, &selected_trust)
-            .is_err()
+            .unwrap(),
+        None
     );
     assert!(
         observer_app

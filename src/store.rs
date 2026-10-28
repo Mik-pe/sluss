@@ -438,6 +438,7 @@ impl Store {
         }
         if let Some((base, target)) = base_sha {
             if old_base.as_deref() != Some(base) {
+                clear_ci_candidate_heads(&tx)?;
                 let batches = {
                     let mut stmt = tx.prepare("SELECT id,body FROM batches")?;
                     let rows = stmt
@@ -480,6 +481,7 @@ impl Store {
         };
         for number in old {
             if !numbers.contains(&number) {
+                clear_ci_candidate_heads(&tx)?;
                 tx.execute("DELETE FROM candidates WHERE number=?1", [number as i64])?;
                 tx.execute(
                     "DELETE FROM candidate_evidence WHERE number=?1",
@@ -516,6 +518,7 @@ impl Store {
                 || existing_evidence.as_deref() != new_evidence
                 || new_evidence.is_none();
             if changed {
+                clear_ci_candidate_heads(&tx)?;
                 tx.execute(
                     "DELETE FROM failed_singletons WHERE number=?1",
                     [candidate.number as i64],
@@ -1478,6 +1481,7 @@ impl Store {
                 params![serde_json::to_string(&batch)?, batch.id],
             )?;
         }
+        clear_ci_candidate_heads(&tx)?;
         // A prior CI investigation is tied to the previous selection policy.
         // Its pending descendants and CI-only holds cannot suppress new work.
         tx.execute("WITH RECURSIVE descendants(id) AS (SELECT batch_id FROM ci_investigations UNION SELECT t.child_id FROM split_tasks t JOIN descendants d ON t.parent_id=d.id WHERE t.child_id IS NOT NULL) UPDATE split_tasks SET state='stale' WHERE state='pending' AND parent_id IN (SELECT id FROM descendants)", [])?;
@@ -1768,6 +1772,40 @@ fn valid_transition(previous: &State, next: &State) -> bool {
         ) => tested == verified && !tested.is_empty(),
         _ => false,
     }
+}
+
+/// Remove only current pointers; immutable observations remain as history.
+/// Older databases may not yet have the experimental candidate tables.
+fn clear_ci_candidate_heads(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_evidence_candidate_heads_v1')", [], |r| r.get(0))?;
+    if exists {
+        tx.execute("DELETE FROM ci_evidence_candidate_heads_v1", [])?;
+    }
+    Ok(())
+}
+
+/// Any new scoped provider delivery can supersede a saved observation. The
+/// delivery and this invalidation commit together; duplicates do not reapply.
+pub(crate) fn invalidate_ci_candidate_hint(
+    tx: &Transaction<'_>,
+    installation: i64,
+    repository: i64,
+) -> Result<(), StoreError> {
+    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='repository_binding')", [], |r| r.get(0))?;
+    if !exists {
+        return Ok(());
+    }
+    let binding: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT installation,repository FROM repository_binding WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if binding == Some((installation, repository)) {
+        clear_ci_candidate_heads(tx)?;
+    }
+    Ok(())
 }
 
 /// A signed provider security-change hint invalidates all active evidence in
