@@ -73,7 +73,7 @@ fn changed_selection_semantics_invalidate_previous_policy_digests() {
     use sha2::{Digest, Sha256};
     let policy = sample_policy();
     let mut old = Sha256::new();
-    old.update(b"sluss-selective-policy-v2\0");
+    old.update(b"sluss-selective-policy-v3\0");
     old.update(serde_json::to_vec(&policy).unwrap());
     assert_ne!(policy.digest().unwrap(), hex::encode(old.finalize()));
 }
@@ -228,6 +228,184 @@ fn git_selection_uses_full_suites_for_link_and_submodule_changes() {
     let module = git(repo, &["rev-parse", "HEAD"]);
     assert!(matches!(
         policy.select_git(repo, &removed, &module).unwrap(),
+        Selection::Full { .. }
+    ));
+}
+
+#[test]
+fn unchanged_internal_link_propagates_changes_to_its_own_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("crates/api/src")).unwrap();
+    std::fs::create_dir_all(repo.join("crates/core/src")).unwrap();
+    std::fs::write(repo.join("crates/api/src/lib.rs"), "before\n").unwrap();
+    std::fs::write(repo.join("target"), "../../api/src/lib.rs").unwrap();
+    let blob = git(repo, &["hash-object", "-w", "target"]);
+    git(repo, &["add", "crates/api/src/lib.rs"]);
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{blob},crates/core/src/link.rs"),
+        ],
+    );
+    git(repo, &["commit", "-m", "base with link"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("crates/api/src/lib.rs"), "after\n").unwrap();
+    git(repo, &["add", "crates/api/src/lib.rs"]);
+    git(repo, &["commit", "-m", "change target"]);
+    let head = git(repo, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        sample_policy().select_git(repo, &base, &head).unwrap(),
+        Selection::Selected {
+            suites: names(&["core-tests", "api-tests", "ui-tests"]),
+            components: names(&["core", "api", "ui"]),
+        }
+    );
+    std::fs::create_dir_all(repo.join("apps/ui/src")).unwrap();
+    std::fs::write(repo.join("apps/ui/src/new.rs"), "ui\n").unwrap();
+    git(repo, &["add", "apps/ui/src/new.rs"]);
+    git(repo, &["commit", "-m", "unrelated UI change"]);
+    let ui_head = git(repo, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        sample_policy().select_git(repo, &head, &ui_head).unwrap(),
+        Selection::Selected {
+            suites: names(&["ui-tests"]),
+            components: names(&["ui"]),
+        }
+    );
+}
+
+#[test]
+fn external_or_chained_unchanged_links_force_full_verification() {
+    for (target, chained) in [
+        ("/outside/repository", false),
+        ("../../api/src/other", true),
+        ("../../../..", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.join("crates/api/src")).unwrap();
+        std::fs::write(repo.join("crates/api/src/lib.rs"), "before\n").unwrap();
+        std::fs::write(repo.join("target"), target).unwrap();
+        let blob = git(repo, &["hash-object", "-w", "target"]);
+        git(repo, &["add", "crates/api/src/lib.rs"]);
+        git(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("120000,{blob},crates/core/src/link"),
+            ],
+        );
+        if chained {
+            std::fs::write(repo.join("target"), "lib.rs").unwrap();
+            let other = git(repo, &["hash-object", "-w", "target"]);
+            git(
+                repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("120000,{other},crates/api/src/other"),
+                ],
+            );
+        }
+        git(repo, &["commit", "-m", "base"]);
+        let base = git(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("crates/api/src/lib.rs"), "after\n").unwrap();
+        git(repo, &["add", "crates/api/src/lib.rs"]);
+        git(repo, &["commit", "-m", "change"]);
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        assert!(
+            matches!(
+                sample_policy().select_git(repo, &base, &head).unwrap(),
+                Selection::Full { .. }
+            ),
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn directory_aliases_propagate_and_recursive_aliases_fall_back_to_full() {
+    for (target, expected_full) in [("../../api/src", false), (".", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.join("crates/api/src")).unwrap();
+        std::fs::create_dir_all(repo.join("crates/core/src")).unwrap();
+        let changed = if expected_full {
+            "crates/core/src/lib.rs"
+        } else {
+            "crates/api/src/lib.rs"
+        };
+        std::fs::write(repo.join(changed), "before\n").unwrap();
+        std::fs::write(repo.join("target"), target).unwrap();
+        let blob = git(repo, &["hash-object", "-w", "target"]);
+        git(repo, &["add", changed]);
+        git(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("120000,{blob},crates/core/src/mirror"),
+            ],
+        );
+        git(repo, &["commit", "-m", "base"]);
+        let base = git(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join(changed), "after\n").unwrap();
+        git(repo, &["add", changed]);
+        git(repo, &["commit", "-m", "change"]);
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        let result = sample_policy().select_git(repo, &base, &head).unwrap();
+        if expected_full {
+            assert!(matches!(result, Selection::Full { .. }));
+        } else {
+            assert_eq!(
+                result,
+                Selection::Selected {
+                    suites: names(&["core-tests", "api-tests", "ui-tests"]),
+                    components: names(&["core", "api", "ui"])
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn link_alias_into_ci_policy_forces_the_full_suite() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("apps/ui/src")).unwrap();
+    std::fs::write(repo.join("apps/ui/src/config"), "before\n").unwrap();
+    std::fs::write(repo.join("target"), "../../apps/ui/src/config").unwrap();
+    let blob = git(repo, &["hash-object", "-w", "target"]);
+    git(repo, &["add", "apps/ui/src/config"]);
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{blob},.github/workflows/ci.yml"),
+        ],
+    );
+    git(repo, &["commit", "-m", "base"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("apps/ui/src/config"), "after\n").unwrap();
+    git(repo, &["add", "apps/ui/src/config"]);
+    git(repo, &["commit", "-m", "update config"]);
+    let head = git(repo, &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        sample_policy().select_git(repo, &base, &head).unwrap(),
         Selection::Full { .. }
     ));
 }

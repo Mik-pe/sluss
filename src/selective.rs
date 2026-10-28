@@ -70,7 +70,7 @@ impl Policy {
         let mut hash = sha2::Sha256::new();
         // Bump the domain when selection semantics change so old frozen
         // decisions cannot be dispatched under a newly parsed policy.
-        hash.update(b"sluss-selective-policy-v3\0");
+        hash.update(b"sluss-selective-policy-v4\0");
         hash.update(bytes);
         Ok(hex::encode(hash.finalize()))
     }
@@ -137,7 +137,14 @@ impl Policy {
                 suites: self.full_suites.iter().cloned().collect(),
                 reason: "changed symbolic link or submodule".into(),
             }),
-            Ok(changes) => self.select(&changes.paths),
+            Ok(changes) => match expand_linked_paths(repo, head, &changes.paths) {
+                Ok(paths) => self.select(&paths),
+                Err(SelectionError::ChangeList) => Ok(Selection::Full {
+                    suites: self.full_suites.iter().cloned().collect(),
+                    reason: "symbolic links could not be classified".into(),
+                }),
+                Err(error) => Err(error),
+            },
             Err(SelectionError::ChangeList) => Ok(Selection::Full {
                 suites: self.full_suites.iter().cloned().collect(),
                 reason: "change list could not be classified".into(),
@@ -398,6 +405,184 @@ fn git_changes(repo: &Path, base: &str, head: &str) -> Result<GitChanges, Select
         paths,
         special_files,
     })
+}
+
+/// Expand changed paths through simple in-tree symbolic links. For targets
+/// involving another link or escaping the tree, there is no reliable lexical
+/// resolution without executing a checkout, so callers select the full suite.
+fn expand_linked_paths(
+    repo: &Path,
+    head: &str,
+    changes: &[String],
+) -> Result<Vec<String>, SelectionError> {
+    let mut list = git(repo);
+    list.args(["ls-tree", "--full-tree", "-r", "-z", head]);
+    let tree = selection_git(list, 16 * 1024 * 1024, true)?;
+    if !tree.status.success() {
+        return Err(SelectionError::Git);
+    }
+    let mut links = Vec::<(String, String)>::new();
+    if !tree.stdout.is_empty() && !tree.stdout.ends_with(&[0]) {
+        return Err(SelectionError::ChangeList);
+    }
+    for entry in tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            return Err(SelectionError::ChangeList);
+        };
+        let header = std::str::from_utf8(&entry[..tab]).map_err(|_| SelectionError::ChangeList)?;
+        let mut fields = header.split(' ');
+        let mode = fields.next().ok_or(SelectionError::ChangeList)?;
+        let kind = fields.next().ok_or(SelectionError::ChangeList)?;
+        let id = fields.next().ok_or(SelectionError::ChangeList)?;
+        if fields.next().is_some()
+            || id.len() != 40
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(SelectionError::ChangeList);
+        }
+        if mode == "120000" {
+            let path =
+                std::str::from_utf8(&entry[tab + 1..]).map_err(|_| SelectionError::ChangeList)?;
+            // 64 SHA-1 lines fit in a pipe before bounded_local_command starts
+            // reading stdout, avoiding a batch request/output deadlock.
+            if kind != "blob" || !path.is_ascii() || !valid_path(path) || links.len() >= 64 {
+                return Err(SelectionError::ChangeList);
+            }
+            links.push((path.to_owned(), id.to_owned()));
+        }
+    }
+    if links.is_empty() {
+        return Ok(changes.to_vec());
+    }
+    if changes
+        .iter()
+        .any(|path| !path.is_ascii() || !valid_path(path))
+    {
+        return Err(SelectionError::ChangeList);
+    }
+    let input = links
+        .iter()
+        .map(|(_, id)| format!("{id}\n"))
+        .collect::<String>();
+    let mut cmd = git(repo);
+    cmd.args(["cat-file", "--batch"]);
+    let objects = crate::integration::bounded_local_command(
+        cmd,
+        Some(input.as_bytes()),
+        1024 * 1024 + 32768,
+        std::time::Duration::from_secs(60),
+    )
+    .map_err(|error| match error {
+        crate::integration::LocalCommandError::Io(error) => SelectionError::Io(error),
+        crate::integration::LocalCommandError::Limit => SelectionError::ChangeList,
+        crate::integration::LocalCommandError::Timeout => SelectionError::Git,
+    })?;
+    if !objects.status.success() {
+        return Err(SelectionError::Git);
+    }
+    let link_names: BTreeSet<String> = links
+        .iter()
+        .map(|(path, _)| path.to_ascii_lowercase())
+        .collect();
+    if link_names.len() != links.len() {
+        return Err(SelectionError::ChangeList);
+    }
+    let mut remaining = objects.stdout.as_slice();
+    let mut mappings = Vec::with_capacity(links.len());
+    for (path, id) in &links {
+        let newline = remaining
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or(SelectionError::ChangeList)?;
+        let header =
+            std::str::from_utf8(&remaining[..newline]).map_err(|_| SelectionError::ChangeList)?;
+        let mut fields = header.split(' ');
+        if fields.next() != Some(id.as_str()) || fields.next() != Some("blob") {
+            return Err(SelectionError::ChangeList);
+        }
+        let size = fields
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n <= 4096)
+            .ok_or(SelectionError::ChangeList)?;
+        if fields.next().is_some() {
+            return Err(SelectionError::ChangeList);
+        }
+        remaining = &remaining[newline + 1..];
+        if remaining.len() <= size || remaining[size] != b'\n' {
+            return Err(SelectionError::ChangeList);
+        }
+        let target =
+            std::str::from_utf8(&remaining[..size]).map_err(|_| SelectionError::ChangeList)?;
+        remaining = &remaining[size + 1..];
+        if !target.is_ascii()
+            || target.starts_with('/')
+            || target.contains(['\\', ':'])
+            || target.chars().any(char::is_control)
+        {
+            return Err(SelectionError::ChangeList);
+        }
+        let mut parts: Vec<&str> = path.split('/').collect();
+        parts.pop();
+        for part in target.split('/') {
+            if link_names.contains(&parts.join("/").to_ascii_lowercase()) {
+                return Err(SelectionError::ChangeList);
+            }
+            if part.eq_ignore_ascii_case(".git") {
+                return Err(SelectionError::ChangeList);
+            }
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err(SelectionError::ChangeList);
+                    }
+                }
+                _ => parts.push(part),
+            }
+        }
+        let target = parts.join("/");
+        if !valid_path(&target) || link_names.contains(&target.to_ascii_lowercase()) {
+            return Err(SelectionError::ChangeList);
+        }
+        mappings.push((path.as_str(), target));
+    }
+    if !remaining.is_empty() {
+        return Err(SelectionError::ChangeList);
+    }
+    let mut affected: BTreeSet<String> = changes.iter().cloned().collect();
+    for _ in 0..16 {
+        let before = affected.len();
+        let snapshot: Vec<_> = affected.iter().cloned().collect();
+        for changed in &snapshot {
+            let lower = changed.to_ascii_lowercase();
+            for (link, target) in &mappings {
+                let target_lower = target.to_ascii_lowercase();
+                if lower == target_lower || lower.starts_with(&(target_lower.clone() + "/")) {
+                    let alias = format!("{}{}", link, &changed[target.len()..]);
+                    if !valid_path(&alias) {
+                        return Err(SelectionError::ChangeList);
+                    }
+                    affected.insert(alias);
+                } else if target_lower.starts_with(&(lower.clone() + "/")) {
+                    affected.insert((*link).to_owned());
+                }
+                if affected.len() > 4096 {
+                    return Err(SelectionError::ChangeList);
+                }
+            }
+        }
+        if affected.len() == before {
+            return Ok(affected.into_iter().collect());
+        }
+    }
+    Err(SelectionError::ChangeList)
 }
 
 #[cfg(all(test, unix))]
