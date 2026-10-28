@@ -4165,3 +4165,283 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
     }
     server.abort();
 }
+
+async fn recovery_ref(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    uri: axum::extract::OriginalUri,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let staging = uri.0.path().contains("/sluss/");
+    if mode == 118 && staging {
+        state.pulls.fetch_add(1, Ordering::SeqCst);
+        while state.mode.load(Ordering::SeqCst) == 118 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    if mode == 117 && staging {
+        return (StatusCode::NOT_FOUND, Json(json!({"message":"missing"})));
+    }
+    let count = if !staging {
+        state.pulls.fetch_add(1, Ordering::SeqCst)
+    } else {
+        0
+    };
+    let sha = if staging {
+        if mode == 112 { "d" } else { "a" }
+    } else if mode == 110 || (mode == 114 && count > 0) {
+        "a"
+    } else if mode == 111 {
+        "c"
+    } else {
+        "b"
+    };
+    let reference = if mode == 116 && staging {
+        "refs/heads/sluss/other"
+    } else if staging {
+        "refs/heads/sluss/batch-0123456789abcdef"
+    } else {
+        "refs/heads/main"
+    };
+    (
+        StatusCode::OK,
+        Json(
+            json!({"ref":reference,"object":{"sha":sha.repeat(if mode == 119 {39} else {40}),"type":if mode == 113 && staging {"tree"} else {"commit"}}}),
+        ),
+    )
+}
+
+#[tokio::test]
+async fn uncertain_landing_records_stable_github_refs_without_claiming_success() {
+    use sluss::landing::{IntentState, LandingError, LandingJournal, LandingPlan};
+    let (key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let server = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/git/ref/heads/main", get(recovery_ref))
+        .route(
+            "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
+            get(recovery_ref),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: reads.clone(),
+            permissions: writes.clone(),
+            token_calls: token_calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let read = app.read_token(42, 7).await.unwrap();
+    let inventory = app.runner_inventory_token(42, 7).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("recovery.sqlite");
+    let mut journal = LandingJournal::open(&db).unwrap();
+    let plan = LandingPlan {
+        operation_id: "land-recovery-1".into(),
+        batch_id: "batch-0123456789abcdef".into(),
+        installation_id: 42,
+        repository_id: 7,
+        repository_node_id: "R_repo".into(),
+        target_ref: "refs/heads/main".into(),
+        staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
+        base_sha: "b".repeat(40),
+        staged_sha: "a".repeat(40),
+        policy_digest: "c".repeat(64),
+        admission_digest: "d".repeat(64),
+        ci_evidence_digest: "e".repeat(64),
+        trusted_ci_policy_digest: None,
+        branch_rules_digest: None,
+        branch_security_digest: None,
+    };
+    journal.prepare(&plan).unwrap();
+    assert!(
+        app.observe_landing_recovery(&mut journal, &read, ("owner", "repo"), &plan.operation_id)
+            .await
+            .is_err()
+    );
+    journal.claim(&plan.operation_id).unwrap().unwrap();
+    assert!(
+        app.observe_landing_recovery(
+            &mut journal,
+            &inventory,
+            ("owner", "repo"),
+            &plan.operation_id
+        )
+        .await
+        .is_err()
+    );
+    for (state, position, stage) in [
+        (0, "base", "a"),
+        (110, "staged", "a"),
+        (111, "other", "a"),
+        (112, "base", "d"),
+    ] {
+        mode.store(state, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        let observation = app
+            .observe_landing_recovery(&mut journal, &read, ("owner", "repo"), &plan.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(observation.target_position(), position);
+        assert_eq!(observation.staging_sha, stage.repeat(40));
+        assert_eq!(
+            journal
+                .last_recovery_observation(&plan.operation_id)
+                .unwrap(),
+            Some(observation)
+        );
+        assert_eq!(
+            journal.get(&plan.operation_id).unwrap().unwrap().1,
+            IntentState::Sending
+        );
+        assert!(journal.claim(&plan.operation_id).unwrap().is_none());
+        let mut other = plan.clone();
+        other.operation_id = "land-recovery-other".into();
+        assert!(matches!(
+            journal.prepare(&other),
+            Err(LandingError::TargetBusy)
+        ));
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count = || {
+        conn.query_row(
+            "SELECT COUNT(*) FROM landing_recovery_observations_v1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(), 4);
+    for invalid in [63, 113, 114, 116, 117, 119] {
+        mode.store(invalid, Ordering::SeqCst);
+        reads.store(0, Ordering::SeqCst);
+        assert!(
+            app.observe_landing_recovery(
+                &mut journal,
+                &read,
+                ("owner", "repo"),
+                &plan.operation_id
+            )
+            .await
+            .is_err(),
+            "mode {invalid}"
+        );
+        assert_eq!(count(), 4);
+    }
+    mode.store(110, Ordering::SeqCst);
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, format!("version=1\n[github]\napp_client_id='app-client-id'\ninstallation_id=42\nrepository_id=7\nowner='owner'\nrepository='repo'\napi='http://{addr}/'\n[queue]\ntarget='main'\n[checks]\nrequired_reviews=1\n")).unwrap();
+    let db_arg = db.clone();
+    let config_arg = config.clone();
+    let key_arg = key_dir.path().join("test-key.pem");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(db_arg)
+            .args([
+                "observe-landing-recovery",
+                "--operation-id",
+                "land-recovery-1",
+                "--config",
+            ])
+            .arg(config_arg)
+            .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key_arg)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("target observed at staged"));
+    drop(journal);
+    let mut journal = LandingJournal::open(&db).unwrap();
+    assert_eq!(
+        journal
+            .last_recovery_observation(&plan.operation_id)
+            .unwrap()
+            .unwrap()
+            .target_position(),
+        "staged"
+    );
+    let report = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["landing-recovery", "--operation-id", "land-recovery-1"])
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    assert!(String::from_utf8_lossy(&report.stdout).contains("does not acknowledge"));
+    let direct =
+        serde_json::to_vec(&json!({"data":{"updateRefs":{"clientMutationId":plan.operation_id}}}))
+            .unwrap();
+    journal
+        .acknowledge(&plan.operation_id, 200, &direct)
+        .unwrap();
+    assert_eq!(
+        journal.get(&plan.operation_id).unwrap().unwrap().1,
+        IntentState::Acknowledged
+    );
+    assert!(
+        app.observe_landing_recovery(&mut journal, &read, ("owner", "repo"), &plan.operation_id)
+            .await
+            .is_err()
+    );
+    let mut next = plan.clone();
+    next.operation_id = "land-recovery-2".into();
+    journal.prepare(&next).unwrap();
+    journal.claim(&next.operation_id).unwrap().unwrap();
+    mode.store(118, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let mut concurrent = LandingJournal::open(&db).unwrap();
+    let (observed, acknowledged) = tokio::join!(
+        app.observe_landing_recovery(&mut journal, &read, ("owner", "repo"), &next.operation_id),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while reads.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let direct = serde_json::to_vec(
+                &json!({"data":{"updateRefs":{"clientMutationId":next.operation_id}}}),
+            )
+            .unwrap();
+            let result = concurrent.acknowledge(&next.operation_id, 200, &direct);
+            mode.store(0, Ordering::SeqCst);
+            result
+        }
+    );
+    assert!(acknowledged.is_ok());
+    assert!(observed.is_err());
+    assert!(
+        journal
+            .last_recovery_observation(&next.operation_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    conn.execute(
+        "UPDATE landing_recovery_observations_v1 SET digest='bad' WHERE id=?1",
+        [&plan.operation_id],
+    )
+    .unwrap();
+    assert!(
+        journal
+            .last_recovery_observation(&plan.operation_id)
+            .is_err()
+    );
+    server.abort();
+}

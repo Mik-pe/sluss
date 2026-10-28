@@ -2,8 +2,8 @@
 //!
 //! This module does not contact GitHub, authenticate the supplied evidence,
 //! establish fast-forward ancestry, revalidate reviews or authorize landing.
-//! It is not connected to the service or CLI. All callers and stored inputs
-//! must be trusted. In particular, a GraphQL clientMutationId is correlation,
+//! The CLI exposes read-only provider observations, but neither the CLI nor
+//! service sends landing requests. All callers and stored inputs must be trusted. In particular, a GraphQL clientMutationId is correlation,
 //! not an idempotency key or proof that a provider performed an operation.
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
@@ -239,6 +239,41 @@ impl LandingPlan {
     }
 }
 
+/// Historical provider observations made after a sender became uncertain.
+/// They do not acknowledge a request or authorize another write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingRecoveryObservation {
+    pub plan: LandingPlan,
+    pub target_sha: String,
+    pub staging_sha: String,
+    pub observed_ms: u64,
+}
+impl LandingRecoveryObservation {
+    fn validate(&self) -> Result<(), LandingError> {
+        self.plan.validate()?;
+        if !hex(&self.target_sha, 40) || !hex(&self.staging_sha, 40) || self.observed_ms == 0 {
+            return Err(LandingError::Corrupt);
+        }
+        Ok(())
+    }
+    pub fn target_position(&self) -> &'static str {
+        if self.target_sha == self.plan.base_sha {
+            "base"
+        } else if self.target_sha == self.plan.staged_sha {
+            "staged"
+        } else {
+            "other"
+        }
+    }
+}
+fn recovery_digest(body: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"sluss-landing-recovery-v1\0");
+    hash.update(body.as_bytes());
+    hex::encode(hash.finalize())
+}
+
 pub struct LandingJournal {
     conn: Connection,
 }
@@ -315,6 +350,8 @@ impl LandingJournal {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS landing_one_unresolved_target_v1
         ON landing_intents_v1(repository_id,target_ref) WHERE state IN ('prepared','sending');
+        CREATE TABLE IF NOT EXISTS landing_recovery_observations_v1 (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS landing_recovery_by_id_v1 ON landing_recovery_observations_v1(id,sequence);
         CREATE TABLE IF NOT EXISTS landing_batch_bindings_v1 (id TEXT PRIMARY KEY NOT NULL);
         CREATE TABLE IF NOT EXISTS landing_trust_bindings_v1 (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL);",
         )?;
@@ -363,6 +400,72 @@ impl LandingJournal {
             .optional()?;
         row.map(|row| decode_row(id, row)).transpose()
     }
+    /// Retrieve the last historical observation and detect corrupted or
+    /// rebound intent data. This does not change the unresolved intent.
+    pub fn last_recovery_observation(
+        &self,
+        id: &str,
+    ) -> Result<Option<LandingRecoveryObservation>, LandingError> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='landing_recovery_observations_v1')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let row: Option<(String, String)> = self.conn.query_row(
+            "SELECT body,digest FROM landing_recovery_observations_v1 WHERE id=?1 ORDER BY sequence DESC LIMIT 1", [id],
+            |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let Some((body, digest)) = row else {
+            return Ok(None);
+        };
+        if body.len() > 65536 || recovery_digest(&body) != digest {
+            return Err(LandingError::Corrupt);
+        }
+        let observation: LandingRecoveryObservation = serde_json::from_str(&body)?;
+        observation.validate()?;
+        let (plan, _) = self.get(id)?.ok_or(LandingError::Corrupt)?;
+        if observation.plan != plan {
+            return Err(LandingError::Corrupt);
+        }
+        Ok(Some(observation))
+    }
+
+    /// Persist a provider-fetched snapshot only if the same intent is still
+    /// sending. Keep its target lock and prohibit retransmission.
+    pub(crate) fn record_recovery_observation(
+        &mut self,
+        observation: &LandingRecoveryObservation,
+    ) -> Result<(), LandingError> {
+        observation.validate()?;
+        let body = serde_json::to_string(observation)?;
+        if body.len() > 65536 {
+            return Err(LandingError::Corrupt);
+        }
+        let digest = recovery_digest(&body);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, i64, String)> = tx
+            .query_row(
+                "SELECT plan,state,repository_id,target_ref FROM landing_intents_v1 WHERE id=?1",
+                [&observation.plan.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (plan, state) = decode_row(
+            &observation.plan.operation_id,
+            row.ok_or(LandingError::Transition)?,
+        )?;
+        if plan != observation.plan || state != IntentState::Sending {
+            return Err(LandingError::Transition);
+        }
+        tx.execute(
+            "INSERT INTO landing_recovery_observations_v1(id,body,digest) VALUES(?1,?2,?3)",
+            params![plan.operation_id, body, digest],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// This only claims an intent. It does not validate live inputs and is
     /// not permission to send; a crash after claim must not trigger a resend.
     pub fn claim(&mut self, id: &str) -> Result<Option<LandingPlan>, LandingError> {

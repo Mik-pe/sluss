@@ -333,3 +333,40 @@ fn corrupted_claimed_intent_cannot_be_acknowledged() {
         .unwrap();
     assert_eq!(state, "sending");
 }
+
+#[test]
+fn offline_recovery_inspection_does_not_create_or_migrate_a_database() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&missing)
+        .args(["landing-recovery", "--operation-id", "land-one"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!missing.exists());
+    let db = dir.path().join("legacy.sqlite");
+    let mut journal = LandingJournal::open(&db).unwrap();
+    journal.prepare(&plan("land-one")).unwrap();
+    journal.claim("land-one").unwrap();
+    drop(journal);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TABLE landing_recovery_observations_v1", [])
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["landing-recovery", "--operation-id", "land-one"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no recorded ref observation"));
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='landing_recovery_observations_v1')", [], |r| r.get(0)).unwrap();
+    assert!(!exists);
+}

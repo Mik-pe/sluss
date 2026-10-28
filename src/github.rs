@@ -908,13 +908,13 @@ pub enum DispatchError {
     #[error(transparent)]
     Scheduler(#[from] crate::scheduler::SchedulerError),
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct DispatchRef {
     #[serde(rename = "ref")]
     reference: String,
     object: DispatchObject,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct DispatchObject {
     sha: String,
     #[serde(rename = "type")]
@@ -1400,6 +1400,85 @@ pub enum LandingRefreshError {
     GitHub(#[from] GitHubError),
     #[error(transparent)]
     Journal(#[from] crate::landing::LandingError),
+}
+
+impl App {
+    /// Read an uncertain landing's refs twice and append historical observations.
+    /// This never sends a mutation, acknowledges a request or unlocks its target.
+    pub async fn observe_landing_recovery(
+        &self,
+        journal: &mut crate::landing::LandingJournal,
+        token: &InstallationToken,
+        repository: (&str, &str),
+        id: &str,
+    ) -> Result<crate::landing::LandingRecoveryObservation, LandingRefreshError> {
+        #[derive(Deserialize, PartialEq, Eq)]
+        struct Identity {
+            id: u64,
+            node_id: String,
+        }
+        let (owner, name) = repository;
+        if !valid_name(owner)
+            || !valid_name(name)
+            || !token.checks_read
+            || token.app_client_id != self.client_id
+            || token.api_origin != self.api.as_str()
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let (plan, state) = journal.get(id)?.ok_or(LandingRefreshError::Scope)?;
+        if state != crate::landing::IntentState::Sending
+            || i64::try_from(token.repository_id).ok() != Some(plan.repository_id)
+            || i64::try_from(token.installation_id).ok() != Some(plan.installation_id)
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let root = format!("repos/{owner}/{name}");
+        let target = format!(
+            "{root}/git/ref/{}",
+            plan.target_ref
+                .strip_prefix("refs/")
+                .ok_or(LandingRefreshError::Scope)?
+        );
+        let staging = format!(
+            "{root}/git/ref/{}",
+            plan.staging_ref
+                .strip_prefix("refs/")
+                .ok_or(LandingRefreshError::Scope)?
+        );
+        let first_repo: Identity = self.get_json(token, &root, None).await?;
+        let first_target: DispatchRef = self.get_json(token, &target, None).await?;
+        let first_staging: DispatchRef = self.get_json(token, &staging, None).await?;
+        let last_staging: DispatchRef = self.get_json(token, &staging, None).await?;
+        let last_target: DispatchRef = self.get_json(token, &target, None).await?;
+        let last_repo: Identity = self.get_json(token, &root, None).await?;
+        if first_repo != last_repo || first_target != last_target || first_staging != last_staging {
+            return Err(LandingRefreshError::Changed);
+        }
+        if first_repo.id != token.repository_id
+            || first_repo.node_id != plan.repository_node_id
+            || first_target.reference != plan.target_ref
+            || first_staging.reference != plan.staging_ref
+            || first_target.object.kind != "commit"
+            || first_staging.object.kind != "commit"
+        {
+            return Err(LandingRefreshError::Scope);
+        }
+        let observed_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| GitHubError::Clock)?
+            .as_millis()
+            .try_into()
+            .map_err(|_| GitHubError::Clock)?;
+        let observation = crate::landing::LandingRecoveryObservation {
+            plan,
+            target_sha: first_target.object.sha,
+            staging_sha: first_staging.object.sha,
+            observed_ms,
+        };
+        journal.record_recovery_observation(&observation)?;
+        Ok(observation)
+    }
 }
 
 /// GitHub's current review status, not a complete mergeability or CODEOWNERS proof.

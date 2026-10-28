@@ -116,6 +116,18 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Read an uncertain landing's GitHub refs without retrying the mutation.
+    ObserveLandingRecovery {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Show a landing intent and its last historical ref observation.
+    LandingRecovery {
+        #[arg(long)]
+        operation_id: String,
+    },
     /// Freeze a batch from reconciled observations for local experimentation.
     Plan {
         #[arg(long)]
@@ -884,6 +896,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
+    if let Command::LandingRecovery { operation_id } = &cli.command {
+        let journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
+        let (plan, state) = journal.get(operation_id)?.ok_or("unknown landing intent")?;
+        println!(
+            "landing {}: {:?}; target {}, base {}, staged {}",
+            plan.operation_id, state, plan.target_ref, plan.base_sha, plan.staged_sha
+        );
+        if let Some(observed) = journal.last_recovery_observation(operation_id)? {
+            println!(
+                "last historical observation: target {} ({}), staging {} at {} ms",
+                observed.target_position(),
+                observed.target_sha,
+                observed.staging_sha,
+                observed.observed_ms
+            );
+        } else {
+            println!("no recorded ref observation");
+        }
+        println!("a ref observation does not acknowledge a request or authorize a merge");
+        return Ok(());
+    }
+
     let store = Store::open(&cli.db)?;
     match cli.command {
         Command::Serve { .. } => unreachable!(),
@@ -1473,6 +1507,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("planning settings already match; Sluss remains paused");
             }
         }
+        Command::ObserveLandingRecovery {
+            operation_id,
+            config,
+        } => {
+            let config = sluss::config::Config::load(&config)?;
+            let mut journal = sluss::landing::LandingJournal::open(&cli.db)?;
+            let (plan, _) = journal
+                .get(&operation_id)?
+                .ok_or("unknown landing intent")?;
+            if (plan.installation_id, plan.repository_id)
+                != (config.github.installation_id, config.github.repository_id)
+                || plan.target_ref != format!("refs/heads/{}", config.queue.target)
+            {
+                return Err("repository or target does not match the landing intent".into());
+            }
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = sluss::github::App::new(
+                config.github.app_client_id,
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let token = app
+                .read_token(
+                    config.github.installation_id as u64,
+                    config.github.repository_id as u64,
+                )
+                .await?;
+            let observed = app
+                .observe_landing_recovery(
+                    &mut journal,
+                    &token,
+                    (&config.github.owner, &config.github.repository),
+                    &operation_id,
+                )
+                .await?;
+            println!(
+                "target observed at {} ({}); staging {} ({}); observation time {} ms",
+                observed.target_position(),
+                observed.target_sha,
+                observed.staging_sha,
+                if observed.staging_sha == observed.plan.staged_sha {
+                    "matches frozen SHA"
+                } else {
+                    "changed"
+                },
+                observed.observed_ms
+            );
+            println!(
+                "historical observation only; operation remains uncertain and the target stays locked"
+            );
+        }
+        Command::LandingRecovery { .. } => unreachable!(),
         Command::RetryCi { batch_id } => {
             let mut store = store;
             let count = store.retry_ci_only(&batch_id)?;
