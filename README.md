@@ -27,6 +27,8 @@ Strict landing is not enabled: experimental no-op guards cover only frozen sourc
 
 For an experimental installation, `sluss app-registration-url --name "My Sluss Preview"` creates a GitHub registration link with read-only permissions and webhooks disabled. It does not create an App. See [GitHub App setup](docs/github-app-setup.md) for the separately opted-in CI permissions, webhook setup and key isolation.
 
+For a guided CI-only experiment with multiple workflows and hosts, see the [preview quickstart](docs/ci-only-quickstart.md).
+
 For a currently testing batch with a directly recorded failed CI run, the explicit experimental `sluss --db sluss.sqlite report-failed-check --batch-id <id> --config /path/to/sluss.toml --capacity /path/to/capacity.toml` can create a **failure-only** `sluss/verified` check on the staging commit. It requires the App's Checks-write permission, rereads the run and never publishes success. An ambiguous send is not retried. An operator can supply a candidate ID to `sluss --db sluss.sqlite recover-failed-check --batch-id <id> --check-run-id <id> --config /path/to/sluss.toml --capacity /path/to/capacity.toml`; matching metadata does not prove the original request created it. Both commands have only been tested against a local GitHub stub and neither provides trusted attestation or merge approval.
 
 An experimental library function can advance a branch in a trusted **local bare Git repository** using a reference transaction. It is not connected to the service or CLI, does not provide authorization, and is not GitHub landing. See the [protocol](docs/protocol.md) for its assumptions and limitations.
