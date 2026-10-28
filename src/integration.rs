@@ -1,7 +1,7 @@
 //! Local, isolated construction of deterministic merge commits.
 //! Staging publication is explicit; this module does not start CI or authorize a merge.
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
@@ -199,6 +199,173 @@ fn ensure(output: Output, context: &'static str) -> Result<Output, IntegrationEr
     }
 }
 
+fn valid_staging_id(id: &str) -> bool {
+    (16..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A conservative check of push-triggered Actions in the integration commit.
+/// Other events, organization runners, external automation and workflow trust
+/// remain independent operator responsibilities.
+#[derive(Debug, Error)]
+pub enum StagingWorkflowError {
+    #[error("invalid staging identifier")]
+    Invalid,
+    #[error("could not safely inspect the integration workflow tree")]
+    Tree,
+    #[error("workflow {0} could run on the staging push; restrict its branch filter")]
+    PushTrigger(String),
+    #[error("workflow {0} has unsupported or ambiguous trigger syntax")]
+    Ambiguous(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+fn bounded_git(mut cmd: Command, limit: u64) -> Result<Vec<u8>, StagingWorkflowError> {
+    cmd.stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut output = Vec::new();
+    let stdout = child.stdout.take().ok_or(StagingWorkflowError::Tree)?;
+    if let Err(error) = stdout.take(limit + 1).read_to_end(&mut output) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.into());
+    }
+    if output.len() as u64 > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(StagingWorkflowError::Tree);
+    }
+    if !child.wait()?.success() {
+        return Err(StagingWorkflowError::Tree);
+    }
+    Ok(output)
+}
+
+fn tree_entry(line: &[u8]) -> Result<(&str, &str, &str, &str), StagingWorkflowError> {
+    let line = std::str::from_utf8(line).map_err(|_| StagingWorkflowError::Tree)?;
+    let (metadata, name) = line.split_once('\t').ok_or(StagingWorkflowError::Tree)?;
+    let mut parts = metadata.split(' ');
+    let (Some(mode), Some(kind), Some(sha)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(StagingWorkflowError::Tree);
+    };
+    if parts.next().is_some()
+        || !valid_sha(sha)
+        || name.is_empty()
+        || name.chars().any(char::is_control)
+    {
+        return Err(StagingWorkflowError::Tree);
+    }
+    Ok((mode, kind, sha, name))
+}
+
+impl Integration {
+    /// Inspect every direct .yml/.yaml workflow file from this exact commit.
+    /// This does not prove that other events or external systems cannot start CI.
+    pub fn check_staging_push_workflows(&self, id: &str) -> Result<(), StagingWorkflowError> {
+        if !valid_staging_id(id) {
+            return Err(StagingWorkflowError::Invalid);
+        }
+        let branch = format!("sluss/{id}");
+        let repo = self.repository();
+        let mut parent = git(&repo);
+        parent.args([
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            self.sha(),
+            "--",
+            ".github",
+        ]);
+        let parent = bounded_git(parent, 1024 * 1024)?;
+        if parent.is_empty() {
+            return Ok(());
+        }
+        let line = parent
+            .strip_suffix(b"\0")
+            .ok_or(StagingWorkflowError::Tree)?;
+        let (mode, kind, _, path) = tree_entry(line)?;
+        if path != ".github" {
+            return Err(StagingWorkflowError::Tree);
+        }
+        if mode != "040000" || kind != "tree" {
+            return Err(StagingWorkflowError::Ambiguous(".github".into()));
+        }
+        let mut root = git(&repo);
+        root.args([
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            self.sha(),
+            "--",
+            ".github/workflows",
+        ]);
+        let root = bounded_git(root, 1024 * 1024)?;
+        if root.is_empty() {
+            return Ok(());
+        }
+        let line = root.strip_suffix(b"\0").ok_or(StagingWorkflowError::Tree)?;
+        let (mode, kind, tree, path) = tree_entry(line)?;
+        if mode != "040000" || kind != "tree" || path != ".github/workflows" {
+            return Err(StagingWorkflowError::Tree);
+        }
+        let mut listing = git(&repo);
+        listing.args(["ls-tree", "-z", tree]);
+        let listing = bounded_git(listing, 1024 * 1024)?;
+        if !listing.is_empty() && !listing.ends_with(b"\0") {
+            return Err(StagingWorkflowError::Tree);
+        }
+        if listing.is_empty() {
+            return Ok(());
+        }
+        for (index, line) in listing[..listing.len() - 1].split(|b| *b == 0).enumerate() {
+            if index >= 1000 {
+                return Err(StagingWorkflowError::Tree);
+            }
+            let (mode, kind, sha, name) = tree_entry(line)?;
+            if name.contains('/') {
+                return Err(StagingWorkflowError::Tree);
+            }
+            let lower = name.to_ascii_lowercase();
+            if !lower.ends_with(".yml") && !lower.ends_with(".yaml") {
+                continue;
+            }
+            let path = format!(".github/workflows/{name}");
+            if !matches!(mode, "100644" | "100755") || kind != "blob" {
+                return Err(StagingWorkflowError::Ambiguous(path));
+            }
+            let mut size = git(&repo);
+            size.args(["cat-file", "-s", sha]);
+            let size = bounded_git(size, 64)?;
+            let size = std::str::from_utf8(&size)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .ok_or(StagingWorkflowError::Tree)?;
+            if size > 256 * 1024 {
+                return Err(StagingWorkflowError::Ambiguous(path));
+            }
+            let mut blob = git(&repo);
+            blob.args(["cat-file", "blob", sha]);
+            let blob = bounded_git(blob, 256 * 1024)?;
+            if blob.len() != size {
+                return Err(StagingWorkflowError::Tree);
+            }
+            match crate::workflow::excludes_staging_push(&blob, &branch) {
+                Ok(true) => {}
+                Ok(false) => return Err(StagingWorkflowError::PushTrigger(path)),
+                Err(_) => return Err(StagingWorkflowError::Ambiguous(path)),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Result of publishing an integration to a temporary staging branch. This
 /// identifies the commit only; it is not evidence of CI or merge permission.
 #[derive(Debug, PartialEq, Eq)]
@@ -217,6 +384,8 @@ pub enum StageError {
     Uncertain,
     #[error("authenticated Git staging is not supported on this platform")]
     Unsupported,
+    #[error(transparent)]
+    Workflow(#[from] StagingWorkflowError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -243,12 +412,14 @@ impl Integration {
     ) -> Result<Staged, StageError> {
         if !crate::github::valid_name(owner)
             || !crate::github::valid_name(repository)
+            || !valid_staging_id(id)
             || token.is_empty()
             || token.len() > 4096
             || !token.bytes().all(|b| (33..=126).contains(&b))
         {
             return Err(StageError::Invalid);
         }
+        self.check_staging_push_workflows(id)?;
         let remote = format!("https://github.com/{owner}/{repository}.git");
         self.stage(std::ffi::OsStr::new(&remote), id, Some(token))
     }
@@ -269,12 +440,7 @@ impl Integration {
         id: &str,
         token: Option<&str>,
     ) -> Result<Staged, StageError> {
-        if id.len() < 16
-            || id.len() > 64
-            || !id
-                .bytes()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        {
+        if !valid_staging_id(id) {
             return Err(StageError::Invalid);
         }
         let reference = format!("refs/heads/sluss/{id}");

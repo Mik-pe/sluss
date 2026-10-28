@@ -18,6 +18,32 @@ pub(crate) struct InvalidWorkflow;
 /// Aliases outside `on` are ignored without expansion; an aliased trigger is
 /// rejected because its value cannot be proven by this streaming inspection.
 pub(crate) fn supports_sluss_dispatch(bytes: &[u8]) -> Result<bool, InvalidWorkflow> {
+    let mut cursor = parse(bytes)?;
+    cursor.expect(Event::StreamStart)?;
+    cursor.expect(Event::DocumentStart)?;
+    if !matches!(cursor.take()?, Event::MappingStart(..)) {
+        return Err(InvalidWorkflow);
+    }
+    let mut keys = BTreeSet::new();
+    let mut found = false;
+    while !matches!(cursor.peek()?, Event::MappingEnd) {
+        let key = cursor.string_scalar()?;
+        if key == "<<" || !keys.insert(key.clone()) {
+            return Err(InvalidWorkflow);
+        }
+        if key == "on" {
+            found = cursor.triggers()?;
+        } else {
+            cursor.skip_node()?;
+        }
+    }
+    cursor.expect(Event::MappingEnd)?;
+    cursor.expect(Event::DocumentEnd)?;
+    cursor.expect(Event::StreamEnd)?;
+    Ok(found)
+}
+
+fn parse(bytes: &[u8]) -> Result<Cursor, InvalidWorkflow> {
     if bytes.is_empty() || bytes.len() > MAX_BYTES {
         return Err(InvalidWorkflow);
     }
@@ -48,21 +74,27 @@ pub(crate) fn supports_sluss_dispatch(bytes: &[u8]) -> Result<bool, InvalidWorkf
             break;
         }
     }
-    let mut cursor = Cursor { events, index: 0 };
+    Ok(Cursor { events, index: 0 })
+}
+
+/// Prove that this workflow cannot run on a push to the exact staging branch.
+/// Unsupported, aliased or ambiguous syntax is rejected rather than guessed.
+pub(crate) fn excludes_staging_push(bytes: &[u8], branch: &str) -> Result<bool, InvalidWorkflow> {
+    let mut cursor = parse(bytes)?;
     cursor.expect(Event::StreamStart)?;
     cursor.expect(Event::DocumentStart)?;
-    if !matches!(cursor.take()?, Event::MappingStart(..)) {
+    if !matches!(cursor.take()?, Event::MappingStart(_, None)) {
         return Err(InvalidWorkflow);
     }
     let mut keys = BTreeSet::new();
-    let mut found = false;
+    let mut safe = None;
     while !matches!(cursor.peek()?, Event::MappingEnd) {
         let key = cursor.string_scalar()?;
         if key == "<<" || !keys.insert(key.clone()) {
             return Err(InvalidWorkflow);
         }
         if key == "on" {
-            found = cursor.triggers()?;
+            safe = Some(cursor.staging_triggers(branch)?);
         } else {
             cursor.skip_node()?;
         }
@@ -70,7 +102,7 @@ pub(crate) fn supports_sluss_dispatch(bytes: &[u8]) -> Result<bool, InvalidWorkf
     cursor.expect(Event::MappingEnd)?;
     cursor.expect(Event::DocumentEnd)?;
     cursor.expect(Event::StreamEnd)?;
-    Ok(found)
+    safe.ok_or(InvalidWorkflow)
 }
 
 struct Cursor {
@@ -160,6 +192,111 @@ impl Cursor {
                 }
                 self.expect(Event::MappingEnd)?;
                 Ok(compatible)
+            }
+            _ => Err(InvalidWorkflow),
+        }
+    }
+
+    fn staging_triggers(&mut self, branch: &str) -> Result<bool, InvalidWorkflow> {
+        match self.peek()? {
+            Event::Scalar(..) => Ok(self.string_scalar()? != "push"),
+            Event::SequenceStart(_, None) => {
+                self.take()?;
+                let mut names = BTreeSet::new();
+                while !matches!(self.peek()?, Event::SequenceEnd) {
+                    let name = self.string_scalar()?;
+                    if !names.insert(name) {
+                        return Err(InvalidWorkflow);
+                    }
+                }
+                self.expect(Event::SequenceEnd)?;
+                Ok(!names.contains("push"))
+            }
+            Event::MappingStart(_, None) => {
+                self.take()?;
+                let mut names = BTreeSet::new();
+                let mut safe = true;
+                while !matches!(self.peek()?, Event::MappingEnd) {
+                    let name = self.string_scalar()?;
+                    if name == "<<" || !names.insert(name.clone()) {
+                        return Err(InvalidWorkflow);
+                    }
+                    if name == "push" {
+                        safe = self.staging_push_filter(branch)?;
+                    } else {
+                        self.skip_node()?;
+                    }
+                }
+                self.expect(Event::MappingEnd)?;
+                Ok(safe)
+            }
+            _ => Err(InvalidWorkflow),
+        }
+    }
+
+    fn staging_push_filter(&mut self, branch: &str) -> Result<bool, InvalidWorkflow> {
+        if !matches!(self.peek()?, Event::MappingStart(_, None)) {
+            self.skip_node()?;
+            return Ok(false);
+        }
+        self.take()?;
+        let mut keys = BTreeSet::new();
+        let mut branches = None;
+        let mut ignored = None;
+        while !matches!(self.peek()?, Event::MappingEnd) {
+            let key = self.string_scalar()?;
+            if key == "<<" || !keys.insert(key.clone()) {
+                return Err(InvalidWorkflow);
+            }
+            match key.as_str() {
+                "branches" => branches = Some(self.branch_patterns()?),
+                "branches-ignore" => ignored = Some(self.branch_patterns()?),
+                _ => self.skip_node()?,
+            }
+        }
+        self.expect(Event::MappingEnd)?;
+        match (branches, ignored) {
+            (Some(patterns), None) => Ok(!patterns.is_empty()
+                && patterns.iter().all(|pattern| {
+                    if pattern.is_empty() || pattern.starts_with('!') {
+                        return false;
+                    }
+                    // A literal prefix that differs is enough to rule out a match;
+                    // any pattern that might match is treated as unsafe.
+                    let end = pattern
+                        .bytes()
+                        .position(|b| {
+                            !(b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+                        })
+                        .unwrap_or(pattern.len());
+                    let prefix = &pattern[..end];
+                    if end == pattern.len() {
+                        pattern != branch
+                    } else {
+                        !branch.starts_with(prefix)
+                    }
+                })),
+            (None, Some(patterns)) => Ok(!patterns.is_empty()
+                && patterns.iter().all(|p| !p.is_empty() && !p.contains('!'))
+                && patterns.iter().any(|p| p == branch || p == "sluss/**")),
+            _ => Ok(false),
+        }
+    }
+
+    fn branch_patterns(&mut self) -> Result<Vec<String>, InvalidWorkflow> {
+        match self.peek()? {
+            Event::Scalar(..) => Ok(vec![self.string_scalar()?]),
+            Event::SequenceStart(_, None) => {
+                self.take()?;
+                let mut values = Vec::new();
+                while !matches!(self.peek()?, Event::SequenceEnd) {
+                    values.push(self.string_scalar()?);
+                    if values.len() > 1000 {
+                        return Err(InvalidWorkflow);
+                    }
+                }
+                self.expect(Event::SequenceEnd)?;
+                Ok(values)
             }
             _ => Err(InvalidWorkflow),
         }
@@ -259,6 +396,56 @@ mod tests {
             assert_eq!(supports_sluss_dispatch(text.as_bytes()), Ok(false), "{text}");
         }
     }
+    #[test]
+    fn staging_push_filter_fails_closed_for_unproven_patterns() {
+        let branch = "sluss/batch-0123456789abcdef";
+        for text in [
+            "on: workflow_dispatch\n",
+            "on: [workflow_dispatch, pull_request]\n",
+            "on: {push: {branches: [main, 'releases/**']}, workflow_dispatch: {}}\n",
+            "on: {push: {branches-ignore: ['sluss/**']}}\n",
+            "on: {push: {branches-ignore: ['sluss/batch-0123456789abcdef']}}\n",
+        ] {
+            assert_eq!(
+                excludes_staging_push(text.as_bytes(), branch),
+                Ok(true),
+                "{text}"
+            );
+        }
+        for text in [
+            "on: push\n",
+            "on: [push, workflow_dispatch]\n",
+            "on: {push: null}\n",
+            "on: {push: {paths: ['src/**']}}\n",
+            "on: {push: {branches: ['**']}}\n",
+            "on: {push: {branches: ['sluss/**']}}\n",
+            "on: {push: {branches: ['{sluss,other}/**']}}\n",
+            "on: {push: {branches: ['sluss/batch-0123456789abcdef']}}\n",
+            "on: {push: {branches: [main], branches-ignore: ['sluss/**']}}\n",
+            "on: {push: {branches-ignore: [main]}}\n",
+            "on: {push: {branches-ignore: ['sluss/**', '!sluss/x']}}\n",
+            "on: {push: {branches: ['!sluss/**']}}\n",
+        ] {
+            assert_eq!(
+                excludes_staging_push(text.as_bytes(), branch),
+                Ok(false),
+                "{text}"
+            );
+        }
+        for text in [
+            "name: no trigger\n",
+            "on: push\non: workflow_dispatch\n",
+            "on: {push: {branches-ignore: *missing}}\n",
+            "on: workflow_dispatch\n---\non: push\n",
+            "on: {push: {<<: *missing}}\n",
+        ] {
+            assert!(
+                excludes_staging_push(text.as_bytes(), branch).is_err(),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn accepts_the_project_workflow_example() {
         let example = include_bytes!("../examples/github-actions/sluss-ci.yml");
