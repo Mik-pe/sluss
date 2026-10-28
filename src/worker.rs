@@ -677,6 +677,7 @@ pub async fn release_ci_only_once(
     let mut scheduler =
         crate::scheduler::Scheduler::open(db, capacity.clone()).map_err(|e| e.to_string())?;
     let mut released = 0;
+    let mut busy_host = None;
     for pending in scheduler.pending_dispatches().map_err(|e| e.to_string())? {
         let run_id = match pending.state {
             DispatchState::Accepted { run_id } | DispatchState::Observed { run_id } => run_id,
@@ -790,12 +791,20 @@ pub async fn release_ci_only_once(
             .observe_repository_runners(&inventory_token, &policy.owner, &policy.name)
             .await
             .map_err(|e| e.to_string())?;
-        crate::verification::check_repository_host_idle(
+        match crate::verification::check_repository_host_idle(
             capacity,
             &runners,
             &pending.reservation.host,
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            Ok(()) => {}
+            Err(crate::verification::InventoryError::InsufficientCapacity) => {
+                let host = pending.reservation.host.clone();
+                eprintln!("CI-only release is waiting for host {host} to become idle");
+                busy_host.get_or_insert(host);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
         let last = app
             .reconcile_dispatch(
                 &mut scheduler,
@@ -819,6 +828,11 @@ pub async fn release_ci_only_once(
                 .map_err(|e| e.to_string())?;
         }
         released += 1;
+    }
+    if released == 0
+        && let Some(host) = busy_host
+    {
+        return Err(format!("reserved host {host} is not idle and online"));
     }
     Ok(released)
 }

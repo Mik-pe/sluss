@@ -186,7 +186,7 @@ async fn open_pulls(
     let branch = query.get("base").expect("base branch filter");
     let mode = state.mode.load(Ordering::SeqCst);
     let row = |number| json!({"number":number, "state":"open", "base":{"ref":if mode == 218 {"wrong"} else {branch}, "repo":{"id":7}}});
-    Json(if matches!(mode, 46 | 47 | 151 | 152) {
+    Json(if matches!(mode, 46 | 47 | 151..=154) {
         json!([row(19), row(20)])
     } else if mode == 222 {
         json!([row(20)])
@@ -234,7 +234,8 @@ async fn actions_jobs(
     } else {
         1
     };
-    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103 | 129) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
+    let separate_host = matches!(mode, 153 | 154) && uri.0.path().contains("/runs/124");
+    let jobs: Vec<Value> = (0..count).map(|n| json!({"id":if separate_host { 124 } else { (page-1)*100+n+1 },"run_id":if mode == 13 || uri.0.path().contains("/runs/124") { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":if matches!(mode,40 | 95..=100 | 103 | 129) { "failure" } else { "success" },"started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":if separate_host { 2 } else { 1 }})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
 async fn dispatch_repo(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
@@ -284,10 +285,15 @@ async fn dispatch_ref(
     }
     body.into_response()
 }
-async fn stale_pinned_ref(State(_state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+async fn stale_pinned_ref(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let sha = if matches!(state.mode.load(Ordering::SeqCst), 153 | 154) {
+        "a"
+    } else {
+        "b"
+    };
     Json(
-        json!({"ref":"refs/heads/sluss/batch-0000000000000000","object":{"sha":"b".repeat(40),"type":"commit"}}),
+        json!({"ref":"refs/heads/sluss/batch-0000000000000000","object":{"sha":sha.repeat(40),"type":"commit"}}),
     )
 }
 async fn dispatched_run(
@@ -299,7 +305,9 @@ async fn dispatched_run(
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
     let latest = !path.0.path().contains("/attempts/");
-    let branch = if mode == 18 {
+    let branch = if matches!(mode, 153 | 154) && path.0.path().contains("/runs/124") {
+        "sluss/batch-0000000000000000"
+    } else if mode == 18 {
         "sluss/other"
     } else {
         "sluss/batch-0123456789abcdef"
@@ -319,7 +327,9 @@ async fn dispatched_run(
     } else {
         17
     };
-    let workflow_path = if mode == 51 {
+    let workflow_path = if matches!(mode, 153 | 154) && path.0.path().contains("/runs/124") {
+        ".github/workflows/ci.yml@refs/heads/sluss/batch-0000000000000000"
+    } else if mode == 51 {
         ".github/workflows/other.yml@refs/heads/sluss/batch-0123456789abcdef"
     } else if mode == 239 {
         ".github/workflows/ci.yml@refs/heads/main"
@@ -834,9 +844,9 @@ async fn repository_runners(
     assert_eq!(query["page"], "1");
     let mode = state.mode.load(Ordering::SeqCst);
     let count = state.pulls.fetch_add(1, Ordering::SeqCst);
-    if matches!(mode, 44..=47 | 66 | 151 | 152) {
+    if matches!(mode, 44..=47 | 66 | 151..=154) {
         return Json(json!({"total_count":2,"runners":[
-            {"id":2,"name":"busy-runner","status":"online","busy":!matches!(mode,151 | 152),"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
+            {"id":2,"name":"busy-runner","status":"online","busy":!matches!(mode,151..=153),"labels":[{"name":"self-hosted"},{"name":"sluss-host-busy"}]},
             {"id":1,"name":"runner","status":"online","busy":mode == 45 || mode == 47,"labels":[{"name":"self-hosted"},{"name":"sluss-host-test"}]}
         ]}));
     }
@@ -861,9 +871,15 @@ async fn dispatch_post(
     } else {
         "full"
     };
+    let separate_host = state.mode.load(Ordering::SeqCst) == 153;
+    let (reference, host) = if separate_host {
+        ("refs/heads/sluss/batch-0000000000000000", "sluss-host-busy")
+    } else {
+        ("refs/heads/sluss/batch-0123456789abcdef", "sluss-host-test")
+    };
     assert_eq!(
         body,
-        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef", "return_run_details":true, "inputs":{"sluss_host":"sluss-host-test","sluss_suites":suites}})
+        json!({"ref":reference, "return_run_details":true, "inputs":{"sluss_host":host,"sluss_suites":suites}})
     );
     state.permissions.fetch_add(1, Ordering::SeqCst);
     let mode = state.mode.load(Ordering::SeqCst);
@@ -883,7 +899,7 @@ async fn dispatch_post(
     } else {
         (
             StatusCode::OK,
-            Json(json!({"workflow_run_id":if mode == 123 {124} else {123}})),
+            Json(json!({"workflow_run_id":if matches!(mode, 123 | 153) {124} else {123}})),
         )
     }
 }
@@ -4823,7 +4839,38 @@ async fn cli_dispatches_fixture() {
         .is_err()
     );
     assert_eq!(stale_scheduler.pending_dispatches().unwrap().len(), 2);
-    mode.store(46, Ordering::SeqCst);
+    // A second completed batch is first in reservation order, but its host
+    // is busy; the already completed batch on the other host can be released.
+    mode.store(153, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::dispatch_once(
+            &fixture_app,
+            &stale_db,
+            &fixture_policy,
+            &independent_capacity,
+            &settings
+        )
+        .await
+        .unwrap(),
+        Some(sluss::dispatch::Outcome::Sent {
+            run: 124,
+            host: "sluss-host-busy".into()
+        })
+    );
+    sluss::worker::observe_dispatches_with_completion(
+        &fixture_app,
+        &stale_db,
+        &independent_capacity,
+        &fixture_policy,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        stale_store.batch(pinned_id).unwrap().unwrap().0.state,
+        sluss::batch::State::CiComplete { .. }
+    ));
+    mode.store(154, Ordering::SeqCst);
     assert_eq!(
         sluss::worker::release_ci_only_once(
             &fixture_app,
@@ -4838,6 +4885,19 @@ async fn cli_dispatches_fixture() {
     let remaining = stale_scheduler.pending_dispatches().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].reservation.id, pinned_id);
+    mode.store(153, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::release_ci_only_once(
+            &fixture_app,
+            &stale_db,
+            &independent_capacity,
+            &fixture_policy
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(stale_scheduler.pending_dispatches().unwrap().is_empty());
     posts.store(0, Ordering::SeqCst);
     mode.store(0, Ordering::SeqCst);
     reads.store(0, Ordering::SeqCst);
