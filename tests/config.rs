@@ -92,6 +92,7 @@ fn lane_worker_rejects_incomplete_or_unsupported_configuration_before_startup() 
             ])
             .args(extra)
             .env("SLUSS_WEBHOOK_SECRET", "test")
+            .env_remove("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .output()
             .unwrap()
     };
@@ -106,7 +107,7 @@ fn lane_worker_rejects_incomplete_or_unsupported_configuration_before_startup() 
         "--bisect-ci-failures",
     ]);
     assert!(!bisection.status.success());
-    assert!(String::from_utf8_lossy(&bisection.stderr).contains("lane bisection"));
+    assert!(String::from_utf8_lossy(&bisection.stderr).contains("SLUSS_GITHUB_PRIVATE_KEY_PATH"));
     assert!(!db.exists());
 }
 

@@ -32,6 +32,7 @@ fn fixture() -> (Capacity, LanePlan) {
         hosts,
     };
     let plan = LanePlan {
+        full_policy: None,
         batch: DispatchPlan {
             installation_id: 1,
             repository_id: 2,

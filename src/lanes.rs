@@ -24,6 +24,11 @@ pub struct Policy {
 pub struct LanePlan {
     pub batch: DispatchPlan,
     pub lanes: BTreeMap<String, Lane>,
+    /// Complete operator mapping, including lanes not selected for this batch.
+    /// Older plans without it remain usable for CI-only scheduling, but are
+    /// not comparable for multi-lane failure investigation.
+    #[serde(default)]
+    pub full_policy: Option<Policy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -86,6 +91,7 @@ impl Policy {
         if !(LanePlan {
             batch: full,
             lanes: self.lanes.clone(),
+            full_policy: None,
         })
         .validate(capacity)
         {
@@ -115,7 +121,11 @@ impl Policy {
             .next()
             .ok_or("selection has no configured lane")?
             .workflow_id;
-        let plan = LanePlan { batch, lanes };
+        let plan = LanePlan {
+            batch,
+            lanes,
+            full_policy: Some(self.clone()),
+        };
         if !plan.validate(capacity) {
             return Err("invalid selected lane plan");
         }
@@ -176,6 +186,61 @@ impl LanePlan {
             }
             jobs.extend(lane.required_jobs.iter().cloned());
         }
-        suites == self.batch.suites && jobs == self.batch.required_jobs
+        if suites != self.batch.suites || jobs != self.batch.required_jobs {
+            return false;
+        }
+        if let Some(policy) = &self.full_policy {
+            if policy.version != 1 {
+                return false;
+            }
+            let selected: BTreeMap<_, _> = policy
+                .lanes
+                .iter()
+                .filter_map(|(name, lane)| {
+                    let suites: BTreeSet<_> = lane
+                        .suites
+                        .intersection(&self.batch.suites)
+                        .cloned()
+                        .collect();
+                    if suites.is_empty() {
+                        None
+                    } else {
+                        let mut value = lane.clone();
+                        value.suites = suites;
+                        Some((name.clone(), value))
+                    }
+                })
+                .collect();
+            if selected != self.lanes {
+                return false;
+            }
+            let mut batch = self.batch.clone();
+            batch.suites = policy
+                .lanes
+                .values()
+                .flat_map(|lane| lane.suites.iter().cloned())
+                .collect();
+            batch.required_jobs = policy
+                .lanes
+                .values()
+                .flat_map(|lane| lane.required_jobs.iter().cloned())
+                .collect();
+            batch.workflow_id = policy
+                .lanes
+                .values()
+                .next()
+                .map_or(0, |lane| lane.workflow_id);
+            batch.selection_policy_digest = Some("0".repeat(64));
+            if !(LanePlan {
+                batch,
+                lanes: policy.lanes.clone(),
+                full_policy: None,
+            })
+            .validate(capacity)
+            {
+                return false;
+            }
+        }
+        true
     }
 }

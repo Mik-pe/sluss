@@ -283,14 +283,21 @@ pub async fn batch_lanes(
         suites,
         selection_policy_digest: selection_digest,
     };
-    let lanes = crate::lanes::Policy::load(&settings.policy)
+    let mut lanes = crate::lanes::Policy::load(&settings.policy)
         .map_err(Error::Invalid)?
         .plan(template, &all_suites, capacity)
         .map_err(Error::Invalid)?;
     let mut scheduler = Scheduler::open(db, capacity.clone())?;
     if let Some(existing) = scheduler.lane_plan(batch_id)? {
         if existing != lanes {
-            return Err(SchedulerError::IdConflict.into());
+            let mut legacy = lanes.clone();
+            legacy.full_policy = None;
+            if existing != legacy {
+                return Err(SchedulerError::IdConflict.into());
+            }
+            // Older selected-lane plans can finish CI-only, but cannot be
+            // promoted to a full-policy comparison after they were frozen.
+            lanes = existing;
         }
         let mut outstanding = false;
         for lane in lanes.lanes.keys() {

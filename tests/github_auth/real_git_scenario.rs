@@ -471,6 +471,25 @@ async fn scenario(lane_mode: bool) {
         Some("direct")
     );
     drop(scheduler);
+    if lane_mode {
+        // Plans written by the previous version had no complete mapping;
+        // they can finish CI-only but must not acquire new comparison proof.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM lane_batch_plans WHERE batch_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        body.as_object_mut().unwrap().remove("full_policy");
+        conn.execute(
+            "UPDATE lane_batch_plans SET body=?1 WHERE batch_id=?2",
+            rusqlite::params![serde_json::to_string(&body).unwrap(), id],
+        )
+        .unwrap();
+    }
     drop(app);
     // Reconstruct the application as well as the database handles after dispatch.
     let app =

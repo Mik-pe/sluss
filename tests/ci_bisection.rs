@@ -95,6 +95,7 @@ fn lane_plan_is_bound_to_batch_and_excludes_single_run_dispatch() {
         pools: [("rust".into(), 1)].into(),
     };
     let lanes = LanePlan {
+        full_policy: None,
         batch: plan.clone(),
         lanes: [(
             "rust".into(),
@@ -246,6 +247,7 @@ fn lane_completion_scenario(second_conclusion: &str, expected_conclusion: &str) 
         );
     }
     let plan = LanePlan {
+        full_policy: None,
         batch: DispatchPlan {
             installation_id: 1,
             repository_id: 2,
@@ -478,6 +480,7 @@ fn distinct_lanes_can_hold_distinct_physical_hosts_at_once() {
         },
     };
     let frozen = LanePlan {
+        full_policy: None,
         batch: DispatchPlan {
             installation_id: 1,
             repository_id: 2,
@@ -515,6 +518,284 @@ fn distinct_lanes_can_hold_distinct_physical_hosts_at_once() {
     ));
     assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 1);
     assert!(scheduler.pending_dispatches().unwrap().is_empty());
+}
+
+fn finish_lane_batch(
+    store: &mut Store,
+    scheduler: &mut Scheduler,
+    batch: &sluss::batch::Batch,
+    run_base: u64,
+    conclusion: &str,
+    workflow_id: u64,
+) {
+    finish_lane_batch_selected(
+        store,
+        scheduler,
+        batch,
+        run_base,
+        conclusion,
+        workflow_id,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_lane_batch_selected(
+    store: &mut Store,
+    scheduler: &mut Scheduler,
+    batch: &sluss::batch::Batch,
+    run_base: u64,
+    conclusion: &str,
+    workflow_id: u64,
+    only_compile: bool,
+) {
+    use sluss::lanes::{Lane, Policy};
+    let suites: BTreeSet<String> = if only_compile {
+        ["compile".into()].into()
+    } else {
+        ["compile".into(), "test".into()].into()
+    };
+    store
+        .bind_policy_paths(&batch.id, &[".github/workflows/ci.yml".into()])
+        .unwrap();
+    store.start_integration(&batch.id).unwrap();
+    store
+        .finish_integration(&batch.id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    store
+        .record_selection(
+            &batch.id,
+            &sluss::selective::FrozenSelection {
+                base_sha: batch.base_sha.clone(),
+                integration_sha: "b".repeat(40),
+                policy_digest: "d".repeat(64),
+                selection: sluss::selective::Selection::Selected {
+                    suites: suites.clone(),
+                    components: ["all".into()].into(),
+                },
+            },
+        )
+        .unwrap();
+    let request = Request {
+        pools: [("rust".into(), 1)].into(),
+    };
+    let lane = |name: &str| Lane {
+        workflow_id,
+        suites: [name.into()].into(),
+        required_jobs: [format!("{name}-job")].into(),
+        request: request.clone(),
+    };
+    let policy = Policy {
+        version: 1,
+        lanes: [
+            ("compile".into(), lane("compile")),
+            ("test".into(), lane("test")),
+        ]
+        .into(),
+    };
+    let template = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 0,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{}", batch.id),
+        policy_digest: "c".repeat(64),
+        required_jobs: BTreeSet::new(),
+        suites,
+        selection_policy_digest: Some("d".repeat(64)),
+    };
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let capacity = Capacity {
+        pools: pools.clone(),
+        hosts: [(
+            "sluss-host-test".into(),
+            Host {
+                slots: 1,
+                runner_ids: [7].into(),
+                pools,
+            },
+        )]
+        .into(),
+    };
+    let plan = policy
+        .plan(
+            template,
+            &["compile".into(), "test".into()].into(),
+            &capacity,
+        )
+        .unwrap();
+    scheduler.freeze_lane_plan(&batch.id, &plan).unwrap();
+    let eligible = ["sluss-host-test".into()].into();
+    for (n, name) in plan.lanes.keys().map(String::as_str).enumerate() {
+        let run_id = run_base + n as u64;
+        let result = if conclusion == "partial" && name == "compile" {
+            "failure"
+        } else if conclusion == "partial" {
+            "cancelled"
+        } else if name == "compile" {
+            conclusion
+        } else {
+            "success"
+        };
+        let reservation = scheduler
+            .reserve_lane_dispatch_on(&batch.id, name, &eligible)
+            .unwrap()
+            .unwrap();
+        assert!(
+            scheduler
+                .claim_batch_dispatch(&reservation.id, ".github/workflows/ci.yml")
+                .unwrap()
+        );
+        scheduler.record_receipt(&reservation.id, run_id).unwrap();
+        scheduler.observe_dispatch(&reservation.id, run_id).unwrap();
+        let snapshot = ActionsSnapshot {
+            run: ActionsRun {
+                id: run_id,
+                run_attempt: 1,
+                workflow_id,
+                head_sha: "b".repeat(40),
+                head_branch: Some(format!("sluss/{}", batch.id)),
+                path: ".github/workflows/ci.yml".into(),
+                event: "workflow_dispatch".into(),
+                status: "completed".into(),
+                conclusion: Some(result.into()),
+                repository: ActionsRepository { id: 2 },
+                head_repository: Some(ActionsRepository { id: 2 }),
+            },
+            jobs: vec![ActionsJob {
+                id: run_id + 1000,
+                run_id,
+                head_sha: "b".repeat(40),
+                name: format!("{name}-job"),
+                status: "completed".into(),
+                conclusion: Some(result.into()),
+                started_at: None,
+                completed_at: None,
+                runner_id: Some(7),
+            }],
+        };
+        scheduler
+            .record_ci_observation(&reservation.id, &snapshot)
+            .unwrap();
+        scheduler
+            .release_completed_lane(&reservation.id, run_id)
+            .unwrap();
+    }
+    assert!(scheduler.complete_lanes_ci_only(&batch.id).unwrap());
+}
+
+#[test]
+fn lane_failures_are_bisected_only_after_a_comparable_successful_sibling() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &root, 100, "failure", 3);
+    let left = plan(&mut store, 2).unwrap();
+    assert_eq!(numbers(&left), [1, 2]);
+    finish_lane_batch(&mut store, &mut scheduler, &left, 200, "failure", 3);
+    let right = plan(&mut store, 3).unwrap();
+    assert_eq!(numbers(&right), [3, 4]);
+    finish_lane_batch(&mut store, &mut scheduler, &right, 300, "success", 3);
+    let first = plan(&mut store, 4).unwrap();
+    assert_eq!(numbers(&first), [1]);
+    finish_lane_batch(&mut store, &mut scheduler, &first, 400, "success", 3);
+    let second = plan(&mut store, 5).unwrap();
+    assert_eq!(numbers(&second), [2]);
+    finish_lane_batch(&mut store, &mut scheduler, &second, 500, "failure", 3);
+    assert!(plan(&mut store, 6).is_none());
+    assert!(store.failed_candidates().unwrap().is_empty());
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "needs-review".into()))
+    );
+}
+
+#[test]
+fn selected_parent_failure_is_compared_with_full_suite_children() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_lane_batch_selected(&mut store, &mut scheduler, &root, 100, "failure", 3, true);
+    let left = plan(&mut store, 2).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &left, 200, "failure", 3);
+    let right = plan(&mut store, 3).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &right, 300, "success", 3);
+    assert_eq!(numbers(&plan(&mut store, 4).unwrap()), [1]);
+}
+
+#[test]
+fn changed_lane_policy_makes_failure_bisection_inconclusive() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &root, 100, "failure", 3);
+    let left = plan(&mut store, 2).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &left, 200, "failure", 3);
+    let right = plan(&mut store, 3).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &right, 300, "success", 4);
+    assert!(plan(&mut store, 4).is_none());
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "inconclusive".into()))
+    );
+}
+
+#[test]
+fn a_cancelled_lane_does_not_turn_a_partial_failure_into_a_bisection_result() {
+    let (_dir, mut store, _inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &root, 100, "partial", 3);
+    assert!(matches!(store.batch(&root.id).unwrap().unwrap().0.state,
+        State::CiCompleteLanes { conclusion, .. } if conclusion == "inconclusive"));
+    assert!(store.ci_investigations().unwrap().is_empty());
+    assert!(plan(&mut store, 2).is_none());
+}
+
+#[test]
+fn changed_review_invalidates_an_inflight_lane_investigation() {
+    let (_dir, mut store, mut inbox, mut scheduler) = setup();
+    let root = plan(&mut store, 1).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &root, 100, "failure", 3);
+    let left = plan(&mut store, 2).unwrap();
+    finish_lane_batch(&mut store, &mut scheduler, &left, 200, "failure", 3);
+    inbox
+        .record(
+            "changed-review-lanes",
+            "pull_request_review",
+            &[9; 32],
+            1,
+            2,
+        )
+        .unwrap();
+    let event = inbox.pending().unwrap().remove(0);
+    let mut candidates: Vec<_> = store
+        .candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| AdmissionCandidate {
+            evidence_digest: format!("{:064x}", candidate.number),
+            candidate,
+        })
+        .collect();
+    candidates[0].evidence_digest = "9".repeat(64);
+    store
+        .apply_admission_reconciliation_with_base(
+            &event,
+            &"f".repeat(64),
+            &candidates,
+            &"a".repeat(40),
+            "main",
+        )
+        .unwrap();
+    assert!(
+        store
+            .ci_investigations()
+            .unwrap()
+            .contains(&(root.id, "stale".into()))
+    );
+    let next = plan(&mut store, 3).unwrap();
+    assert_ne!(numbers(&next), [3, 4]);
 }
 
 #[test]

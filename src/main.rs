@@ -1126,8 +1126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
         let lane_settings = if let Some(path) = lane_policy {
-            if !complete_ci_only || !release_ci_only || bisect_ci_failures {
-                return Err("lane dispatch requires --complete-ci-only and --release-ci-only; lane bisection is not yet supported".into());
+            if !complete_ci_only || !release_ci_only {
+                return Err(
+                    "lane dispatch requires --complete-ci-only and --release-ci-only".into(),
+                );
             }
             let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
             let (suites, digest) = if let Some(path) = &verification_policy {

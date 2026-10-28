@@ -3506,6 +3506,9 @@ fn investigate_ci_batch(
     if !enabled {
         return Ok(());
     }
+    if matches!(batch.state, State::CiCompleteLanes { .. }) {
+        return investigate_lane_ci_batch(tx, batch);
+    }
     let parent: Option<String> = tx
         .query_row(
             "SELECT parent_id FROM split_tasks WHERE child_id=?1 AND state='planned'",
@@ -3557,6 +3560,10 @@ fn investigate_ci_batch(
             match &candidate.state {
                 State::CiComplete { conclusion, .. } => {
                     observed.push((candidate.clone(), conclusion.clone()))
+                }
+                State::CiCompleteLanes { .. } => {
+                    crate::store::finish_ci_investigation(tx, &parent, "inconclusive")?;
+                    return Ok(());
                 }
                 _ => return Ok(()),
             }
@@ -3661,6 +3668,251 @@ fn investigate_ci_batch(
         if !bound || !has_job_snapshot(tx, &batch.id)? {
             return Ok(());
         }
+        crate::store::enqueue_bisection(tx, batch)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO ci_investigations(batch_id,state) VALUES(?1,'pending')",
+            [&batch.id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The complete lane mapping and original job snapshots are required before
+/// comparing failures. Missing legacy data makes an investigation inconclusive.
+type LaneComparison = (crate::lanes::LanePlan, BTreeMap<String, String>);
+fn comparable_lane_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &crate::batch::Batch,
+) -> Result<Option<LaneComparison>, SchedulerError> {
+    let crate::batch::State::CiCompleteLanes {
+        integration_sha,
+        lanes: results,
+        ..
+    } = &batch.state
+    else {
+        return Ok(None);
+    };
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT body,capacity FROM lane_batch_plans WHERE batch_id=?1",
+            [&batch.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((body, capacity)) = row else {
+        return Ok(None);
+    };
+    let plan: crate::lanes::LanePlan = serde_json::from_str(&body)?;
+    let capacity: Capacity = serde_json::from_str(&capacity)?;
+    if plan.full_policy.is_none()
+        || !plan.validate(&capacity)
+        || &plan.batch.integration_sha != integration_sha
+        || plan.batch.staging_ref != format!("refs/heads/sluss/{}", batch.id)
+        || results.len() != plan.lanes.len()
+    {
+        return Ok(None);
+    }
+    let mut paths = BTreeMap::new();
+    for name in plan.lanes.keys() {
+        let id = crate::lanes::LanePlan::dispatch_id(&batch.id, name);
+        let Some(result) = results.get(name) else {
+            return Ok(None);
+        };
+        let row: Option<(String, String, Option<String>, String, String, String)> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,s.source,w.path,h.host FROM dispatch_intents d JOIN dispatch_batches b ON b.id=d.id AND b.batch_id=?2 JOIN dispatch_receipt_sources s ON s.id=d.id JOIN dispatch_workflows w ON w.id=d.id JOIN lane_dispatch_hosts h ON h.id=d.id WHERE d.id=?1",
+            params![id,batch.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+        ).optional()?;
+        let Some((body, state, run, source, path, host)) = row else {
+            return Ok(None);
+        };
+        let actual: DispatchPlan = serde_json::from_str(&body)?;
+        let (expected, _) = plan.dispatch(name).ok_or(SchedulerError::Corrupt)?;
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_receipt_conflicts WHERE id=?1)",
+            [&id],
+            |r| r.get(0),
+        )?;
+        let observation: Option<String> = tx
+            .query_row("SELECT body FROM ci_observations WHERE id=?1", [&id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(observation) = observation else {
+            return Ok(None);
+        };
+        let observation: CiObservationRecord = serde_json::from_str(&observation)?;
+        let Some(snapshot) = &observation.snapshot else {
+            return Ok(None);
+        };
+        let Some(host) = capacity.hosts.get(&host) else {
+            return Ok(None);
+        };
+        let placement = crate::verification::check_host_placement(snapshot, &host.runner_ids);
+        let conclusion = match &observation.observation {
+            crate::verification::CiObservation::Successful => "success",
+            crate::verification::CiObservation::Failed { conclusion } => conclusion.as_str(),
+            _ => return Ok(None),
+        };
+        if actual != expected
+            || state != "finished"
+            || source != "direct"
+            || conflict
+            || run.as_deref() != Some(&result.run_id.to_string())
+            || observation.run_id != result.run_id
+            || observation.plan != actual
+            || observation.workflow_path.as_deref() != Some(path.as_str())
+            || result.conclusion != conclusion
+            || !has_job_snapshot(tx, &id)?
+            || !matches!(placement, Ok(crate::verification::Placement::Confirmed { runner_id }) if Some(runner_id) == observation.runner_id)
+        {
+            return Ok(None);
+        }
+        paths.insert(name.clone(), path);
+    }
+    Ok(Some((plan, paths)))
+}
+
+fn investigate_lane_ci_batch(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &crate::batch::Batch,
+) -> Result<(), SchedulerError> {
+    use crate::batch::State;
+    let parent: Option<String> = tx
+        .query_row(
+            "SELECT parent_id FROM split_tasks WHERE child_id=?1 AND state='planned'",
+            [&batch.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(parent) = parent {
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_investigations WHERE batch_id=?1 AND state='pending')",
+            [&parent],
+            |r| r.get(0),
+        )?;
+        if !pending {
+            return Ok(());
+        }
+        let children: Vec<(String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT state,child_id FROM split_tasks WHERE parent_id=?1 ORDER BY side",
+            )?;
+            let rows = stmt.query_map([&parent], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if children.len() != 2
+            || children
+                .iter()
+                .any(|(state, id)| state != "planned" || id.is_none())
+        {
+            return Ok(());
+        }
+        let mut observed = Vec::new();
+        for (_, id) in children {
+            let id = id.ok_or(SchedulerError::Corrupt)?;
+            let (child, _) = match crate::store::checked_batch(tx, &id) {
+                Ok(value) => value,
+                Err(
+                    crate::store::StoreError::StaleBatch | crate::store::StoreError::InvalidBatch,
+                ) => {
+                    tx.execute(
+                        "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
+                        [&parent],
+                    )?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let conclusion = match &child.state {
+                State::CiCompleteLanes { conclusion, .. } => conclusion.clone(),
+                State::CiComplete { .. } => {
+                    crate::store::finish_ci_investigation(tx, &parent, "inconclusive")?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            };
+            observed.push((child, conclusion));
+        }
+        let (parent_batch, _) = match crate::store::checked_batch(tx, &parent) {
+            Ok(value) => value,
+            Err(crate::store::StoreError::StaleBatch | crate::store::StoreError::InvalidBatch) => {
+                tx.execute(
+                    "UPDATE ci_investigations SET state='stale' WHERE batch_id=?1",
+                    [&parent],
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let parent_snapshot = comparable_lane_snapshot(tx, &parent_batch)?;
+        let left = comparable_lane_snapshot(tx, &observed[0].0)?;
+        let right = comparable_lane_snapshot(tx, &observed[1].0)?;
+        let comparable = match (parent_snapshot, left, right) {
+            (
+                Some((parent_plan, parent_paths)),
+                Some((left, left_paths)),
+                Some((right, right_paths)),
+            ) => {
+                let common = |other: &crate::lanes::LanePlan| {
+                    parent_plan.batch.installation_id == other.batch.installation_id
+                        && parent_plan.batch.repository_id == other.batch.repository_id
+                        && parent_plan.batch.policy_digest == other.batch.policy_digest
+                        && parent_plan.batch.selection_policy_digest
+                            == other.batch.selection_policy_digest
+                        && parent_plan.full_policy == other.full_policy
+                };
+                let all_suites: std::collections::BTreeSet<_> = parent_plan
+                    .full_policy
+                    .as_ref()
+                    .expect("snapshot includes full policy")
+                    .lanes
+                    .values()
+                    .flat_map(|lane| lane.suites.iter().cloned())
+                    .collect();
+                parent_batch.base_sha == observed[0].0.base_sha
+                    && observed[0].0.base_sha == observed[1].0.base_sha
+                    && common(&left)
+                    && common(&right)
+                    && left.lanes == right.lanes
+                    && left.batch.suites == all_suites
+                    && right.batch.suites == all_suites
+                    && left_paths == right_paths
+                    && parent_paths
+                        .iter()
+                        .all(|(name, path)| left_paths.get(name) == Some(path))
+            }
+            _ => false,
+        };
+        if !comparable {
+            crate::store::finish_ci_investigation(tx, &parent, "inconclusive")?;
+            return Ok(());
+        }
+        let failure = match (observed[0].1.as_str(), observed[1].1.as_str()) {
+            ("failure", "success") => Some(&observed[0].0),
+            ("success", "failure") => Some(&observed[1].0),
+            _ => None,
+        };
+        let state = match failure {
+            Some(failed) if failed.candidates.len() == 1 => "needs-review",
+            Some(_) => "investigating",
+            None => "inconclusive",
+        };
+        if state == "investigating" {
+            tx.execute("UPDATE ci_investigations SET state='investigating' WHERE batch_id=?1 AND state='pending'", [&parent])?;
+        } else {
+            crate::store::finish_ci_investigation(tx, &parent, state)?;
+        }
+        if let Some(failed) = failure.filter(|failed| failed.candidates.len() > 1) {
+            crate::store::enqueue_bisection(tx, failed)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO ci_investigations(batch_id,state) VALUES(?1,'pending')",
+                [&failed.id],
+            )?;
+        }
+    } else if matches!(&batch.state, State::CiCompleteLanes { conclusion, .. } if conclusion == "failure")
+        && batch.candidates.len() > 1
+        && comparable_lane_snapshot(tx, batch)?.is_some()
+    {
         crate::store::enqueue_bisection(tx, batch)?;
         tx.execute(
             "INSERT OR IGNORE INTO ci_investigations(batch_id,state) VALUES(?1,'pending')",
@@ -3786,7 +4038,7 @@ impl Scheduler {
             "success".to_owned()
         } else if results
             .values()
-            .any(|result| result.conclusion == "failure")
+            .all(|result| matches!(result.conclusion.as_str(), "success" | "failure"))
         {
             "failure".to_owned()
         } else {
@@ -3813,6 +4065,7 @@ impl Scheduler {
         {
             return Err(SchedulerError::StaleBatch);
         }
+        investigate_ci_batch(&tx, &batch)?;
         tx.commit()?;
         Ok(true)
     }
@@ -4456,6 +4709,7 @@ mod rerun_scan_tests {
             selection_policy_digest: None,
         };
         let frozen = crate::lanes::LanePlan {
+            full_policy: None,
             batch: plan.clone(),
             lanes: [(
                 "full".into(),
