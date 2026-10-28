@@ -113,6 +113,39 @@ async fn actions_jobs(
     let jobs: Vec<Value> = (0..count).map(|n| json!({"id":(page-1)*100+n+1,"run_id":if mode == 13 { 124 } else { 123 },"head_sha":"a".repeat(40),"name":format!("job-{page}-{n}"),"status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","runner_id":1})).collect();
     Json(json!({"total_count":total,"jobs":jobs}))
 }
+async fn dispatch_repo(headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    Json(json!({"id": 7}))
+}
+async fn dispatch_ref(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let sha = if state.mode.load(Ordering::SeqCst) == 16 {
+        "b"
+    } else {
+        "a"
+    };
+    Json(
+        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef","object":{"sha":sha.repeat(40),"type":"commit"}}),
+    )
+}
+async fn dispatch_post(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    assert_eq!(headers["x-github-api-version"], "2026-03-10");
+    assert_eq!(
+        body,
+        json!({"ref":"refs/heads/sluss/batch-0123456789abcdef"})
+    );
+    state.permissions.fetch_add(1, Ordering::SeqCst);
+    if state.mode.load(Ordering::SeqCst) == 17 {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+    } else {
+        (StatusCode::OK, Json(json!({"workflow_run_id":123})))
+    }
+}
 async fn token(
     State(state): State<ServerState>,
     Path(id): Path<u64>,
@@ -122,10 +155,18 @@ async fn token(
     state.token_calls.fetch_add(1, Ordering::SeqCst);
     assert_eq!(id, 42);
     assert_eq!(body["repository_ids"], json!([7]));
-    assert_eq!(
-        body["permissions"],
-        json!({"actions":"read","checks":"read","contents":"read","pull_requests":"read"})
-    );
+    let write = body["permissions"]["actions"] == "write";
+    if write {
+        assert_eq!(
+            body["permissions"],
+            json!({"actions":"write","contents":"read"})
+        );
+    } else {
+        assert_eq!(
+            body["permissions"],
+            json!({"actions":"read","checks":"read","contents":"read","pull_requests":"read"})
+        );
+    }
     let jwt = headers["authorization"]
         .to_str()
         .unwrap()
@@ -165,6 +206,13 @@ async fn token(
         ("pull_requests", "read"),
         ("metadata", "read"),
     ]);
+    if write {
+        permissions = BTreeMap::from([
+            ("actions", "write"),
+            ("contents", "read"),
+            ("metadata", "read"),
+        ]);
+    }
     if mode == 3 {
         permissions.insert("contents", "write");
     }
@@ -611,4 +659,145 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
     }
     assert!(cleared, "webhook reconciliation did not remove blocked PR");
     api_task.abort();
+}
+
+#[tokio::test]
+async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried() {
+    use sluss::github::DispatchError;
+    use sluss::scheduler::{Capacity, DispatchPlan, DispatchState, Host, Request, Scheduler};
+    let (_key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let posts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route(
+            "/repos/owner/repo/git/ref/heads/sluss/batch-0123456789abcdef",
+            get(dispatch_ref),
+        )
+        .route(
+            "/repos/owner/repo/actions/workflows/17/dispatches",
+            post(dispatch_post),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: posts.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    let read_token = client.read_token(42, 7).await.unwrap();
+    let write_token = client.dispatch_token(42, 7).await.unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let pools = BTreeMap::from([("rust".into(), 3)]);
+    let mut scheduler = Scheduler::open(
+        db.path().join("db"),
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([("host".into(), Host { slots: 3, pools })]),
+        },
+    )
+    .unwrap();
+    let plan = DispatchPlan {
+        installation_id: 42,
+        repository_id: 7,
+        workflow_id: 17,
+        integration_sha: "a".repeat(40),
+        staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
+        policy_digest: "b".repeat(64),
+    };
+    let req = Request {
+        pools: BTreeMap::from([("rust".into(), 1)]),
+    };
+    scheduler
+        .reserve_dispatch("good", &req, &plan)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        client
+            .issue_dispatch(&mut scheduler, &read_token, "owner", "repo", "good")
+            .await,
+        Err(DispatchError::Invalid)
+    ));
+    let other = App::new("different-app".into(), &private, &format!("http://{addr}/")).unwrap();
+    assert!(matches!(
+        other
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
+            .await,
+        Err(DispatchError::GitHub(GitHubError::InvalidConfiguration))
+    ));
+    assert_eq!(
+        client
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
+            .await
+            .unwrap(),
+        123
+    );
+    assert_eq!(
+        scheduler.pending_dispatches().unwrap()[0].state,
+        DispatchState::Accepted { run_id: 123 }
+    );
+    assert!(matches!(
+        scheduler.observe_dispatch("good", 124),
+        Err(sluss::scheduler::SchedulerError::DispatchTransition)
+    ));
+    scheduler.observe_dispatch("good", 123).unwrap();
+    assert!(matches!(
+        client
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "good")
+            .await,
+        Err(DispatchError::AlreadyClaimed)
+    ));
+    scheduler
+        .reserve_dispatch("lost", &req, &plan)
+        .unwrap()
+        .unwrap();
+    mode.store(17, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "lost")
+            .await,
+        Err(DispatchError::Uncertain)
+    ));
+    assert!(matches!(
+        client
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "lost")
+            .await,
+        Err(DispatchError::AlreadyClaimed)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    scheduler
+        .reserve_dispatch("stale", &req, &plan)
+        .unwrap()
+        .unwrap();
+    mode.store(16, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .issue_dispatch(&mut scheduler, &write_token, "owner", "repo", "stale")
+            .await,
+        Err(DispatchError::StaleRef)
+    ));
+    let pending = scheduler.pending_dispatches().unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .find(|p| p.reservation.id == "lost")
+            .unwrap()
+            .state,
+        DispatchState::Sending
+    );
+    assert_eq!(
+        pending
+            .iter()
+            .find(|p| p.reservation.id == "stale")
+            .unwrap()
+            .state,
+        DispatchState::Prepared
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    server.abort();
 }

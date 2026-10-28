@@ -38,6 +38,9 @@ pub struct InstallationToken {
     pub expires_at: String,
     repository_id: u64,
     installation_id: u64,
+    actions_write: bool,
+    app_client_id: String,
+    api_origin: String,
 }
 impl InstallationToken {
     pub fn secret(&self) -> &str {
@@ -129,6 +132,22 @@ impl App {
         installation_id: u64,
         repository_id: u64,
     ) -> Result<InstallationToken, GitHubError> {
+        self.mint_token(installation_id, repository_id, false).await
+    }
+    /// Separate, repository-scoped credential for explicit workflow dispatch.
+    pub async fn dispatch_token(
+        &self,
+        installation_id: u64,
+        repository_id: u64,
+    ) -> Result<InstallationToken, GitHubError> {
+        self.mint_token(installation_id, repository_id, true).await
+    }
+    async fn mint_token(
+        &self,
+        installation_id: u64,
+        repository_id: u64,
+        actions_write: bool,
+    ) -> Result<InstallationToken, GitHubError> {
         if installation_id == 0 || repository_id == 0 {
             return Err(GitHubError::InvalidConfiguration);
         }
@@ -137,14 +156,19 @@ impl App {
             .map_err(|_| GitHubError::Clock)?
             .as_secs();
         let jwt = self.jwt(now)?;
-        let body = RequestBody {
-            repository_ids: [repository_id],
-            permissions: BTreeMap::from([
+        let permissions = if actions_write {
+            BTreeMap::from([("actions", "write"), ("contents", "read")])
+        } else {
+            BTreeMap::from([
                 ("actions", "read"),
                 ("checks", "read"),
                 ("contents", "read"),
                 ("pull_requests", "read"),
-            ]),
+            ])
+        };
+        let body = RequestBody {
+            repository_ids: [repository_id],
+            permissions,
         };
         let url = self
             .api
@@ -187,11 +211,13 @@ impl App {
             || response.expires_at.is_empty()
             || response.repositories.len() != 1
             || response.repositories[0].id != repository_id
-            || response.permissions.values().any(|v| v != "read")
-            || body
+            || response
                 .permissions
-                .keys()
-                .any(|k| response.permissions.get(*k).map(String::as_str) != Some("read"))
+                .iter()
+                .any(|(k, v)| v != "read" && !(actions_write && k == "actions" && v == "write"))
+            || body.permissions.iter().any(|(k, expected)| {
+                response.permissions.get(*k).map(String::as_str) != Some(*expected)
+            })
         {
             return Err(GitHubError::InvalidResponse);
         }
@@ -200,6 +226,9 @@ impl App {
             expires_at: response.expires_at,
             repository_id,
             installation_id,
+            actions_write,
+            app_client_id: self.client_id.clone(),
+            api_origin: self.api.as_str().to_owned(),
         })
     }
 }
@@ -328,6 +357,9 @@ impl App {
         path: &str,
         page: Option<u32>,
     ) -> Result<T, GitHubError> {
+        if token.app_client_id != self.client_id || token.api_origin != self.api.as_str() {
+            return Err(GitHubError::InvalidConfiguration);
+        }
         let mut url = self
             .api
             .join(path)
@@ -654,5 +686,125 @@ impl App {
             }
         }
         Err(GitHubError::UnstableObservation)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DispatchError {
+    #[error("invalid dispatch request or scoped credential")]
+    Invalid,
+    #[error("staging ref no longer identifies the frozen integration commit")]
+    StaleRef,
+    #[error("the dispatch was already claimed or is not prepared")]
+    AlreadyClaimed,
+    #[error("the provider may have accepted the dispatch; reconcile without retrying")]
+    Uncertain,
+    #[error(transparent)]
+    GitHub(#[from] GitHubError),
+    #[error(transparent)]
+    Scheduler(#[from] crate::scheduler::SchedulerError),
+}
+#[derive(Deserialize)]
+struct DispatchRef {
+    #[serde(rename = "ref")]
+    reference: String,
+    object: DispatchObject,
+}
+#[derive(Deserialize)]
+struct DispatchObject {
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+#[derive(Deserialize)]
+struct DispatchReceipt {
+    workflow_run_id: u64,
+}
+impl App {
+    /// Explicit experimental workflow dispatch. Claiming is durable before
+    /// the HTTP POST. No automatic retry occurs after any ambiguous result.
+    /// The caller must separately prove workflow trust and host binding.
+    pub async fn issue_dispatch(
+        &self,
+        scheduler: &mut crate::scheduler::Scheduler,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        id: &str,
+    ) -> Result<u64, DispatchError> {
+        use crate::scheduler::DispatchState;
+        if !token.actions_write || !valid_name(owner) || !valid_name(repository) {
+            return Err(DispatchError::Invalid);
+        }
+        let pending = scheduler
+            .pending_dispatches()?
+            .into_iter()
+            .find(|p| p.reservation.id == id)
+            .ok_or(DispatchError::Invalid)?;
+        if pending.plan.repository_id != token.repository_id
+            || pending.plan.installation_id != token.installation_id
+        {
+            return Err(DispatchError::Invalid);
+        }
+        if pending.state != DispatchState::Prepared {
+            return Err(DispatchError::AlreadyClaimed);
+        }
+        let repo_path = format!("repos/{owner}/{repository}");
+        let observed_repo: Repository = self.get_json(token, &repo_path, None).await?;
+        if observed_repo.id != pending.plan.repository_id {
+            return Err(DispatchError::Invalid);
+        }
+        let short_ref = pending
+            .plan
+            .staging_ref
+            .strip_prefix("refs/")
+            .ok_or(DispatchError::Invalid)?;
+        let ref_path = format!("{repo_path}/git/ref/{short_ref}");
+        let observed_ref: DispatchRef = self.get_json(token, &ref_path, None).await?;
+        if observed_ref.reference != pending.plan.staging_ref
+            || observed_ref.object.kind != "commit"
+            || observed_ref.object.sha != pending.plan.integration_sha
+        {
+            return Err(DispatchError::StaleRef);
+        }
+        if !scheduler.claim_dispatch(id)? {
+            return Err(DispatchError::AlreadyClaimed);
+        }
+        let path = format!(
+            "{repo_path}/actions/workflows/{}/dispatches",
+            pending.plan.workflow_id
+        );
+        let url = self.api.join(&path).map_err(|_| DispatchError::Uncertain)?;
+        let mut response = self
+            .client
+            .post(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10")
+            .bearer_auth(token.secret())
+            .json(&serde_json::json!({"ref": pending.plan.staging_ref}))
+            .send()
+            .await
+            .map_err(|_| DispatchError::Uncertain)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(DispatchError::Uncertain);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| DispatchError::Uncertain)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 65536 {
+                return Err(DispatchError::Uncertain);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let receipt: DispatchReceipt =
+            serde_json::from_slice(&bytes).map_err(|_| DispatchError::Uncertain)?;
+        if receipt.workflow_run_id == 0 {
+            return Err(DispatchError::Uncertain);
+        }
+        scheduler.record_receipt(id, receipt.workflow_run_id)?;
+        Ok(receipt.workflow_run_id)
     }
 }

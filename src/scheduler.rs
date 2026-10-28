@@ -347,6 +347,9 @@ pub enum DispatchState {
     Prepared,
     /// The send may have happened, even if the process crashed before the HTTP request.
     Sending,
+    Accepted {
+        run_id: u64,
+    },
     Observed {
         run_id: u64,
     },
@@ -365,6 +368,37 @@ impl Scheduler {
             "UPDATE dispatch_intents SET state='sending' WHERE id=?1 AND state='prepared'",
             [id],
         )? == 1)
+    }
+    /// Save the direct provider receipt before validating the run details.
+    pub fn record_receipt(&mut self, id: &str, run_id: u64) -> Result<(), SchedulerError> {
+        if run_id == 0 {
+            return Err(SchedulerError::Invalid);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT state,run_id FROM dispatch_intents WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let run = run_id.to_string();
+        match row {
+            Some((state, None)) if state == "sending" => {
+                tx.execute(
+                    "UPDATE dispatch_intents SET state='accepted',run_id=?2 WHERE id=?1",
+                    params![id, run],
+                )?;
+            }
+            Some((state, Some(old)))
+                if (state == "accepted" || state == "observed" || state == "finished")
+                    && old == run => {}
+            _ => return Err(SchedulerError::DispatchTransition),
+        }
+        tx.commit()?;
+        Ok(())
     }
     /// Bind a provider-observed run. The caller must authenticate and verify
     /// the run identity against the frozen plan before recording it.
@@ -388,6 +422,12 @@ impl Scheduler {
                 tx.execute(
                     "UPDATE dispatch_intents SET state='observed',run_id=?2 WHERE id=?1",
                     params![id, run],
+                )?;
+            }
+            Some((state, Some(old))) if state == "accepted" && old == run => {
+                tx.execute(
+                    "UPDATE dispatch_intents SET state='observed' WHERE id=?1",
+                    [id],
                 )?;
             }
             Some((state, Some(old)))
@@ -446,6 +486,13 @@ impl Scheduler {
             let state = match (state.as_str(), run) {
                 ("prepared", None) => DispatchState::Prepared,
                 ("sending", None) => DispatchState::Sending,
+                ("accepted", Some(run)) => DispatchState::Accepted {
+                    run_id: run
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n != 0)
+                        .ok_or(SchedulerError::Corrupt)?,
+                },
                 ("observed", Some(run)) => DispatchState::Observed {
                     run_id: run
                         .parse::<u64>()
