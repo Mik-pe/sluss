@@ -114,11 +114,80 @@ pub(crate) fn inspect_staging_triggers(
     safe.ok_or(InvalidWorkflow)
 }
 
+/// List declared event names only. Filters and job conditions are deliberately
+/// not interpreted; aliases or ambiguous trigger keys remain unknown.
+pub(crate) fn declared_events(bytes: &[u8]) -> Result<BTreeSet<String>, InvalidWorkflow> {
+    let mut cursor = parse(bytes)?;
+    cursor.expect(Event::StreamStart)?;
+    cursor.expect(Event::DocumentStart)?;
+    if !matches!(cursor.take()?, Event::MappingStart(_, None)) {
+        return Err(InvalidWorkflow);
+    }
+    let mut keys = BTreeSet::new();
+    let mut events = None;
+    while !matches!(cursor.peek()?, Event::MappingEnd) {
+        let key = cursor.string_scalar()?;
+        if key == "<<" || !keys.insert(key.clone()) {
+            return Err(InvalidWorkflow);
+        }
+        if key == "on" {
+            events = Some(cursor.event_names()?);
+        } else {
+            cursor.skip_node()?;
+        }
+    }
+    cursor.expect(Event::MappingEnd)?;
+    cursor.expect(Event::DocumentEnd)?;
+    cursor.expect(Event::StreamEnd)?;
+    events.ok_or(InvalidWorkflow)
+}
+
 struct Cursor {
     events: Vec<Event>,
     index: usize,
 }
 impl Cursor {
+    fn event_names(&mut self) -> Result<BTreeSet<String>, InvalidWorkflow> {
+        let mut events = BTreeSet::new();
+        match self.peek()? {
+            Event::Scalar(..) => {
+                events.insert(self.string_scalar()?);
+            }
+            Event::SequenceStart(_, None) => {
+                self.take()?;
+                while !matches!(self.peek()?, Event::SequenceEnd) {
+                    if !events.insert(self.string_scalar()?) {
+                        return Err(InvalidWorkflow);
+                    }
+                }
+                self.expect(Event::SequenceEnd)?;
+            }
+            Event::MappingStart(_, None) => {
+                self.take()?;
+                while !matches!(self.peek()?, Event::MappingEnd) {
+                    let name = self.string_scalar()?;
+                    if name == "<<" || !events.insert(name) {
+                        return Err(InvalidWorkflow);
+                    }
+                    self.skip_node()?;
+                }
+                self.expect(Event::MappingEnd)?;
+            }
+            _ => return Err(InvalidWorkflow),
+        }
+        if events.is_empty()
+            || events.iter().any(|event| {
+                event.is_empty()
+                    || event.len() > 100
+                    || !event
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+        {
+            return Err(InvalidWorkflow);
+        }
+        Ok(events)
+    }
     fn peek(&self) -> Result<&Event, InvalidWorkflow> {
         self.events.get(self.index).ok_or(InvalidWorkflow)
     }
@@ -400,6 +469,33 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_inventory_lists_declarations_and_rejects_ambiguous_keys() {
+        for yaml in [
+            "on: [push, pull_request]\n",
+            "on: {pull_request: {branches: [main]}, push: {}}\n",
+        ] {
+            assert_eq!(
+                declared_events(yaml.as_bytes()).unwrap(),
+                ["pull_request".to_string(), "push".to_string()]
+                    .into_iter()
+                    .collect()
+            );
+        }
+        assert_eq!(
+            declared_events(b"on: workflow_dispatch\n").unwrap(),
+            ["workflow_dispatch".to_string()].into_iter().collect()
+        );
+        for yaml in [
+            "events: &events [push]\non: *events\n",
+            "on: [push, push]\n",
+            "on: {<<: {push: {}}}\n",
+            "on: push\non: pull_request\n",
+            "jobs: {}\n",
+        ] {
+            assert!(declared_events(yaml.as_bytes()).is_err(), "{yaml}");
+        }
+    }
     #[test]
     fn requires_both_string_inputs_without_other_mandatory_inputs() {
         let good = "on: {workflow_dispatch: {inputs: {sluss_host: {type: string}, sluss_suites: {type: string}, note: {type: string, required: false}}}}\n";

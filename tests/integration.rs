@@ -1327,3 +1327,104 @@ fn github_staging_inspects_all_workflows_in_the_exact_integration_commit() {
         );
     }
 }
+
+#[test]
+fn workflow_audit_reads_exact_commit_and_never_creates_a_database() {
+    use sluss::integration::audit_workflows;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-b", "main"]);
+    std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+    std::fs::write(
+        repo.join(".github/workflows/pr.yml"),
+        "on: {pull_request: {branches: [main]}, push: {branches: [main]}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".github/workflows/sluss.yml"),
+        "on: workflow_dispatch\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".github/workflows/unknown.yml"),
+        "events: &events [push]\non: *events\n",
+    )
+    .unwrap();
+    git(repo, &["add", "."]);
+    git(
+        repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "workflows"],
+    );
+    let commit = git(repo, &["rev-parse", "HEAD"]);
+    std::fs::write(
+        repo.join(".github/workflows/pr.yml"),
+        "on: workflow_dispatch\n",
+    )
+    .unwrap();
+    let workflows = audit_workflows(repo, &commit).unwrap();
+    assert_eq!(workflows.len(), 3);
+    assert_eq!(workflows[0].path, ".github/workflows/pr.yml");
+    assert_eq!(
+        workflows[0]
+            .events
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["pull_request", "push"]
+    );
+    assert_eq!(
+        workflows[1]
+            .events
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["workflow_dispatch"]
+    );
+    assert!(workflows[2].events.is_none());
+    let db = repo.join("must-not-exist.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_sluss"))
+        .arg("--db")
+        .arg(&db)
+        .args(["audit-workflows", "--source"])
+        .arg(repo)
+        .args(["--commit", &commit])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("pull_request, push (may start independently of Sluss)"));
+    assert!(text.contains("unknown trigger syntax; inspect manually"));
+    assert!(!db.exists());
+    assert!(audit_workflows(repo, "--help").is_err());
+    std::fs::write(repo.join("link-target"), "pr.yml").unwrap();
+    let blob = git(repo, &["hash-object", "-w", "link-target"]);
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{blob},.github/workflows/link.yml"),
+        ],
+    );
+    git(
+        repo,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "symlinked workflow",
+        ],
+    );
+    let linked_commit = git(repo, &["rev-parse", "HEAD"]);
+    assert!(audit_workflows(repo, &linked_commit).is_err());
+}

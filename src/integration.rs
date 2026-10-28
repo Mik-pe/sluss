@@ -359,7 +359,7 @@ fn valid_staging_id(id: &str) -> bool {
 /// remain independent operator responsibilities.
 #[derive(Debug, Error)]
 pub enum StagingWorkflowError {
-    #[error("invalid staging identifier")]
+    #[error("invalid staging identifier or commit SHA")]
     Invalid,
     #[error("could not safely inspect the integration workflow tree")]
     Tree,
@@ -419,109 +419,145 @@ impl Integration {
             return Err(StagingWorkflowError::Invalid);
         }
         let branch = format!("sluss/{id}");
-        let repo = self.repository();
-        let mut kind = git(&repo);
-        kind.args(["cat-file", "-t", commit]);
-        if bounded_git(kind, 64)? != b"commit\n" {
-            return Err(StagingWorkflowError::Tree);
-        }
-        let mut parent = git(&repo);
-        parent.args([
-            "--literal-pathspecs",
-            "ls-tree",
-            "-z",
-            "--full-tree",
-            commit,
-            "--",
-            ".github",
-        ]);
-        let parent = bounded_git(parent, 1024 * 1024)?;
-        if parent.is_empty() {
-            return Ok(());
-        }
-        let line = parent
-            .strip_suffix(b"\0")
-            .ok_or(StagingWorkflowError::Tree)?;
-        let (mode, kind, _, path) = tree_entry(line)?;
-        if path != ".github" {
-            return Err(StagingWorkflowError::Tree);
-        }
-        if mode != "040000" || kind != "tree" {
-            return Err(StagingWorkflowError::Ambiguous(".github".into()));
-        }
-        let mut root = git(&repo);
-        root.args([
-            "--literal-pathspecs",
-            "ls-tree",
-            "-z",
-            "--full-tree",
-            commit,
-            "--",
-            ".github/workflows",
-        ]);
-        let root = bounded_git(root, 1024 * 1024)?;
-        if root.is_empty() {
-            return Ok(());
-        }
-        let line = root.strip_suffix(b"\0").ok_or(StagingWorkflowError::Tree)?;
-        let (mode, kind, tree, path) = tree_entry(line)?;
-        if mode != "040000" || kind != "tree" || path != ".github/workflows" {
-            return Err(StagingWorkflowError::Tree);
-        }
-        let mut listing = git(&repo);
-        listing.args(["ls-tree", "-z", tree]);
-        let listing = bounded_git(listing, 1024 * 1024)?;
-        if !listing.is_empty() && !listing.ends_with(b"\0") {
-            return Err(StagingWorkflowError::Tree);
-        }
-        if listing.is_empty() {
-            return Ok(());
-        }
-        for (index, line) in listing[..listing.len() - 1].split(|b| *b == 0).enumerate() {
-            if index >= 1000 {
-                return Err(StagingWorkflowError::Tree);
-            }
-            let (mode, kind, sha, name) = tree_entry(line)?;
-            if name.contains('/') {
-                return Err(StagingWorkflowError::Tree);
-            }
-            let lower = name.to_ascii_lowercase();
-            if !lower.ends_with(".yml") && !lower.ends_with(".yaml") {
-                continue;
-            }
-            let path = format!(".github/workflows/{name}");
-            if !matches!(mode, "100644" | "100755") || kind != "blob" {
-                return Err(StagingWorkflowError::Ambiguous(path));
-            }
-            let mut size = git(&repo);
-            size.args(["cat-file", "-s", sha]);
-            let size = bounded_git(size, 64)?;
-            let size = std::str::from_utf8(&size)
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .ok_or(StagingWorkflowError::Tree)?;
-            if size > 256 * 1024 {
-                return Err(StagingWorkflowError::Ambiguous(path));
-            }
-            let mut blob = git(&repo);
-            blob.args(["cat-file", "blob", sha]);
-            let blob = bounded_git(blob, 256 * 1024)?;
-            if blob.len() != size {
-                return Err(StagingWorkflowError::Tree);
-            }
-            match crate::workflow::inspect_staging_triggers(&blob, &branch) {
+        visit_workflows(&self.repository(), commit, |path, blob| {
+            match crate::workflow::inspect_staging_triggers(blob, &branch) {
                 Ok(triggers) if !triggers.create_excluded => {
-                    return Err(StagingWorkflowError::CreateTrigger(path));
+                    Err(StagingWorkflowError::CreateTrigger(path.into()))
                 }
                 Ok(triggers) if !triggers.push_excluded => {
-                    return Err(StagingWorkflowError::PushTrigger(path));
+                    Err(StagingWorkflowError::PushTrigger(path.into()))
                 }
-                Ok(_) => {}
-                Err(_) => return Err(StagingWorkflowError::Ambiguous(path)),
+                Ok(_) => Ok(()),
+                Err(_) => Err(StagingWorkflowError::Ambiguous(path.into())),
             }
-        }
-        Ok(())
+        })
     }
+}
+
+/// An immutable workflow file and its declared events, or unknown syntax.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WorkflowEvents {
+    pub path: String,
+    pub events: Option<std::collections::BTreeSet<String>>,
+}
+
+/// Read direct workflow files from a local commit without creating a database.
+/// This inspects declarations, not provider enablement or actual job execution.
+pub fn audit_workflows(
+    repo: &Path,
+    commit: &str,
+) -> Result<Vec<WorkflowEvents>, StagingWorkflowError> {
+    if !valid_sha(commit) {
+        return Err(StagingWorkflowError::Invalid);
+    }
+    let mut result = Vec::new();
+    visit_workflows(repo, commit, |path, blob| {
+        result.push(WorkflowEvents {
+            path: path.into(),
+            events: crate::workflow::declared_events(blob).ok(),
+        });
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+fn visit_workflows(
+    repo: &Path,
+    commit: &str,
+    mut visit: impl FnMut(&str, &[u8]) -> Result<(), StagingWorkflowError>,
+) -> Result<(), StagingWorkflowError> {
+    let mut kind = git(repo);
+    kind.args(["cat-file", "-t", commit]);
+    if bounded_git(kind, 64)? != b"commit\n" {
+        return Err(StagingWorkflowError::Tree);
+    }
+    let mut parent = git(repo);
+    parent.args([
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        commit,
+        "--",
+        ".github",
+    ]);
+    let parent = bounded_git(parent, 1024 * 1024)?;
+    if parent.is_empty() {
+        return Ok(());
+    }
+    let line = parent
+        .strip_suffix(b"\0")
+        .ok_or(StagingWorkflowError::Tree)?;
+    let (mode, kind, _, path) = tree_entry(line)?;
+    if path != ".github" {
+        return Err(StagingWorkflowError::Tree);
+    }
+    if mode != "040000" || kind != "tree" {
+        return Err(StagingWorkflowError::Ambiguous(".github".into()));
+    }
+    let mut root = git(repo);
+    root.args([
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        commit,
+        "--",
+        ".github/workflows",
+    ]);
+    let root = bounded_git(root, 1024 * 1024)?;
+    if root.is_empty() {
+        return Ok(());
+    }
+    let line = root.strip_suffix(b"\0").ok_or(StagingWorkflowError::Tree)?;
+    let (mode, kind, tree, path) = tree_entry(line)?;
+    if mode != "040000" || kind != "tree" || path != ".github/workflows" {
+        return Err(StagingWorkflowError::Tree);
+    }
+    let mut listing = git(repo);
+    listing.args(["ls-tree", "-z", tree]);
+    let listing = bounded_git(listing, 1024 * 1024)?;
+    if !listing.is_empty() && !listing.ends_with(b"\0") {
+        return Err(StagingWorkflowError::Tree);
+    }
+    if listing.is_empty() {
+        return Ok(());
+    }
+    for (index, line) in listing[..listing.len() - 1].split(|b| *b == 0).enumerate() {
+        if index >= 1000 {
+            return Err(StagingWorkflowError::Tree);
+        }
+        let (mode, kind, sha, name) = tree_entry(line)?;
+        if name.contains('/') {
+            return Err(StagingWorkflowError::Tree);
+        }
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".yml") && !lower.ends_with(".yaml") {
+            continue;
+        }
+        let path = format!(".github/workflows/{name}");
+        if !matches!(mode, "100644" | "100755") || kind != "blob" {
+            return Err(StagingWorkflowError::Ambiguous(path));
+        }
+        let mut size = git(repo);
+        size.args(["cat-file", "-s", sha]);
+        let size = bounded_git(size, 64)?;
+        let size = std::str::from_utf8(&size)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .ok_or(StagingWorkflowError::Tree)?;
+        if size > 256 * 1024 {
+            return Err(StagingWorkflowError::Ambiguous(path));
+        }
+        let mut blob = git(repo);
+        blob.args(["cat-file", "blob", sha]);
+        let blob = bounded_git(blob, 256 * 1024)?;
+        if blob.len() != size {
+            return Err(StagingWorkflowError::Tree);
+        }
+        visit(&path, &blob)?;
+    }
+    Ok(())
 }
 
 /// Result of publishing an integration to a temporary staging branch. This

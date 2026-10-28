@@ -80,6 +80,15 @@ enum Command {
     },
     /// Reconcile one pending repository wakeup without starting CI.
     Reconcile(ReconcileArgs),
+    /// Inspect workflow event declarations from a local Git commit.
+    AuditWorkflows {
+        /// Repository containing the commit to inspect.
+        #[arg(long)]
+        source: PathBuf,
+        /// Full commit SHA to inspect.
+        #[arg(long)]
+        commit: String,
+    },
     /// Select suites from an operator-controlled policy and a Git diff.
     Select {
         #[arg(long)]
@@ -629,6 +638,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<_, sluss::github::GitHubError>(app)
     };
+    if let Command::AuditWorkflows { source, commit } = &cli.command {
+        let workflows = sluss::integration::audit_workflows(source, commit)?;
+        println!("Workflow event declarations at {commit}:");
+        for workflow in &workflows {
+            match &workflow.events {
+                Some(events) => {
+                    let independently_triggered =
+                        events.iter().any(|event| event != "workflow_dispatch");
+                    println!(
+                        "{}: {}{}",
+                        workflow.path,
+                        events.iter().cloned().collect::<Vec<_>>().join(", "),
+                        if independently_triggered {
+                            " (may start independently of Sluss)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                None => println!(
+                    "{}: unknown trigger syntax; inspect manually",
+                    workflow.path
+                ),
+            }
+        }
+        println!(
+            "{} workflow file(s) inspected. Event declarations do not establish provider enablement, filters, job conditions, runner use or complete CI coverage; other actors can also dispatch workflows.",
+            workflows.len()
+        );
+        return Ok(());
+    }
     if let Command::AppRegistrationUrl {
         name,
         organization,
@@ -1922,6 +1962,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Serve { .. } => unreachable!(),
         Command::Reconcile(_) => unreachable!(),
+        Command::AuditWorkflows { .. } => unreachable!(),
         Command::FindDispatchRuns { .. } => unreachable!(),
         Command::PrepareLandingMarker { .. } => unreachable!(),
         Command::CreateLandingMarker { .. } => unreachable!(),

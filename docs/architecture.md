@@ -20,3 +20,5 @@ Two operation modes have distinct contracts: CI-only does not publish merge auth
 4. Measure actual runner minutes, queue latency, retries and landed PRs in a real pilot. The targets of 30% fewer runner minutes per merged PR and zero incorrectly authorized merges are acceptance goals, not measured results.
 
 Real-world results, native runners, provider permissions, branch rules and Ugla-specific integration are separate acceptance work. No Ugla-specific rules belong in Sluss itself.
+
+The `audit-workflows` command lists event declarations from direct workflow files in an explicitly supplied local commit. It reports unknown syntax instead of treating it as safe and helps operators identify PR and push workflows that may start alongside Sluss. Filters, enabled state, workflow semantics, other actors and external CI remain outside its evidence; it does not alter workflows or establish that any particular build is duplicate. Git may fetch missing objects in a partial clone.
