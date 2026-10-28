@@ -426,6 +426,18 @@ impl App {
         Ok(())
     }
 
+    async fn spawn_github_git<F, T>(
+        &self,
+        operation: F,
+    ) -> Result<Result<T, tokio::task::JoinError>, GitHubError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.check_rate_limit().await?;
+        Ok(tokio::task::spawn_blocking(operation).await)
+    }
+
     async fn defer_requests(&self, delay: Duration) -> Result<(), GitHubError> {
         {
             let mut gate = self
@@ -3927,10 +3939,10 @@ impl App {
         let target = target.to_owned();
         let batch = batch.clone();
         let secret = token.secret().to_owned();
-        tokio::task::spawn_blocking(move || {
+        self.spawn_github_git(move || {
             crate::integration::fetch_github(&owner, &repository, &target, &batch, &secret)
         })
-        .await
+        .await?
         .map_err(|_| InputFetchError::Worker)?
         .map_err(InputFetchError::Fetch)
     }
@@ -3979,12 +3991,10 @@ impl App {
         let repository = repository.to_owned();
         let id = id.to_owned();
         let secret = token.secret().to_owned();
-        tokio::task::spawn_blocking(move || {
-            integration.stage_github(&owner, &repository, &secret, &id)
-        })
-        .await
-        .map_err(|_| StagingError::Worker)?
-        .map_err(StagingError::Git)
+        self.spawn_github_git(move || integration.stage_github(&owner, &repository, &secret, &id))
+            .await?
+            .map_err(|_| StagingError::Worker)?
+            .map_err(StagingError::Git)
     }
 }
 
@@ -5011,7 +5021,7 @@ impl App {
 
 #[cfg(test)]
 mod rate_limit_tests {
-    use super::rate_limit_delay;
+    use super::{App, GitHubError, RateLimitGate, rate_limit_delay};
     use reqwest::{
         StatusCode,
         header::{HeaderMap, HeaderValue, RETRY_AFTER},
@@ -5052,6 +5062,52 @@ mod rate_limit_tests {
             rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, &headers, false, 1_000),
             Some(Duration::from_secs(u64::MAX))
         );
+    }
+
+    #[tokio::test]
+    async fn shared_gate_prevents_git_work_until_the_saved_deadline_clears() {
+        use std::sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("queue.sqlite");
+        let _inbox = crate::webhook::Inbox::open(&db).unwrap();
+        let app = || App {
+            client_id: "test".into(),
+            key: jsonwebtoken::EncodingKey::from_secret(b"unused"),
+            client: reqwest::Client::new(),
+            api: reqwest::Url::parse("http://127.0.0.1/").unwrap(),
+            rate_limit: Mutex::new(RateLimitGate::Open),
+            shared_rate_limit: OnceLock::new(),
+        };
+        let first = app();
+        let second = app();
+        first.enable_shared_rate_limits(&db).unwrap();
+        second.enable_shared_rate_limits(&db).unwrap();
+        first.defer_requests(Duration::from_secs(60)).await.unwrap();
+        let executed = Arc::new(AtomicBool::new(false));
+        let flag = executed.clone();
+        assert!(matches!(
+            second
+                .spawn_github_git(move || flag.store(true, Ordering::SeqCst))
+                .await,
+            Err(GitHubError::RateLimited)
+        ));
+        assert!(!executed.load(Ordering::SeqCst));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE github_rate_limit_gate SET observed_ms=0,until_ms=0",
+            [],
+        )
+        .unwrap();
+        let flag = executed.clone();
+        second
+            .spawn_github_git(move || flag.store(true, Ordering::SeqCst))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(executed.load(Ordering::SeqCst));
     }
 }
 

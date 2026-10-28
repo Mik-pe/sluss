@@ -191,3 +191,42 @@ fn invalid_worker_configuration_fails_before_creating_the_database() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one registered runner"));
     assert!(!db.exists());
 }
+
+#[test]
+fn status_reports_the_saved_rate_gate_and_legacy_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let _store = sluss::store::Store::open(&db).unwrap();
+    let status = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sluss"))
+            .arg("--db")
+            .arg(&db)
+            .arg("status")
+            .output()
+            .unwrap()
+    };
+    let legacy = status();
+    assert!(legacy.status.success());
+    assert!(String::from_utf8_lossy(&legacy.stdout).contains("shared rate gate: not initialized"));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE github_rate_limit_gate(id INTEGER PRIMARY KEY, observed_ms INTEGER NOT NULL, until_ms INTEGER NOT NULL)").unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+    conn.execute(
+        "INSERT INTO github_rate_limit_gate VALUES(1,?1,?2)",
+        rusqlite::params![now, now + 60_000],
+    )
+    .unwrap();
+    let deferred = status();
+    assert!(deferred.status.success());
+    assert!(String::from_utf8_lossy(&deferred.stdout).contains("shared rate gate: deferred until"));
+    conn.execute(
+        "UPDATE github_rate_limit_gate SET observed_ms=?1,until_ms=?1",
+        [now + 60_000],
+    )
+    .unwrap();
+    let backward = status();
+    assert!(backward.status.success());
+    assert!(
+        String::from_utf8_lossy(&backward.stdout).contains("system clock precedes recorded time")
+    );
+}

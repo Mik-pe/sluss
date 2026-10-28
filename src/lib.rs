@@ -25,5 +25,5 @@ pub mod verification;
 pub mod webhook;
 pub mod worker;
 
-mod rate_limit;
+pub mod rate_limit;
 mod workflow;

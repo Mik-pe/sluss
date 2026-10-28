@@ -2644,6 +2644,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store.paused()?,
                 store.candidates()?.len()
             );
+            use sluss::rate_limit::SharedStatus;
+            let timestamp = |value| {
+                format_unix_ms(value).unwrap_or_else(|_| format!("{value} ms since Unix epoch"))
+            };
+            match sluss::rate_limit::inspect(&cli.db) {
+                Ok(SharedStatus::Uninitialized) => {
+                    println!("GitHub API shared rate gate: not initialized")
+                }
+                Ok(SharedStatus::Open) => println!("GitHub API shared rate gate: open"),
+                Ok(SharedStatus::Deferred { until_ms }) => println!(
+                    "GitHub API shared rate gate: deferred until {}",
+                    timestamp(until_ms)
+                ),
+                Ok(SharedStatus::ClockBehind { observed_ms }) => println!(
+                    "GitHub API shared rate gate: blocked; system clock precedes recorded time {}",
+                    timestamp(observed_ms)
+                ),
+                Ok(SharedStatus::Indefinite) => {
+                    println!("GitHub API shared rate gate: blocked indefinitely")
+                }
+                Err(_) => println!(
+                    "GitHub API shared rate gate: unavailable; coordinated requests fail closed"
+                ),
+            }
+            println!("Shared rate-gate status excludes process-local limits and other databases.");
             if let Some(digest) = store.repository_policy_digest()? {
                 println!(
                     "admission policy digest: {digest}; revision: {}",
