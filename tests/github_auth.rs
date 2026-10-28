@@ -9135,3 +9135,6 @@ async fn default_workflow_blob(
         "size":size, "encoding":"base64",
         "content":if mode==252 {"invalid?"} else {encoded.as_str()}}))
 }
+
+#[path = "github_auth/real_git_scenario.rs"]
+mod real_git_scenario;
