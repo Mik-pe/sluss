@@ -6,7 +6,7 @@ Sluss is intended to be a small, open-source CI orchestrator and merge queue for
 
 ## Status: early development
 
-The current development preview contains a durable SQLite queue, batch state machine, physical-host reservations, a Git integration builder, authenticated GitHub App reconciliation, and optional workers for planning, staging, dispatch and observation. These paths have not been validated end-to-end against a real GitHub App and runner. The service and CLI do not establish trusted CI attestation or update target branches, and the project is not ready for production or a pilot. A `Verified` state is not merge authorization; `doctor` exits unsuccessfully until the required checks exist. The writable SQLite connections require WAL and `synchronous=FULL`; they fail if WAL cannot be enabled. Use a filesystem that supports SQLite WAL and preserves sync semantics. Power-loss behavior has not been tested on a target deployment.
+The current development preview contains a durable SQLite queue, batch state machine, physical-host reservations, a Git integration builder, authenticated GitHub App reconciliation, and optional workers for planning, staging, dispatch and observation. These paths have not been validated end-to-end against a real GitHub App and runner. The service and CLI do not establish trusted CI attestation or update target branches, and the project is not ready for production or a pilot. A `Verified` state is not merge authorization; the strict `doctor` exits unsuccessfully until the required checks exist. The writable SQLite connections require WAL and `synchronous=FULL`; they fail if WAL cannot be enabled. Use a filesystem that supports SQLite WAL and preserves sync semantics. Power-loss behavior has not been tested on a target deployment.
 
 The experimental landing journal can freeze and create a per-operation receipt ref, then record its observed SHA after an uncertain landing. Creation uses a separately scoped App token and a durable one-shot journal; an ambiguous result is not retried. These App paths are tested with a stub only. Sluss does not send a landing mutation, resolve uncertain sends or authorize a merge based on the marker. See the [protocol](docs/protocol.md).
 
@@ -52,6 +52,16 @@ cargo run -- doctor
 ```
 
 `sluss doctor --config /path/to/sluss.toml --capacity /path/to/capacity.toml --workflow-id <id>` inspects the configured branch, active rules, visible ruleset bypass actors, classic branch protection, workflow registration, repository runner inventory, App token scopes and available GraphQL ref-update schema fields. It checks the registered workflow's regular Git blob and `workflow_dispatch` declaration with the two Sluss string inputs on both the stable default branch and selected target, and checks the App's JWT-authenticated identity against visible bypass actors. It rejects additional required inputs but does not validate the workflow schema, job semantics or trust. Hidden bypass lists and inaccessible classic protection are reported as unknown. It still exits unsuccessfully because those observations do not establish all prerequisites for strict landing. The command has only been tested with a local GitHub stub; the separate GraphQL ref-update probes described in the protocol used a user credential and temporary unprotected branches. The opt-in [`scripts/probe-github-cas.py`](scripts/probe-github-cas.py) can repeat a concurrent-writer experiment on an operator-selected repository; it creates temporary refs and is not a production landing test.
+
+For a CI-only preflight, supply the same workflow, pool, required job and policy-file settings you intend to use for staging and dispatch:
+
+```sh
+sluss doctor --ci-only --config /path/to/sluss.toml --capacity /path/to/capacity.toml \
+  --workflow-id 17 --pool rust=1 --required-job test \
+  --policy-file .github/workflows/sluss-ci.yml
+```
+
+This checks the App identity and scoped read, staging and Actions credentials, the registered workflow and its dispatch inputs on the stable default and target branches, the declared workflow path, and at least one currently idle configured host satisfying the requested pools. It exits successfully only for the supported GitHub.com API origin after those checks pass. This is a point-in-time diagnostic, not proof that Git push or workflow execution will succeed: it does not verify workflow semantics, policy completeness, branch permissions, organization or enterprise runners, host isolation or later availability. It cannot authorize landing. `--verification-policy` can additionally validate a selection-policy file. The path has only been exercised against a local stub, which is deliberately rejected as a Git staging origin.
 
 To try webhook intake locally, set `SLUSS_WEBHOOK_SECRET` in the environment and run `cargo run -- serve`. It listens on `127.0.0.1:8080` by default; `--listen` changes the address. External traffic requires a trusted HTTPS reverse proxy. Without configuration, this only records deliveries.
 

@@ -7487,6 +7487,68 @@ async fn cli_dispatches_fixture() {
             .contains("reviews, PR metadata and branch policy are not atomically guarded")
     );
     assert!(!info.contains("fake-installation-token"));
+    // CI-only diagnostics do not require a merge bypass or branch-rule reads.
+    mode.store(65, Ordering::SeqCst);
+    reads.store(0, Ordering::SeqCst);
+    let ci = fixture_app
+        .inspect_ci_repository(&fixture_token, "owner", "repo", "main", 17)
+        .await
+        .unwrap();
+    assert_eq!(ci.workflow.path, ".github/workflows/ci.yml");
+    assert_eq!(ci.branch.commit.sha, "b".repeat(40));
+    let ci_args = || {
+        vec![
+            "doctor".into(),
+            "--ci-only".into(),
+            "--config".into(),
+            config.to_str().unwrap().into(),
+            "--capacity".into(),
+            capacity.to_str().unwrap().into(),
+            "--workflow-id".into(),
+            "17".into(),
+            "--pool".into(),
+            "rust=1".into(),
+            "--required-job".into(),
+            "job-1-0".into(),
+            "--policy-file".into(),
+            ".github/workflows/ci.yml".into(),
+        ]
+    };
+    let ci_doctor = launch(ci_args()).await.unwrap();
+    // Stub API origins are intentionally unsuitable for authenticated Git staging.
+    assert!(!ci_doctor.status.success());
+    let ci_output = String::from_utf8_lossy(&ci_doctor.stdout);
+    assert!(ci_output.contains("CI-only provider checks: App sluss-test"));
+    assert!(ci_output.contains("eligible idle configured hosts: 1"));
+    let ci_error = String::from_utf8_lossy(&ci_doctor.stderr);
+    assert!(ci_error.contains("no merge authorization"));
+    assert!(ci_error.contains("Git staging is unsupported for this API origin"));
+    assert!(!ci_output.contains("fake-installation-token"));
+    mode.store(41, Ordering::SeqCst);
+    let busy = launch(ci_args()).await.unwrap();
+    assert!(!busy.status.success());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("no idle configured host"));
+    mode.store(0, Ordering::SeqCst);
+    let mut wrong_policy = ci_args();
+    *wrong_policy.last_mut().unwrap() = ".github/workflows/other.yml".into();
+    let wrong_policy = launch(wrong_policy).await.unwrap();
+    assert!(!wrong_policy.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_policy.stderr).contains("workflow path must be included")
+    );
+    let mut impossible = ci_args();
+    let pool_index = impossible.iter().position(|arg| arg == "rust=1").unwrap();
+    impossible[pool_index] = "rust=2".into();
+    let impossible = launch(impossible).await.unwrap();
+    assert!(!impossible.status.success());
+    assert!(
+        String::from_utf8_lossy(&impossible.stderr).contains("unsatisfiable dispatch capacity")
+    );
+    reads.store(0, Ordering::SeqCst);
+    mode.store(30, Ordering::SeqCst);
+    let ci_changed = launch(ci_args()).await.unwrap();
+    assert!(!ci_changed.status.success());
+    assert!(String::from_utf8_lossy(&ci_changed.stderr).contains("UnstableObservation"));
     reads.store(0, Ordering::SeqCst);
     mode.store(30, Ordering::SeqCst);
     let unstable_doctor = launch(vec![

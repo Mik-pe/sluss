@@ -520,6 +520,20 @@ enum Command {
         capacity: Option<PathBuf>,
         #[arg(long, requires_all = ["config", "capacity"])]
         workflow_id: Option<u64>,
+        /// Inspect CI-only prerequisites without claiming merge readiness.
+        #[arg(long, requires_all = ["config", "capacity", "workflow_id"])]
+        ci_only: bool,
+        /// CI-only resource request, in name=count form.
+        #[arg(long, requires = "ci_only")]
+        pool: Vec<String>,
+        /// Expected CI job name; may be repeated.
+        #[arg(long, requires = "ci_only")]
+        required_job: Vec<String>,
+        /// Operator-reviewed policy file path; may be repeated.
+        #[arg(long, requires = "ci_only")]
+        policy_file: Vec<String>,
+        #[arg(long, requires = "ci_only")]
+        verification_policy: Option<PathBuf>,
     },
 }
 
@@ -969,37 +983,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dispatch_settings = if auto_dispatch {
             let capacity = capacity_config.as_ref().ok_or("capacity is required")?;
             let workflow_id = workflow_id.ok_or("workflow ID is required")?;
-            let jobs: std::collections::BTreeSet<_> = required_job.into_iter().collect();
-            let pools = parse_pools(&pool)?;
-            if workflow_id == 0
-                || jobs.is_empty()
-                || jobs.len() > 100
-                || jobs.iter().any(|name: &String| {
-                    name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
-                })
-                || capacity
-                    .hosts
-                    .keys()
-                    .any(|name| !sluss::github::valid_runner_label(name))
-                || pools.iter().any(|(name, amount)| {
-                    capacity.pools.get(name).is_none_or(|limit| amount > limit)
-                })
-                || !capacity.hosts.values().any(|host| {
-                    pools.iter().all(|(name, amount)| {
-                        host.pools.get(name).is_some_and(|limit| amount <= limit)
-                    })
-                })
-            {
-                return Err(
-                    "invalid workflow, required jobs or unsatisfiable dispatch capacity".into(),
-                );
-            }
-            Some(sluss::dispatch::Settings {
+            Some(build_dispatch_settings(
+                capacity,
                 workflow_id,
-                required_jobs: jobs,
-                request: sluss::scheduler::Request { pools },
-                verification_policy: verification_policy.clone(),
-            })
+                required_job,
+                &pool,
+                verification_policy.clone(),
+            )?)
         } else {
             None
         };
@@ -1203,8 +1193,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         capacity,
         workflow_id,
+        ci_only,
+        pool,
+        required_job,
+        policy_file,
+        verification_policy,
     } = &cli.command
     {
+        if *ci_only {
+            let config =
+                sluss::config::Config::load(config.as_ref().ok_or("configuration is required")?)?;
+            let capacity = load_capacity(capacity.as_ref().ok_or("capacity is required")?)?;
+            sluss::scheduler::validate_capacity(&capacity)?;
+            let workflow_id = workflow_id.ok_or("workflow ID is required")?;
+            let settings = build_dispatch_settings(
+                &capacity,
+                workflow_id,
+                required_job.clone(),
+                pool,
+                verification_policy.clone(),
+            )?;
+            if let Some(path) = verification_policy {
+                sluss::selective::Policy::load(path)?;
+            }
+            let paths: std::collections::BTreeSet<_> = policy_file.iter().collect();
+            if paths.is_empty()
+                || paths.len() != policy_file.len()
+                || paths.len() > 128
+                || paths
+                    .iter()
+                    .any(|path| !sluss::integration::valid_policy_path(path))
+            {
+                return Err("invalid or duplicate CI policy paths".into());
+            }
+            let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
+                .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
+            let app = new_cli_app(
+                config.github.app_client_id,
+                &std::fs::read(key_path)?,
+                &config.github.api,
+            )?;
+            let identity = app.observe_app_identity().await?;
+            let installation = config.github.installation_id as u64;
+            let repository = config.github.repository_id as u64;
+            let read = app.read_token(installation, repository).await?;
+            let inventory = app.runner_inventory_token(installation, repository).await?;
+            let preflight = app
+                .inspect_ci_repository(
+                    &read,
+                    &config.github.owner,
+                    &config.github.repository,
+                    &config.queue.target,
+                    workflow_id,
+                )
+                .await?;
+            if !paths.contains(&preflight.workflow.path) {
+                return Err("workflow path must be included in --policy-file".into());
+            }
+            let runners = app
+                .observe_repository_runners(
+                    &inventory,
+                    &config.github.owner,
+                    &config.github.repository,
+                )
+                .await?;
+            let available = sluss::verification::available_repository_hosts(&capacity, &runners)?;
+            let eligible: Vec<_> = available
+                .iter()
+                .filter(|name| {
+                    settings.request.pools.iter().all(|(pool, count)| {
+                        capacity.hosts[*name]
+                            .pools
+                            .get(pool)
+                            .is_some_and(|limit| count <= limit)
+                    })
+                })
+                .collect();
+            if eligible.is_empty() {
+                return Err("no idle configured host satisfies the requested pools".into());
+            }
+            let _staging = app.staging_token(installation, repository).await?;
+            let _dispatch = app.dispatch_token(installation, repository).await?;
+            println!(
+                "CI-only provider checks: App {} (ID {}), {}/{} (ID {}), target {} at {}",
+                identity.slug,
+                identity.id,
+                config.github.owner,
+                config.github.repository,
+                repository,
+                preflight.branch.name,
+                preflight.branch.commit.sha
+            );
+            println!(
+                "workflow {} ({}) has compatible dispatch inputs on {} and {}",
+                preflight.workflow.id,
+                preflight.workflow.path,
+                preflight.default_workflow.branch,
+                preflight.branch.name
+            );
+            println!("eligible idle configured hosts: {}", eligible.len());
+            println!("read, staging and Actions tokens issued for the configured repository");
+            eprintln!(
+                "CI-only diagnostic: no merge authorization; workflow trust, runner isolation, branch permissions and live execution are not established."
+            );
+            if !app.supports_github_git() {
+                return Err("Git staging is unsupported for this API origin".into());
+            }
+            return Ok(());
+        }
         if let (Some(config), Some(capacity), Some(workflow_id)) = (config, capacity, workflow_id) {
             let config = sluss::config::Config::load(config)?;
             let capacity = load_capacity(capacity)?;
@@ -2898,6 +2994,44 @@ fn format_unix_ms(value: i64) -> Result<String, Box<dyn std::error::Error>> {
             .format(&time::format_description::well_known::Rfc3339)?,
     )
 }
+fn build_dispatch_settings(
+    capacity: &sluss::scheduler::Capacity,
+    workflow_id: u64,
+    required_job: Vec<String>,
+    pool: &[String],
+    verification_policy: Option<PathBuf>,
+) -> Result<sluss::dispatch::Settings, Box<dyn std::error::Error>> {
+    let jobs: std::collections::BTreeSet<_> = required_job.into_iter().collect();
+    let pools = parse_pools(pool)?;
+    if workflow_id == 0
+        || jobs.is_empty()
+        || jobs.len() > 100
+        || jobs.iter().any(|name: &String| {
+            name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+        })
+        || capacity
+            .hosts
+            .keys()
+            .any(|name| !sluss::github::valid_runner_label(name))
+        || pools
+            .iter()
+            .any(|(name, amount)| capacity.pools.get(name).is_none_or(|limit| amount > limit))
+        || !capacity.hosts.values().any(|host| {
+            pools
+                .iter()
+                .all(|(name, amount)| host.pools.get(name).is_some_and(|limit| amount <= limit))
+        })
+    {
+        return Err("invalid workflow, required jobs or unsatisfiable dispatch capacity".into());
+    }
+    Ok(sluss::dispatch::Settings {
+        workflow_id,
+        required_jobs: jobs,
+        request: sluss::scheduler::Request { pools },
+        verification_policy,
+    })
+}
+
 fn parse_pools(
     values: &[String],
 ) -> Result<std::collections::BTreeMap<String, u32>, Box<dyn std::error::Error>> {

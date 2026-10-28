@@ -4156,6 +4156,13 @@ pub struct DefaultWorkflowPresence {
     pub blob_sha: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRepositoryPreflight {
+    pub branch: BranchInfo,
+    pub workflow: WorkflowInfo,
+    pub default_workflow: DefaultWorkflowPresence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryPreflight {
     pub branch: BranchInfo,
     pub workflow: WorkflowInfo,
@@ -4769,6 +4776,45 @@ impl App {
             return Err(GitHubError::UnstableObservation);
         }
         Ok(())
+    }
+
+    /// Check the provider-visible workflow needed for CI-only dispatch. These
+    /// repeated reads do not establish workflow trust or authorize landing.
+    pub async fn inspect_ci_repository(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+        workflow_id: u64,
+    ) -> Result<CiRepositoryPreflight, GitHubError> {
+        let first = self
+            .observe_target_branch(token, owner, repository, branch)
+            .await?;
+        let workflow = self
+            .observe_registered_workflow(token, owner, repository, workflow_id)
+            .await?;
+        let default_workflow = self
+            .observe_default_workflow(token, owner, repository, &workflow)
+            .await?;
+        let target_blob = self
+            .workflow_blob_at_commit(token, owner, repository, &first.commit.sha, &workflow.path)
+            .await?;
+        self.verify_dispatch_trigger(token, owner, repository, &target_blob)
+            .await?;
+        self.recheck_default_workflow(token, owner, repository, &workflow, &default_workflow)
+            .await?;
+        let last = self
+            .observe_target_branch(token, owner, repository, branch)
+            .await?;
+        if first != last {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(CiRepositoryPreflight {
+            branch: last,
+            workflow,
+            default_workflow,
+        })
     }
 
     /// Inspect current branch, workflow registration and active branch rules.
