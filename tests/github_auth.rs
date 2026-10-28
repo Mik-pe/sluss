@@ -5385,6 +5385,88 @@ async fn cli_dispatches_fixture() {
         && item.state == sluss::scheduler::DispatchState::Prepared));
     assert!(pending.iter().any(|item| item.reservation.id == id
         && item.state == (sluss::scheduler::DispatchState::Accepted { run_id: 123 })));
+    // The lane worker likewise skips a batch with a stale staging ref and
+    // can send a different batch whose already-reserved host is available.
+    posts.store(0, Ordering::SeqCst);
+    mode.store(151, Ordering::SeqCst);
+    let lane_db = data.path().join("lane-stale-ref.sqlite");
+    let mut lane_inbox = Inbox::open(&lane_db).unwrap();
+    let mut lane_store = Store::open(&lane_db).unwrap();
+    lane_inbox
+        .record("lane-stale-queue", "pull_request", &[10; 32], 42, 7)
+        .unwrap();
+    let lane_event = lane_inbox.pending().unwrap().remove(0);
+    sluss::reconcile::reconcile_once(
+        &fixture_app,
+        &fixture_token,
+        &mut lane_store,
+        &lane_event,
+        &fixture_policy,
+    )
+    .await
+    .unwrap();
+    for batch_id in [pinned_id, id] {
+        lane_store
+            .plan_batch(batch_id, &"b".repeat(40), 1, 2)
+            .unwrap()
+            .unwrap();
+        lane_store
+            .bind_policy_paths(batch_id, &[".github/workflows/ci.yml".into()])
+            .unwrap();
+        lane_store.start_integration(batch_id).unwrap();
+        lane_store
+            .finish_integration(batch_id, &"a".repeat(40), &"e".repeat(64))
+            .unwrap();
+    }
+    let lane_path = data.path().join("stale-lanes.toml");
+    std::fs::write(&lane_path, "version=1\n[lanes.full]\nworkflow_id=17\nsuites=['full']\nrequired_jobs=['job-1-0']\n[lanes.full.request.pools]\nrust=1\n").unwrap();
+    let lane_settings = sluss::dispatch::LaneSettings {
+        policy: lane_path,
+        verification_policy: None,
+    };
+    mode.store(152, Ordering::SeqCst);
+    let error = sluss::worker::dispatch_lanes_once(
+        &fixture_app,
+        &lane_db,
+        &fixture_policy,
+        &independent_capacity,
+        &lane_settings,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("changed staging ref"));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    let lane_scheduler =
+        sluss::scheduler::Scheduler::open(&lane_db, independent_capacity.clone()).unwrap();
+    assert_eq!(lane_scheduler.pending_dispatches().unwrap().len(), 2);
+    mode.store(151, Ordering::SeqCst);
+    assert_eq!(
+        sluss::worker::dispatch_lanes_once(
+            &fixture_app,
+            &lane_db,
+            &fixture_policy,
+            &independent_capacity,
+            &lane_settings
+        )
+        .await
+        .unwrap(),
+        Some(sluss::dispatch::Outcome::Sent {
+            run: 123,
+            host: "sluss-host-test".into()
+        })
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert!(
+        lane_scheduler
+            .pending_dispatches()
+            .unwrap()
+            .iter()
+            .any(
+                |item| item.reservation.id == format!("{pinned_id}:lane:full")
+                    && item.state == sluss::scheduler::DispatchState::Prepared
+            )
+    );
+
     // A changed ref in the first batch cannot block an unrelated batch. Both
     // prepared reservations remain pinned until their normal recovery paths.
     posts.store(0, Ordering::SeqCst);

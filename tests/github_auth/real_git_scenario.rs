@@ -886,10 +886,10 @@ async fn two_host_scenario(fail_mac: bool) {
     drop(store);
     for _ in 0..2 {
         assert!(matches!(
-            sluss::dispatch::batch_lanes(&db, &app, &policy, &capacity, &settings, id)
+            sluss::worker::dispatch_lanes_once(&app, &db, &policy, &capacity, &settings)
                 .await
                 .unwrap(),
-            sluss::dispatch::Outcome::Sent { .. }
+            Some(sluss::dispatch::Outcome::Sent { .. })
         ));
     }
     assert_eq!(posts.load(Ordering::SeqCst), 2);

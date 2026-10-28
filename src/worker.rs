@@ -1102,6 +1102,7 @@ pub async fn dispatch_lanes_once(
         return Ok(None);
     }
     let mut no_capacity = false;
+    let mut stale_ref = None;
     for batch in store.active_batches().map_err(|e| e.to_string())? {
         if !matches!(batch.state, State::Testing { .. }) {
             continue;
@@ -1110,8 +1111,16 @@ pub async fn dispatch_lanes_once(
             Ok(sent @ crate::dispatch::Outcome::Sent { .. }) => return Ok(Some(sent)),
             Ok(crate::dispatch::Outcome::NoCapacity) => no_capacity = true,
             Ok(crate::dispatch::Outcome::AlreadyStarted) => {}
+            Err(crate::dispatch::Error::Dispatch(crate::github::DispatchError::StaleRef)) => {
+                let error = format!("batch {} has a changed staging ref", batch.id);
+                eprintln!("automatic lane dispatch skipped: {error}");
+                stale_ref.get_or_insert(error);
+            }
             Err(error) => return Err(error.to_string()),
         }
+    }
+    if let Some(error) = stale_ref {
+        return Err(error);
     }
     Ok(no_capacity.then_some(crate::dispatch::Outcome::NoCapacity))
 }
