@@ -554,6 +554,38 @@ enum AppProfile {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // Commands which update the queue or its journals use the same durable
+    // provider gate as `serve`. Inspection-only commands remain read-only.
+    let share_rate_limit = matches!(
+        &cli.command,
+        Command::Reconcile(_)
+            | Command::FreezeLandingHeads { .. }
+            | Command::CreateLandingMarker { .. }
+            | Command::ObserveMarkerCreation { .. }
+            | Command::PrepareGithub { .. }
+            | Command::DispatchGithub { .. }
+            | Command::RecoverDispatch { .. }
+            | Command::ObserveDispatch { .. }
+            | Command::ReportFailedCheck { .. }
+            | Command::RecoverFailedCheck { .. }
+            | Command::CancelStale { .. }
+            | Command::CancelConflict { .. }
+            | Command::ResolveDispatchConflict { .. }
+            | Command::VerifyStagedCi { .. }
+            | Command::StartStagedCheck { .. }
+            | Command::RecoverStagedCheck { .. }
+            | Command::CancelStaleStagedCheck { .. }
+            | Command::RecoverCancelledStagedCheck { .. }
+            | Command::ObserveLandingRecovery { .. }
+    );
+    let shared_gate_db = cli.db.clone();
+    let new_cli_app = |client_id: String, key: &[u8], api: &str| {
+        let app = sluss::github::App::new(client_id, key, api)?;
+        if share_rate_limit {
+            app.enable_shared_rate_limits(&shared_gate_db)?;
+        }
+        Ok::<_, sluss::github::GitHubError>(app)
+    };
     if let Command::AppRegistrationUrl {
         name,
         organization,
@@ -597,7 +629,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut journal = sluss::landing::LandingJournal::open_read_only(&cli.db)?;
         let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-        let app = sluss::github::App::new(
+        let app = new_cli_app(
             config.github.app_client_id.clone(),
             &std::fs::read(key_path)?,
             &config.github.api,
@@ -738,7 +770,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = sluss::config::Config::load(config)?;
         let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-        let app = sluss::github::App::new(
+        let app = new_cli_app(
             config.github.app_client_id.clone(),
             &std::fs::read(key_path)?,
             &config.github.api,
@@ -980,7 +1012,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app = std::sync::Arc::new(sluss::github::App::new(
+            let app = std::sync::Arc::new(new_cli_app(
                 config.github.app_client_id.clone(),
                 &key,
                 &config.github.api,
@@ -1134,7 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
         let key = std::fs::read(key_path)?;
-        let app = sluss::github::App::new(args.app_client_id, &key, &args.api)?;
+        let app = new_cli_app(args.app_client_id, &key, &args.api)?;
         let token = app
             .read_token(args.installation_id as u64, args.repository_id as u64)
             .await?;
@@ -1166,8 +1198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app =
-                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app = new_cli_app(config.github.app_client_id, &key, &config.github.api)?;
             let app_identity = match app.observe_app_identity().await {
                 Ok(identity) => {
                     println!(
@@ -1413,7 +1444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let key = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-        let app = sluss::github::App::new(
+        let app = new_cli_app(
             config.github.app_client_id.clone(),
             &std::fs::read(key)?,
             &config.github.api,
@@ -1457,7 +1488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-        let app = sluss::github::App::new(
+        let app = new_cli_app(
             config.github.app_client_id.clone(),
             &std::fs::read(key_path)?,
             &config.github.api,
@@ -1506,7 +1537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let key = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-        let app = sluss::github::App::new(
+        let app = new_cli_app(
             config.github.app_client_id.clone(),
             &std::fs::read(key)?,
             &config.github.api,
@@ -1622,7 +1653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
             .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-        let app = sluss::github::App::new(
+        let app = new_cli_app(
             config.github.app_client_id.clone(),
             &std::fs::read(key_path)?,
             &config.github.api,
@@ -1797,7 +1828,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app = sluss::github::App::new(app_client_id, &key, "https://api.github.com/")?;
+            let app = new_cli_app(app_client_id, &key, "https://api.github.com/")?;
             let token = app.staging_token(installation_id, repository_id).await?;
             let result = sluss::coordinator::prepare_github(
                 &mut store,
@@ -1840,7 +1871,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &key,
                 &config.github.api,
@@ -1886,8 +1917,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app =
-                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app = new_cli_app(config.github.app_client_id, &key, &config.github.api)?;
             let token = app
                 .read_token(
                     config.github.installation_id as u64,
@@ -1947,8 +1977,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app =
-                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app = new_cli_app(config.github.app_client_id, &key, &config.github.api)?;
             let token = app
                 .read_token(
                     config.github.installation_id as u64,
@@ -1999,8 +2028,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app =
-                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app = new_cli_app(config.github.app_client_id, &key, &config.github.api)?;
             let read = app.read_token(installation, repository).await?;
             let write = app.failed_check_token(installation, repository).await?;
             let outcome = app
@@ -2033,7 +2061,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id,
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2072,8 +2100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
             let key = std::fs::read(key_path)?;
-            let app =
-                sluss::github::App::new(config.github.app_client_id, &key, &config.github.api)?;
+            let app = new_cli_app(config.github.app_client_id, &key, &config.github.api)?;
             let token = app
                 .dispatch_token(
                     config.github.installation_id as u64,
@@ -2137,7 +2164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sluss::scheduler::Scheduler::open(&cli.db, load_capacity(&capacity)?)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id,
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2180,7 +2207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut scheduler = sluss::scheduler::Scheduler::open(&cli.db, capacity.clone())?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id,
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2270,7 +2297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = sluss::config::Config::load(&config)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2364,7 +2391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let trust = sluss::landing::TrustedCiPolicy::load(&policy)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2409,7 +2436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = sluss::config::Config::load(&config)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2438,7 +2465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = sluss::config::Config::load(&config)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2470,7 +2497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = sluss::config::Config::load(&config)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2504,7 +2531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let trust = sluss::landing::TrustedCiPolicy::load(&policy)?;
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id.clone(),
                 &std::fs::read(key_path)?,
                 &config.github.api,
@@ -2561,7 +2588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let key_path = std::env::var_os("SLUSS_GITHUB_PRIVATE_KEY_PATH")
                 .ok_or("SLUSS_GITHUB_PRIVATE_KEY_PATH is required")?;
-            let app = sluss::github::App::new(
+            let app = new_cli_app(
                 config.github.app_client_id,
                 &std::fs::read(key_path)?,
                 &config.github.api,

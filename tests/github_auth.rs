@@ -1053,6 +1053,124 @@ fn keys() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
 }
 
 #[tokio::test]
+async fn reconcile_cli_shares_durable_rate_limit_with_other_processes() {
+    let (key_dir, private, public) = keys();
+    let mode = Arc::new(AtomicU8::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let api = Router::new()
+        .route(
+            "/app/installations/{id}/access_tokens",
+            post(rate_limited_token),
+        )
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/branches/main", get(reconcile_branch))
+        .route("/repos/owner/repo/pulls", get(open_pulls))
+        .route("/repos/owner/repo/pulls/19", get(pull))
+        .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
+        .route(
+            "/repos/owner/repo/collaborators/reviewer/permission",
+            get(permission),
+        )
+        .with_state(ServerState {
+            public_key: Arc::new(public),
+            mode: mode.clone(),
+            pulls: Arc::new(AtomicUsize::new(0)),
+            permissions: Arc::new(AtomicUsize::new(0)),
+            token_calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    let mut inbox = sluss::webhook::Inbox::open(&db).unwrap();
+    inbox
+        .record("cli-limit", "pull_request", &[42; 32], 42, 7)
+        .unwrap();
+    let app = App::new("app-client-id".into(), &private, &format!("http://{addr}/")).unwrap();
+    app.enable_shared_rate_limits(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+    conn.execute(
+        "INSERT INTO github_rate_limit_gate(id,observed_ms,until_ms) VALUES(1,?1,?2)",
+        rusqlite::params![now, now + 60_000],
+    )
+    .unwrap();
+    let key = key_dir.path().join("test-key.pem");
+    let run = || {
+        let db = db.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_sluss"))
+                .arg("--db")
+                .arg(db)
+                .args([
+                    "reconcile",
+                    "--owner",
+                    "owner",
+                    "--repository",
+                    "repo",
+                    "--app-client-id",
+                    "app-client-id",
+                    "--installation-id",
+                    "42",
+                    "--repository-id",
+                    "7",
+                    "--api",
+                    &format!("http://{addr}/"),
+                ])
+                .env("SLUSS_GITHUB_PRIVATE_KEY_PATH", key)
+                .output()
+                .unwrap()
+        })
+    };
+    let deferred = run().await.unwrap();
+    assert!(!deferred.status.success());
+    assert!(String::from_utf8_lossy(&deferred.stderr).contains("RateLimited"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+
+    conn.execute(
+        "UPDATE github_rate_limit_gate SET observed_ms=0,until_ms=0",
+        [],
+    )
+    .unwrap();
+    mode.store(220, Ordering::SeqCst);
+    assert!(!run().await.unwrap().status.success());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    mode.store(0, Ordering::SeqCst);
+    let blocked = run().await.unwrap();
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("RateLimited"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a later CLI must see the persisted deadline"
+    );
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+    conn.execute(
+        "UPDATE github_rate_limit_gate SET observed_ms=0,until_ms=0",
+        [],
+    )
+    .unwrap();
+    let finished = run().await.unwrap();
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(inbox.pending().unwrap().is_empty());
+    assert_eq!(
+        sluss::store::Store::open(&db)
+            .unwrap()
+            .candidates()
+            .unwrap()
+            .len(),
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn rate_limits_defer_all_workers_and_preserve_normal_forbidden_errors() {
     let (_dir, private, public) = keys();
     let mode = Arc::new(AtomicU8::new(0));
@@ -2514,6 +2632,11 @@ async fn uncertain_dispatch_discovery_is_read_only_scoped_and_never_asserts_orig
     // Earlier journals may not have the workflow-path table. Discovery must
     // remain read-only and explicitly retain the weaker, unbound result.
     let conn = rusqlite::Connection::open(&db).unwrap();
+    let rate_table: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='github_rate_limit_gate')", [], |row| row.get(0)).unwrap();
+    assert!(
+        !rate_table,
+        "read-only discovery must not create the shared gate"
+    );
     conn.execute("DROP TABLE dispatch_workflows", []).unwrap();
     let legacy = Scheduler::inspect_uncertain_dispatch(&db, id).unwrap();
     assert_eq!(legacy.workflow_path, None);
