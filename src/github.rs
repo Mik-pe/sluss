@@ -1089,6 +1089,30 @@ pub struct RepositoryPreflight {
     pub rules: Vec<serde_json::Value>,
 }
 impl App {
+    /// Read a target branch within the installation's repository scope.
+    /// Callers must compare observations around the rest of a provider scan.
+    pub async fn observe_target_branch(
+        &self,
+        token: &InstallationToken,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+    ) -> Result<BranchInfo, GitHubError> {
+        if !valid_name(owner) || !valid_name(repository) {
+            return Err(GitHubError::InvalidConfiguration);
+        }
+        let segment = encoded_branch_segment(branch).ok_or(GitHubError::InvalidConfiguration)?;
+        let root = format!("repos/{owner}/{repository}");
+        let repo: Repository = self.get_json(token, &root, None).await?;
+        let info: BranchInfo = self
+            .get_json(token, &format!("{root}/branches/{segment}"), None)
+            .await?;
+        if repo.id != token.repository_id || info.name != branch || !commit_sha(&info.commit.sha) {
+            return Err(GitHubError::UnstableObservation);
+        }
+        Ok(info)
+    }
+
     /// Inspect current branch, workflow registration and active branch rules.
     /// Agreement across reads is an observation, not a landing authorization.
     pub async fn inspect_repository(

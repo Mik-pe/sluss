@@ -58,8 +58,13 @@ async fn pull(State(state): State<ServerState>, headers: HeaderMap) -> Json<Valu
     } else {
         "needs-work"
     };
+    let base = if state.mode.load(Ordering::SeqCst) == 36 {
+        "c"
+    } else {
+        "b"
+    };
     Json(
-        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":label}]}),
+        json!({"number":19,"state":"open","draft":false,"user":{"id":4,"login":"author","type":"User"},"head":{"sha":sha},"base":{"sha":base.repeat(40),"ref":"main","repo":{"id":7}},"labels":[{"name":label}]}),
     )
 }
 async fn reviews(
@@ -173,6 +178,19 @@ async fn cancel_run(State(state): State<ServerState>, headers: HeaderMap) -> Sta
     } else {
         StatusCode::ACCEPTED
     }
+}
+async fn reconcile_branch(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
+    assert_eq!(headers["authorization"], "Bearer fake-installation-token");
+    let mode = state.mode.load(Ordering::SeqCst);
+    let sha = if mode == 34
+        || mode == 36
+        || (mode == 35 && state.pulls.fetch_add(1, Ordering::SeqCst) > 0)
+    {
+        "c"
+    } else {
+        "b"
+    };
+    Json(json!({"name":"main","protected":true,"commit":{"sha":sha.repeat(40)}}))
 }
 async fn doctor_branch(State(state): State<ServerState>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer fake-installation-token");
@@ -367,6 +385,8 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
     let permissions = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/branches/main", get(reconcile_branch))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
         .route("/repos/owner/repo/pulls", get(open_pulls))
@@ -490,6 +510,56 @@ async fn creates_signed_scoped_tokens_and_rejects_unsafe_responses() {
         .unwrap();
     assert_eq!(store.candidates().unwrap()[0].head_sha, "a".repeat(40));
     assert!(inbox.pending().unwrap().is_empty());
+    assert!(matches!(
+        store.plan_batch("batch-4123456789abcdef", &"c".repeat(40), 4, 1),
+        Err(sluss::store::StoreError::StaleBatch)
+    ));
+    let obsolete = store
+        .plan_batch("batch-3123456789abcdef", &"b".repeat(40), 4, 1)
+        .unwrap()
+        .unwrap();
+    inbox
+        .record("target-moved", "push", &[11; 32], 42, 7)
+        .unwrap();
+    let moving_job = inbox.pending().unwrap().remove(0);
+    pulls.store(0, Ordering::SeqCst);
+    mode.store(35, Ordering::SeqCst);
+    assert!(
+        sluss::reconcile::reconcile_once(&client, &token, &mut store, &moving_job, &config)
+            .await
+            .is_err()
+    );
+    assert_eq!(inbox.pending().unwrap().len(), 1);
+    mode.store(34, Ordering::SeqCst);
+    assert!(
+        sluss::reconcile::reconcile_once(&client, &token, &mut store, &moving_job, &config)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.batch(&obsolete.id).unwrap().unwrap().0.state,
+        sluss::batch::State::Planned
+    );
+    mode.store(36, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &moving_job, &config)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.batch(&obsolete.id).unwrap().unwrap().0.state,
+        sluss::batch::State::Invalidated { .. }
+    ));
+    assert!(matches!(
+        store.plan_batch("batch-4123456789abcdef", &"b".repeat(40), 4, 1),
+        Err(sluss::store::StoreError::StaleBatch)
+    ));
+    inbox
+        .record("target-restored", "push", &[12; 32], 42, 7)
+        .unwrap();
+    let restored = inbox.pending().unwrap().remove(0);
+    mode.store(0, Ordering::SeqCst);
+    sluss::reconcile::reconcile_once(&client, &token, &mut store, &restored, &config)
+        .await
+        .unwrap();
     let frozen = store
         .plan_batch("batch-0123456789abcdef", &"b".repeat(40), 4, 1)
         .unwrap()
@@ -714,6 +784,8 @@ async fn configured_service_recovers_by_scanning_and_processes_webhooks() {
     let token_calls = Arc::new(AtomicUsize::new(0));
     let api = Router::new()
         .route("/app/installations/{id}/access_tokens", post(token))
+        .route("/repos/owner/repo", get(dispatch_repo))
+        .route("/repos/owner/repo/branches/main", get(reconcile_branch))
         .route("/repos/owner/repo/pulls/19", get(pull))
         .route("/repos/owner/repo/pulls/19/reviews", get(reviews))
         .route("/repos/owner/repo/pulls", get(open_pulls))

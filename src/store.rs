@@ -71,6 +71,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS batch_evidence (batch_id TEXT NOT NULL, number INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(batch_id, number));
             CREATE TABLE IF NOT EXISTS batch_policy (batch_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS batch_selection (batch_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS observed_base (id INTEGER PRIMARY KEY CHECK(id=1), sha TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS split_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id TEXT NOT NULL, side INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL, child_id TEXT, UNIQUE(parent_id,side));
             CREATE TABLE IF NOT EXISTS failed_singletons (number INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, digest TEXT NOT NULL, batch_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_binding (
@@ -200,7 +201,7 @@ impl Store {
         policy_digest: &str,
         candidates: &[Candidate],
     ) -> Result<(), StoreError> {
-        self.apply_reconciliation_inner(job, policy_digest, candidates, None)
+        self.apply_reconciliation_inner(job, policy_digest, candidates, None, None)
     }
     /// Apply observed review and authorization evidence with the queue update.
     pub fn apply_admission_reconciliation(
@@ -208,6 +209,27 @@ impl Store {
         job: &crate::webhook::Reconciliation,
         policy_digest: &str,
         admitted: &[AdmissionCandidate],
+    ) -> Result<(), StoreError> {
+        self.apply_admission_reconciliation_inner(job, policy_digest, admitted, None)
+    }
+
+    /// Commit an observed target base together with admission and inbox acknowledgement.
+    pub fn apply_admission_reconciliation_with_base(
+        &mut self,
+        job: &crate::webhook::Reconciliation,
+        policy_digest: &str,
+        admitted: &[AdmissionCandidate],
+        base_sha: &str,
+    ) -> Result<(), StoreError> {
+        self.apply_admission_reconciliation_inner(job, policy_digest, admitted, Some(base_sha))
+    }
+
+    fn apply_admission_reconciliation_inner(
+        &mut self,
+        job: &crate::webhook::Reconciliation,
+        policy_digest: &str,
+        admitted: &[AdmissionCandidate],
+        base_sha: Option<&str>,
     ) -> Result<(), StoreError> {
         let candidates: Vec<Candidate> = admitted.iter().map(|v| v.candidate.clone()).collect();
         let digests: Vec<String> = admitted.iter().map(|v| v.evidence_digest.clone()).collect();
@@ -219,7 +241,7 @@ impl Store {
         }) {
             return Err(StoreError::InvalidCandidate);
         }
-        self.apply_reconciliation_inner(job, policy_digest, &candidates, Some(&digests))
+        self.apply_reconciliation_inner(job, policy_digest, &candidates, Some(&digests), base_sha)
     }
     fn apply_reconciliation_inner(
         &mut self,
@@ -227,7 +249,16 @@ impl Store {
         policy_digest: &str,
         candidates: &[Candidate],
         digests: Option<&[String]>,
+        base_sha: Option<&str>,
     ) -> Result<(), StoreError> {
+        if base_sha.is_some_and(|sha| {
+            sha.len() != 40
+                || !sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(StoreError::InvalidBatch);
+        }
         if job.installation <= 0
             || job.repository <= 0
             || job.revision <= 0
@@ -289,6 +320,39 @@ impl Store {
             "INSERT OR IGNORE INTO repository_binding(id,installation,repository,policy_digest) VALUES(1,?1,?2,?3)",
             params![job.installation, job.repository, policy_digest],
         )?;
+        let old_base: Option<String> = tx
+            .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+            .optional()?;
+        if old_base.is_some() && base_sha.is_none() {
+            return Err(StoreError::StaleBatch);
+        }
+        if let Some(base) = base_sha {
+            if old_base.as_deref() != Some(base) {
+                let batches = {
+                    let mut stmt = tx.prepare("SELECT id,body FROM batches")?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                for (id, body) in batches {
+                    let mut batch: Batch = serde_json::from_str(&body)?;
+                    if batch.base_sha != base
+                        && batch.invalidate("target base changed".into()).is_ok()
+                    {
+                        tx.execute(
+                            "UPDATE batches SET version=version+1,body=?1 WHERE id=?2",
+                            params![serde_json::to_string(&batch)?, id],
+                        )?;
+                    }
+                }
+                tx.execute(
+                    "UPDATE split_tasks SET state='stale' WHERE state='pending'",
+                    [],
+                )?;
+                tx.execute("DELETE FROM failed_singletons", [])?;
+            }
+            tx.execute("INSERT INTO observed_base(id,sha) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET sha=excluded.sha", [base])?;
+        }
         let old: Vec<u64> = {
             let mut stmt = tx.prepare("SELECT number FROM candidates")?;
             let rows = stmt.query_map([], |r| Ok(r.get::<_, i64>(0)? as u64))?;
@@ -493,6 +557,12 @@ impl Store {
         )?;
         if paused || pending {
             return Ok(None);
+        }
+        let observed_base: Option<String> = tx
+            .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+            .optional()?;
+        if observed_base.as_deref().is_some_and(|sha| sha != base_sha) {
+            return Err(StoreError::StaleBatch);
         }
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM batches WHERE id=?1)",
@@ -705,6 +775,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let observed_base: Option<String> = tx
+            .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+            .optional()?;
+        if observed_base
+            .as_deref()
+            .is_some_and(|sha| sha != batch.base_sha)
+        {
+            return Err(StoreError::StaleBatch);
+        }
         for candidate in &batch.candidates {
             let number =
                 i64::try_from(candidate.number).map_err(|_| StoreError::InvalidCandidate)?;
@@ -1071,6 +1150,15 @@ fn checked_batch(tx: &Transaction<'_>, id: &str) -> Result<(Batch, i64), StoreEr
     let batch: Batch = serde_json::from_str(&body)?;
     if batch.id != id {
         return Err(StoreError::InvalidBatch);
+    }
+    let observed_base: Option<String> = tx
+        .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+        .optional()?;
+    if observed_base
+        .as_deref()
+        .is_some_and(|sha| sha != batch.base_sha)
+    {
+        return Err(StoreError::StaleBatch);
     }
     for candidate in &batch.candidates {
         let number = i64::try_from(candidate.number).map_err(|_| StoreError::StaleBatch)?;

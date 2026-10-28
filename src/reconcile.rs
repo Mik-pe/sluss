@@ -53,6 +53,9 @@ pub async fn reconcile_once(
     {
         return Err(ReconcileError::Scope);
     }
+    let base = app
+        .observe_target_branch(token, &config.owner, &config.name, &config.target_branch)
+        .await?;
     let numbers = app
         .open_pull_numbers(token, &config.owner, &config.name)
         .await?;
@@ -61,6 +64,12 @@ pub async fn reconcile_once(
         let observed = app
             .observe_authorized_pull(token, &config.owner, &config.name, *number)
             .await?;
+        if observed.snapshot.pull.base.branch == config.target_branch
+            && observed.snapshot.pull.base.repo.id == config.repository as u64
+            && observed.snapshot.pull.base.sha != base.commit.sha
+        {
+            return Err(ReconcileError::Unstable);
+        }
         let policy = Policy {
             target_branch: config.target_branch.clone(),
             required_reviews: config.required_reviews,
@@ -101,9 +110,21 @@ pub async fn reconcile_once(
     {
         return Err(ReconcileError::Unstable);
     }
+    if app
+        .observe_target_branch(token, &config.owner, &config.name, &config.target_branch)
+        .await?
+        != base
+    {
+        return Err(ReconcileError::Unstable);
+    }
     use sha2::Digest;
     let encoded = serde_json::to_vec(&(app.scope(), config)).map_err(|_| ReconcileError::Scope)?;
     let policy_digest = hex::encode(sha2::Sha256::digest(encoded));
-    store.apply_admission_reconciliation(job, &policy_digest, &candidates)?;
+    store.apply_admission_reconciliation_with_base(
+        job,
+        &policy_digest,
+        &candidates,
+        &base.commit.sha,
+    )?;
     Ok(())
 }

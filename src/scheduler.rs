@@ -701,6 +701,15 @@ fn validate_batch_dispatch(
     {
         return Err(SchedulerError::StaleBatch);
     }
+    let observed_base: Option<String> = tx
+        .query_row("SELECT sha FROM observed_base WHERE id=1", [], |r| r.get(0))
+        .optional()?;
+    if observed_base
+        .as_deref()
+        .is_some_and(|sha| sha != batch.base_sha)
+    {
+        return Err(SchedulerError::StaleBatch);
+    }
     let policy: Option<String> = tx
         .query_row(
             "SELECT digest FROM batch_policy WHERE batch_id=?1",

@@ -370,6 +370,134 @@ fn debounce_survives_restart_and_resets_only_for_changed_candidates() {
 }
 
 #[test]
+fn changing_target_base_invalidates_dispatch_and_stale_splits_atomically() {
+    use sluss::scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError};
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let base = "a".repeat(40);
+    let changed = "d".repeat(40);
+    let candidates = store.candidates().unwrap();
+    inbox.record("bind-base", "push", &[10; 32], 1, 2).unwrap();
+    let bind = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation_with_base(
+            &bind,
+            &"f".repeat(64),
+            &with_evidence(&candidates),
+            &base,
+        )
+        .unwrap();
+    let id = "batch-0123456789abcdef";
+    let wrong_base = sluss::batch::Batch::new(
+        "batch-3123456789abcdef".into(),
+        changed.clone(),
+        candidates.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.insert_batch(&wrong_base),
+        Err(StoreError::StaleBatch)
+    ));
+    store.plan_batch(id, &base, 4, 1).unwrap().unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let mut scheduler = Scheduler::open(
+        &db,
+        Capacity {
+            pools: pools.clone(),
+            hosts: BTreeMap::from([(
+                "host".into(),
+                Host {
+                    runner_ids: BTreeSet::new(),
+                    slots: 1,
+                    pools: pools.clone(),
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: BTreeSet::from(["test".into()]),
+        suites: BTreeSet::from(["full".into()]),
+        selection_policy_digest: None,
+    };
+    assert!(
+        scheduler
+            .reserve_batch_dispatch(id, &Request { pools }, &plan)
+            .unwrap()
+            .is_some()
+    );
+    inbox
+        .record("base-update", "push", &[11; 32], 1, 2)
+        .unwrap();
+    let update = inbox.pending().unwrap().remove(0);
+    assert!(matches!(
+        store.apply_admission_reconciliation(&update, &"f".repeat(64), &with_evidence(&candidates)),
+        Err(StoreError::StaleBatch)
+    ));
+    store
+        .apply_admission_reconciliation_with_base(
+            &update,
+            &"f".repeat(64),
+            &with_evidence(&candidates),
+            &changed,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
+    assert!(matches!(
+        scheduler.claim_dispatch(id),
+        Err(SchedulerError::StaleBatch)
+    ));
+    assert_eq!(scheduler.cancel_invalidated_prepared().unwrap(), 1);
+    assert!(matches!(
+        store.plan_batch("batch-1123456789abcdef", &base, 4, 1),
+        Err(StoreError::StaleBatch)
+    ));
+    let split_parent = "batch-1123456789abcdef";
+    store
+        .plan_batch(split_parent, &changed, 4, 1)
+        .unwrap()
+        .unwrap();
+    store.start_integration(split_parent).unwrap();
+    store.fail_integration(split_parent, "conflict").unwrap();
+    inbox.record("base-again", "push", &[12; 32], 1, 2).unwrap();
+    let next = inbox.pending().unwrap().remove(0);
+    store
+        .apply_admission_reconciliation_with_base(
+            &next,
+            &"f".repeat(64),
+            &with_evidence(&candidates),
+            &base,
+        )
+        .unwrap();
+    let new_batch = store
+        .plan_batch("batch-2123456789abcdef", &base, 4, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        new_batch.candidates.len(),
+        4,
+        "old-base split work must not constrain the new batch"
+    );
+}
+
+#[test]
 fn batch_window_survives_restart_and_full_batches_do_not_wait() {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     let dir = tempfile::tempdir().unwrap();
