@@ -206,6 +206,7 @@ fn batch_dispatch_rechecks_queue_before_claim_and_can_cancel_unstarted_work() {
         integration_sha: "b".repeat(40),
         staging_ref: format!("refs/heads/sluss/{id}"),
         policy_digest: "c".repeat(64),
+        required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
     };
     assert!(
         scheduler
@@ -503,4 +504,118 @@ fn stale_split_is_discarded_and_does_not_block_other_candidates() {
         new.candidates.iter().map(|c| c.number).collect::<Vec<_>>(),
         [2, 1]
     );
+}
+
+#[test]
+fn ci_observation_is_immutable_and_rejected_when_review_changes() {
+    use sluss::{
+        github::{ActionsJob, ActionsRepository, ActionsRun, ActionsSnapshot},
+        scheduler::{Capacity, DispatchPlan, Host, Request, Scheduler, SchedulerError},
+        verification::CiObservation,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.sqlite");
+    ready_queue(&db);
+    let mut store = Store::open(&db).unwrap();
+    let mut inbox = Inbox::open(&db).unwrap();
+    let id = "batch-0123456789abcdef";
+    store
+        .plan_batch(id, &"a".repeat(40), 1, 1)
+        .unwrap()
+        .unwrap();
+    store.start_integration(id).unwrap();
+    store
+        .finish_integration(id, &"b".repeat(40), &"c".repeat(64))
+        .unwrap();
+    let pools = BTreeMap::from([("rust".into(), 1)]);
+    let capacity = Capacity {
+        pools: pools.clone(),
+        hosts: BTreeMap::from([(
+            "sluss-host-test".into(),
+            Host {
+                slots: 1,
+                runner_ids: BTreeSet::from([7]),
+                pools: pools.clone(),
+            },
+        )]),
+    };
+    let mut scheduler = Scheduler::open(&db, capacity).unwrap();
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "b".repeat(40),
+        staging_ref: format!("refs/heads/sluss/{id}"),
+        policy_digest: "c".repeat(64),
+        required_jobs: BTreeSet::from(["test".into()]),
+    };
+    scheduler
+        .reserve_batch_dispatch(id, &Request { pools }, &plan)
+        .unwrap()
+        .unwrap();
+    scheduler.claim_dispatch(id).unwrap();
+    scheduler.record_receipt(id, 9).unwrap();
+    scheduler.observe_dispatch(id, 9).unwrap();
+    let mut snapshot = ActionsSnapshot {
+        run: ActionsRun {
+            id: 9,
+            run_attempt: 1,
+            workflow_id: 3,
+            head_sha: "b".repeat(40),
+            head_branch: Some(format!("sluss/{id}")),
+            path: ".github/workflows/ci.yml".into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            repository: ActionsRepository { id: 2 },
+            head_repository: Some(ActionsRepository { id: 2 }),
+        },
+        jobs: vec![ActionsJob {
+            id: 11,
+            run_id: 9,
+            head_sha: "b".repeat(40),
+            name: "test".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            runner_id: Some(7),
+        }],
+    };
+    assert_eq!(
+        scheduler.record_ci_observation(id, &snapshot).unwrap(),
+        CiObservation::Successful
+    );
+    assert_eq!(
+        scheduler.record_ci_observation(id, &snapshot).unwrap(),
+        CiObservation::Successful
+    );
+    snapshot.run.conclusion = Some("failure".into());
+    assert!(matches!(
+        scheduler.record_ci_observation(id, &snapshot),
+        Err(SchedulerError::CiConflict)
+    ));
+    snapshot.run.conclusion = Some("success".into());
+    inbox
+        .record("review", "pull_request_review", &[5; 32], 1, 2)
+        .unwrap();
+    assert!(matches!(
+        scheduler.record_ci_observation(id, &snapshot),
+        Err(SchedulerError::StaleBatch)
+    ));
+    let event = inbox.pending().unwrap().remove(0);
+    let mut evidence = with_evidence(&store.candidates().unwrap());
+    evidence[0].evidence_digest = "f".repeat(64);
+    store
+        .apply_admission_reconciliation(&event, &"f".repeat(64), &evidence)
+        .unwrap();
+    assert!(matches!(
+        scheduler.record_ci_observation(id, &snapshot),
+        Err(SchedulerError::StaleBatch)
+    ));
+    assert!(matches!(
+        store.batch(id).unwrap().unwrap().0.state,
+        State::Invalidated { .. }
+    ));
 }

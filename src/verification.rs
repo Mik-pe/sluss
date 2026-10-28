@@ -241,3 +241,82 @@ pub fn check_repository_runner_inventory(
     }
     Ok(())
 }
+
+/// A provider result comparison, not proof of trusted workflow policy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CiObservation {
+    Pending,
+    Successful,
+    Failed { conclusion: String },
+}
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CiObservationError {
+    #[error("run identity does not match the frozen dispatch")]
+    Identity,
+    #[error("job identities, names or conclusions are invalid or ambiguous")]
+    Ambiguous,
+    #[error("a required job is absent, incomplete, skipped or unsuccessful")]
+    RequiredJob,
+}
+/// Compare exact run and job names. The caller must obtain authenticated,
+/// complete provider observations and independently validate workflow policy.
+pub fn observe_ci(
+    plan: &crate::scheduler::DispatchPlan,
+    run_id: u64,
+    snapshot: &crate::github::ActionsSnapshot,
+) -> Result<CiObservation, CiObservationError> {
+    let run = &snapshot.run;
+    let branch = plan
+        .staging_ref
+        .strip_prefix("refs/heads/")
+        .ok_or(CiObservationError::Identity)?;
+    if run_id == 0
+        || plan.required_jobs.is_empty()
+        || run.id != run_id
+        || run.run_attempt != 1
+        || run.repository.id != plan.repository_id
+        || run.head_repository.as_ref().map(|r| r.id) != Some(plan.repository_id)
+        || run.workflow_id != plan.workflow_id
+        || run.head_sha != plan.integration_sha
+        || run.head_branch.as_deref() != Some(branch)
+        || run.event != "workflow_dispatch"
+    {
+        return Err(CiObservationError::Identity);
+    }
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for job in &snapshot.jobs {
+        if job.id == 0
+            || job.name.is_empty()
+            || job.run_id != run_id
+            || job.head_sha != run.head_sha
+            || !ids.insert(job.id)
+            || !names.insert(&job.name)
+        {
+            return Err(CiObservationError::Ambiguous);
+        }
+    }
+    if run.status != "completed" {
+        return Ok(CiObservation::Pending);
+    }
+    let conclusion = run
+        .conclusion
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or(CiObservationError::Ambiguous)?;
+    if conclusion != "success" {
+        return Ok(CiObservation::Failed {
+            conclusion: conclusion.into(),
+        });
+    }
+    for required in &plan.required_jobs {
+        if !snapshot.jobs.iter().any(|job| {
+            &job.name == required
+                && job.status == "completed"
+                && job.conclusion.as_deref() == Some("success")
+        }) {
+            return Err(CiObservationError::RequiredJob);
+        }
+    }
+    Ok(CiObservation::Successful)
+}

@@ -268,3 +268,98 @@ fn repository_runner_inventory_detects_aliases_missing_and_busy_capacity() {
         Err(InventoryError::RunnerMismatch)
     );
 }
+
+#[test]
+fn ci_observation_requires_exact_run_and_every_required_job() {
+    use sluss::{
+        github::{ActionsJob, ActionsRepository, ActionsRun, ActionsSnapshot},
+        scheduler::DispatchPlan,
+        verification::{CiObservation, CiObservationError, observe_ci},
+    };
+    let plan = DispatchPlan {
+        installation_id: 1,
+        repository_id: 2,
+        workflow_id: 3,
+        integration_sha: "a".repeat(40),
+        staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
+        policy_digest: "b".repeat(64),
+        required_jobs: BTreeSet::from(["test".into()]),
+    };
+    let run = ActionsRun {
+        id: 4,
+        run_attempt: 1,
+        workflow_id: 3,
+        head_sha: "a".repeat(40),
+        head_branch: Some("sluss/batch-0123456789abcdef".into()),
+        path: ".github/workflows/ci.yml".into(),
+        event: "workflow_dispatch".into(),
+        status: "completed".into(),
+        conclusion: Some("success".into()),
+        repository: ActionsRepository { id: 2 },
+        head_repository: Some(ActionsRepository { id: 2 }),
+    };
+    let job = ActionsJob {
+        id: 5,
+        run_id: 4,
+        head_sha: "a".repeat(40),
+        name: "test".into(),
+        status: "completed".into(),
+        conclusion: Some("success".into()),
+        started_at: None,
+        completed_at: None,
+        runner_id: Some(6),
+    };
+    let snapshot = ActionsSnapshot {
+        run,
+        jobs: vec![job],
+    };
+    assert_eq!(
+        observe_ci(&plan, 4, &snapshot),
+        Ok(CiObservation::Successful)
+    );
+    let mut pending = snapshot.clone();
+    pending.run.status = "in_progress".into();
+    pending.run.conclusion = None;
+    assert_eq!(observe_ci(&plan, 4, &pending), Ok(CiObservation::Pending));
+    let mut failed = snapshot.clone();
+    failed.run.conclusion = Some("failure".into());
+    assert_eq!(
+        observe_ci(&plan, 4, &failed),
+        Ok(CiObservation::Failed {
+            conclusion: "failure".into()
+        })
+    );
+    let mut missing = snapshot.clone();
+    missing.jobs.clear();
+    assert_eq!(
+        observe_ci(&plan, 4, &missing),
+        Err(CiObservationError::RequiredJob)
+    );
+    let mut skipped = snapshot.clone();
+    skipped.jobs[0].conclusion = Some("skipped".into());
+    assert_eq!(
+        observe_ci(&plan, 4, &skipped),
+        Err(CiObservationError::RequiredJob)
+    );
+    let mut duplicate = snapshot.clone();
+    duplicate.jobs.push(ActionsJob {
+        id: 6,
+        ..duplicate.jobs[0].clone()
+    });
+    assert_eq!(
+        observe_ci(&plan, 4, &duplicate),
+        Err(CiObservationError::Ambiguous)
+    );
+    let mut stale = snapshot.clone();
+    stale.run.head_sha = "c".repeat(40);
+    assert_eq!(
+        observe_ci(&plan, 4, &stale),
+        Err(CiObservationError::Identity)
+    );
+    let mut retry = snapshot.clone();
+    retry.run.run_attempt = 2;
+    assert_eq!(
+        observe_ci(&plan, 4, &retry),
+        Err(CiObservationError::Identity)
+    );
+}

@@ -88,6 +88,9 @@ enum Command {
         pool: Vec<String>,
         #[arg(long)]
         workflow_id: u64,
+        /// Exact GitHub job name required for this run; repeat if needed.
+        #[arg(long, required = true)]
+        required_job: Vec<String>,
     },
     /// Observe a dispatched run and check the reserved host's runner IDs.
     ObserveDispatch {
@@ -386,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             capacity,
             pool,
             workflow_id,
+            required_job,
         } => {
             let config = sluss::config::Config::load(&config)?;
             if store.repository_scope()?
@@ -411,6 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 integration_sha: sha,
                 staging_ref: format!("refs/heads/sluss/{batch_id}"),
                 policy_digest,
+                required_jobs: required_job.into_iter().collect(),
             };
             let request = sluss::scheduler::Request {
                 pools: parse_pools(&pool)?,
@@ -513,6 +518,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             let placement = sluss::verification::check_host_placement(&snapshot, runners)?;
             let recorded = scheduler.record_job_metrics(&batch_id, &snapshot)?;
+            let ci = scheduler.record_ci_observation(&batch_id, &snapshot)?;
+            println!("provider CI observation: {ci:?} (not an attestation)");
             println!(
                 "run {}: status {}, conclusion {:?}, placement {:?}; {} new completed job measurements",
                 snapshot.run.id, snapshot.run.status, snapshot.run.conclusion, placement, recorded

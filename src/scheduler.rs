@@ -42,6 +42,10 @@ pub enum SchedulerError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Metrics(#[from] crate::metrics::MetricsError),
+    #[error(transparent)]
+    CiObservation(#[from] crate::verification::CiObservationError),
+    #[error("provider CI observations disagree for the same run")]
+    CiConflict,
     #[error("capacity configuration or request is invalid")]
     Invalid,
     #[error("a different capacity configuration is active while reservations exist")]
@@ -78,7 +82,8 @@ impl Scheduler {
             CREATE TABLE IF NOT EXISTS capacity_reservations (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS capacity_finished (id TEXT PRIMARY KEY NOT NULL);
             CREATE TABLE IF NOT EXISTS dispatch_intents (id TEXT PRIMARY KEY NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT);
-            CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS dispatch_batches (id TEXT PRIMARY KEY NOT NULL, batch_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ci_observations (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL);")?;
         crate::metrics::ensure_schema(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<String> = tx
@@ -372,6 +377,9 @@ pub struct DispatchPlan {
     pub integration_sha: String,
     pub staging_ref: String,
     pub policy_digest: String,
+    /// Exact required GitHub job names, frozen before dispatch.
+    #[serde(default)]
+    pub required_jobs: std::collections::BTreeSet<String>,
 }
 impl DispatchPlan {
     fn valid(&self) -> bool {
@@ -387,6 +395,11 @@ impl DispatchPlan {
             && self.workflow_id != 0
             && hex(&self.integration_sha, 40)
             && hex(&self.policy_digest, 64)
+            && !self.required_jobs.is_empty()
+            && self.required_jobs.len() <= 100
+            && self.required_jobs.iter().all(|name| {
+                !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
+            })
             && id.is_some_and(|id| {
                 (16..=64).contains(&id.len())
                     && id
@@ -813,5 +826,86 @@ impl Scheduler {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredCiObservation {
+    run_id: u64,
+    plan: DispatchPlan,
+    observation: crate::verification::CiObservation,
+}
+impl Scheduler {
+    /// Persist a provider result comparison for a still-current batch. This is
+    /// deliberately not an attestation and does not authorize landing.
+    pub fn record_ci_observation(
+        &mut self,
+        id: &str,
+        snapshot: &crate::github::ActionsSnapshot,
+    ) -> Result<crate::verification::CiObservation, SchedulerError> {
+        use crate::verification::{
+            CiObservation, CiObservationError, Placement, check_host_placement, observe_ci,
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: String =
+            tx.query_row("SELECT body FROM capacity_config WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if active != self.encoded {
+            return Err(SchedulerError::ConfigChanged);
+        }
+        let row: Option<(String,String,Option<String>,String,String)> = tx.query_row(
+            "SELECT d.plan,d.state,d.run_id,r.host,b.batch_id FROM dispatch_intents d JOIN capacity_reservations r ON r.id=d.id JOIN dispatch_batches b ON b.id=d.id WHERE d.id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
+        ).optional()?;
+        let (body, state, run_id, host, batch_id) =
+            row.ok_or(SchedulerError::DispatchTransition)?;
+        let plan: DispatchPlan = serde_json::from_str(&body)?;
+        let run_id = run_id
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(SchedulerError::DispatchTransition)?;
+        if state != "observed" || !plan.valid() {
+            return Err(SchedulerError::DispatchTransition);
+        }
+        validate_batch_dispatch(&tx, &batch_id, &plan)?;
+        let observation = observe_ci(&plan, run_id, snapshot)?;
+        let host_config = self
+            .capacity
+            .hosts
+            .get(&host)
+            .ok_or(SchedulerError::Corrupt)?;
+        let placement = check_host_placement(snapshot, &host_config.runner_ids)
+            .map_err(|_| CiObservationError::Ambiguous)?;
+        if matches!(observation, CiObservation::Pending) {
+            return Ok(observation);
+        }
+        if !matches!(placement, Placement::Confirmed { .. }) {
+            return Err(CiObservationError::Ambiguous.into());
+        }
+        let record = StoredCiObservation {
+            run_id,
+            plan,
+            observation: observation.clone(),
+        };
+        let existing: Option<String> = tx
+            .query_row("SELECT body FROM ci_observations WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(body) = existing {
+            let previous: StoredCiObservation = serde_json::from_str(&body)?;
+            if previous != record {
+                return Err(SchedulerError::CiConflict);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO ci_observations(id,body) VALUES(?1,?2)",
+                params![id, serde_json::to_string(&record)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(observation)
     }
 }

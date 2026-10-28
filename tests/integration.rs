@@ -481,6 +481,7 @@ fn prepares_and_recovers_a_reconciled_batch_through_real_git_staging() {
         integration_sha: prepared.sha,
         staging_ref: prepared.reference,
         policy_digest: "c".repeat(64),
+        required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
     };
     assert!(matches!(
         scheduler.reserve_batch_dispatch(id, &request, &plan),

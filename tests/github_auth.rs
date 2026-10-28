@@ -851,6 +851,7 @@ async fn dispatch_is_scoped_claimed_once_and_uncertain_responses_are_not_retried
         integration_sha: "a".repeat(40),
         staging_ref: "refs/heads/sluss/batch-0123456789abcdef".into(),
         policy_digest: "b".repeat(64),
+        required_jobs: std::collections::BTreeSet::from(["job-1-0".into()]),
     };
     let req = Request {
         pools: BTreeMap::from([("rust".into(), 1)]),
@@ -1196,6 +1197,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         "rust=1".into(),
         "--workflow-id".into(),
         "17".into(),
+        "--required-job".into(),
+        "job-1-0".into(),
     ])
     .await
     .unwrap();
@@ -1216,6 +1219,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         "rust=1".into(),
         "--workflow-id".into(),
         "17".into(),
+        "--required-job".into(),
+        "job-1-0".into(),
     ])
     .await
     .unwrap();
@@ -1235,6 +1240,8 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         "rust=1".into(),
         "--workflow-id".into(),
         "17".into(),
+        "--required-job".into(),
+        "job-1-0".into(),
     ])
     .await
     .unwrap();
@@ -1264,6 +1271,10 @@ async fn cli_dispatches_and_observes_a_reserved_host_against_stub_github() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Confirmed { runner_id: 1 }"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("provider CI observation: Successful (not an attestation)")
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 new completed job measurements"));
     let again = launch(vec![
         "observe-dispatch".into(),
